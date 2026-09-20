@@ -16,8 +16,193 @@ use std::path::PathBuf;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(metrics))
+        .route("/host", axum::routing::get(host))
+        .route("/host/history", axum::routing::get(host_history))
         .route("/fleet", axum::routing::get(fleet))
         .route("/replay", axum::routing::get(replay))
+}
+
+/// The full host-analysis script, embedded at compile time so the running
+/// binary always carries the exact bytes from the commit it was built at (no
+/// drift, no repo-relative path to resolve from ~/.local/bin), and so the same
+/// bytes are runnable standalone from any checkout. `../../../../` climbs
+/// api → src → amux-server → crates → repo root.
+const HOST_ANALYSIS_SH: &str = include_str!("../../../../scripts/host-analysis.sh");
+
+/// GET /api/metrics/host — full host-machine analysis: OS, CPU/load, memory,
+/// swap, disk (on the DATA volume, per the collect_system_metrics comment),
+/// uptime, top processes by CPU and RSS, and fleet process counts.
+///
+/// The body is produced by `scripts/host-analysis.sh` (embedded above) so the
+/// Metrics tab renders precisely what the standalone script prints — one
+/// cross-platform source of truth. Stamped with the measured/n_considered
+/// contract (ethos rule 4): host fields go null when a probe cannot run on a
+/// platform, so a reader must be able to tell "measured and fine" from "the
+/// probe never ran". `n_considered` is the total process population the top-N
+/// lists were ranked from.
+async fn host() -> Response {
+    match tokio::task::spawn_blocking(run_host_analysis).await {
+        Ok(Ok(v)) => {
+            let n = v
+                .get("process_counts")
+                .and_then(|p| p.get("total"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0) as usize;
+            Json(crate::api::measured::measured(v, n)).into_response()
+        }
+        Ok(Err(why)) => Json(crate::api::measured::unmeasured(json!({}), &why)).into_response(),
+        Err(e) => Json(crate::api::measured::unmeasured(
+            json!({}),
+            &format!("host-analysis task panicked: {e}"),
+        ))
+        .into_response(),
+    }
+}
+
+/// Run the embedded script by piping it to `bash -s` on stdin and parsing its
+/// JSON. No temp file (nothing to leave behind, nothing for a concurrent writer
+/// to truncate mid-read), and no on-disk script at all. The script is ~10 KB —
+/// well under the OS pipe buffer — so writing it in full before reading stdout
+/// cannot deadlock.
+pub(crate) fn run_host_analysis() -> Result<serde_json::Value, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let bash = if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "bash"
+    };
+    let mut child = Command::new(bash)
+        .arg("-s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn bash: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "bash stdin unavailable".to_string())?
+        .write_all(HOST_ANALYSIS_SH.as_bytes())
+        .map_err(|e| format!("write script to bash: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for bash: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "host-analysis.sh exited {}: {}",
+            out.status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("host-analysis.sh output was not valid JSON: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+pub struct HistoryQuery {
+    since_h: Option<f64>,
+    limit: Option<usize>,
+}
+
+/// GET /api/metrics/host/history — the recorded series behind
+/// /api/metrics/host: one row per sample of the same analysis, written by
+/// `runtime_jobs::host_metrics`.
+///
+/// Every host instrument amux had was a spot read, so "free disk fell 151 GB
+/// overnight, when?" had no answer (DESKT-39, 2026-09-15). This is that
+/// answer's source.
+///
+/// `unmeasured_samples` counts rows whose probe FAILED, and those rows are in
+/// `samples` with `measured: false` and `why_unmeasured`. A reader must be able
+/// to tell a quiet machine from a probe that never ran, which is the same
+/// contract the live endpoint carries (ethos rule 4). `interval_secs` travels
+/// with the answer so an empty window reads as "nothing sampled yet, samples
+/// land every N seconds" rather than as a flat zero.
+async fn host_history(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> Response {
+    let since_h = q.since_h.unwrap_or(24.0).clamp(0.0, 24.0 * 90.0);
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let cutoff = chrono::Utc::now().timestamp() - (since_h * 3600.0) as i64;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(crate::api::measured::unmeasured(
+                json!({}),
+                &format!("store unavailable: {e}"),
+            ))
+            .into_response()
+        }
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT ts, measured, why_unmeasured, cpu_count, load1, load_per_core, mem_total_mb, \
+         mem_used_mb, mem_percent, mem_pressure, swap_used_mb, swap_total_mb, disk_free_gb, \
+         disk_total_gb, proc_total FROM host_metrics WHERE ts >= ?1 ORDER BY ts DESC LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(crate::api::measured::unmeasured(
+                json!({}),
+                &format!("host_metrics unreadable: {e}"),
+            ))
+            .into_response()
+        }
+    };
+    let rows = stmt.query_map(rusqlite::params![cutoff, limit as i64], |r| {
+        Ok(json!({
+            "ts": r.get::<_, i64>(0)?,
+            "measured": r.get::<_, i64>(1)? != 0,
+            "why_unmeasured": r.get::<_, Option<String>>(2)?,
+            "cpu_count": r.get::<_, Option<i64>>(3)?,
+            "load1": r.get::<_, Option<f64>>(4)?,
+            "load_per_core": r.get::<_, Option<f64>>(5)?,
+            "mem_total_mb": r.get::<_, Option<f64>>(6)?,
+            "mem_used_mb": r.get::<_, Option<f64>>(7)?,
+            "mem_percent": r.get::<_, Option<f64>>(8)?,
+            "mem_pressure": r.get::<_, Option<String>>(9)?,
+            "swap_used_mb": r.get::<_, Option<f64>>(10)?,
+            "swap_total_mb": r.get::<_, Option<f64>>(11)?,
+            "disk_free_gb": r.get::<_, Option<f64>>(12)?,
+            "disk_total_gb": r.get::<_, Option<f64>>(13)?,
+            "proc_total": r.get::<_, Option<i64>>(14)?,
+        }))
+    });
+    let samples: Vec<serde_json::Value> = match rows {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            return Json(crate::api::measured::unmeasured(
+                json!({}),
+                &format!("host_metrics query failed: {e}"),
+            ))
+            .into_response()
+        }
+    };
+    let unmeasured = samples
+        .iter()
+        .filter(|s| s.get("measured").and_then(|m| m.as_bool()) == Some(false))
+        .count();
+    let newest = samples.first().and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
+    let oldest = samples.last().and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
+    let n = samples.len();
+    Json(crate::api::measured::measured(
+        json!({
+            "since_h": since_h,
+            "limit": limit,
+            "interval_secs": crate::runtime_jobs::host_metrics::tick_secs(),
+            "sample_count": n,
+            "unmeasured_samples": unmeasured,
+            "newest_ts": newest,
+            "oldest_ts": oldest,
+            "samples": samples,
+        }),
+        n,
+    ))
+    .into_response()
 }
 
 /// GET /api/metrics/replay — audit replay (RR-0111a): fold the event journal
@@ -557,6 +742,44 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// The embedded host-analysis script runs and produces the shape the Metrics
+    /// tab and `measured` stamp depend on. Exercises the SHIPPED bytes
+    /// (include_str! + `bash -s`), not a paraphrase (ethos rule 7): a broken
+    /// script or a renamed key fails here rather than as a blank panel.
+    #[test]
+    fn host_analysis_runs_and_returns_the_expected_shape() {
+        let v = super::run_host_analysis().expect("host-analysis.sh should run and emit JSON");
+        for k in [
+            "cpu",
+            "memory",
+            "disk",
+            "top_cpu",
+            "top_mem",
+            "process_counts",
+            "verdicts",
+        ] {
+            assert!(v.get(k).is_some(), "missing key {k}: {v}");
+        }
+        // Measurable on any supported host (macOS or Linux CI).
+        assert!(v["cpu"]["count"].as_u64().unwrap_or(0) >= 1, "cpu.count: {v}");
+        assert!(
+            v["disk"]["total_gb"].as_f64().unwrap_or(0.0) > 0.0,
+            "disk.total_gb: {v}"
+        );
+        // n_considered is drawn from this, so it must be a real population.
+        assert!(
+            v["process_counts"]["total"].as_u64().unwrap_or(0) >= 1,
+            "process_counts.total: {v}"
+        );
+        for dim in ["cpu", "memory", "disk"] {
+            let s = v["verdicts"][dim].as_str().unwrap_or("");
+            assert!(
+                ["ok", "warn", "critical", "unknown"].contains(&s),
+                "verdict {dim} = {s:?}: {v}"
+            );
+        }
+    }
 
     /// Regression guard for the wrong-volume disk gauge.
     ///

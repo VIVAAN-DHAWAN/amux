@@ -1,5 +1,5 @@
-const CACHE = 'amux-v0.9.813';
-const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
+const CACHE = 'amux-v0.9.1006';
+const SHELL_URLS = ['/', '/state/kernel.js', '/state/feedback.css', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
 self.addEventListener('install', e => {
@@ -67,12 +67,28 @@ self.addEventListener('fetch', e => {
   // Only handle http/https (skip chrome-extension:// etc.)
   if (!url.protocol.startsWith('http')) return;
 
+  // Business is a separate shell with its own hashed bundle. Never serve its
+  // authentication bootstrap or connection health from the developer cache.
+  if (url.pathname === '/business' || url.pathname.startsWith('/business/') ||
+      url.pathname === '/health') return;
+
   // API requests: network only (app JS handles offline queue)
   if (url.pathname.startsWith('/api/')) return;
 
   // Main HTML (SPA): network-first, always cache as canonical '/' key
   // Hash fragments (#path=...) are client-side only — SW sees bare '/' regardless
   if (url.pathname === '/') {
+    // A remote owner reaches the public shell with `?_token=...`, which the
+    // server exchanges for an HttpOnly owner-session cookie and redirects to
+    // a clean URL. Never answer that one-time exchange from the canonical `/`
+    // cache: doing so drops the query before the server sees it and leaves the
+    // correct owner credential looking exactly like an unauthenticated peer.
+    // `fetch(e.request)` follows the server redirect on the network, applying
+    // Set-Cookie before the clean owner shell is returned.
+    if (url.searchParams.has('_token') || url.searchParams.has('_fresh')) {
+      e.respondWith(fetch(e.request));
+      return;
+    }
     const canonical = new Request('/', { headers: { 'Accept': 'text/html' } });
     // STALE-WHILE-REVALIDATE, not network-first. The shell is ~1.6MB of inline
     // HTML/CSS/JS; network-first meant every single load blocked on that full

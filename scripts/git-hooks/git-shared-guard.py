@@ -17,6 +17,11 @@ gives authorized cleanups a clean path instead of training reflog evasion.
 
 Configure guarded roots via AMUX_SHARED_CHECKOUTS (colon-separated; default
 ~/Dev/mixpeek). Fail-open: any error lets the command through.
+
+Managed workers also get corrective feedback for rm/rmdir operands with an
+unchecked variable directory prefix. Claude's native empty-path check otherwise
+opens an interactive prompt even in bypass mode. This denies the tool call; it
+never grants permission or executes/expands the proposed command.
 """
 import sys, json, os, re, time, pathlib
 
@@ -116,7 +121,7 @@ DANGER = [
     # in the one shared tree, sweeping up other sessions' unstaged edits into your
     # commit (wrong-attribution incidents). Bare `git commit` (no -a) is NOT blocked
     # here — too frequent to gate fleet-wide — but the fix is the same: name paths.
-    (r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
+    (r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
      'git commit -a/--all — commits EVERY modified tracked file in this SHARED tree, '
      'sweeping up other sessions\' edits; commit only your paths: `git commit -m "msg" -- <your files>`'),
     # THE SHARED INDEX, staged half (AF-316). `git commit -a` is blocked above;
@@ -136,7 +141,7 @@ DANGER = [
     # TWO RULES, because one regex could not keep `-A -- <path>` legal.
     # `git add -A -- src/foo.rs` is SCOPED and must pass: the flag is bounded by
     # the pathspec. Only the unbounded forms are the hazard.
-    (r'\bgit\s+' + GIT_GLOBALS + r'add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
+    (r'\bgit\s+' + GIT_GLOBALS + r'add(?![-\w])(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
      r'(?:\s-A\b|\s--all\b|\s--no-ignore-removal\b)',
      'git add -A/--all — stages EVERY modified file in this SHARED checkout, '
      'including other sessions\' in-flight edits, and leaves them staged for the '
@@ -146,7 +151,7 @@ DANGER = [
     # command as `git add .` and would otherwise read as "scoped" to the rule
     # above — the obvious next thing to type after being refused once.
     # `git add ./src/foo.rs` is a real path and is NOT matched.
-    (r'\bgit\s+' + GIT_GLOBALS + r'add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'add(?![-\w])[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
      'git add . — stages EVERY modified file under this directory in a SHARED '
      'checkout, including other sessions\' in-flight edits. Name your own paths: '
      '`git add <your files>` (AF-316)'),
@@ -184,7 +189,7 @@ DANGER = [
     #   * `--unshallow` and `--deepen` stay allowed — they are the remedy, and
     #     "deepen" does not contain "depth" so there is no overlap.
     #   * `[^;&|\n]*?` keeps the match inside one command, like the tuples above.
-    (r'\bgit\s+' + GIT_GLOBALS + r'(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
+    (r'\bgit\s+' + GIT_GLOBALS + r'(?:fetch|pull)(?![-\w])[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
      "git fetch/pull --depth (or --shallow-since/--shallow-exclude) — truncates history in "
      "this SHARED checkout, and every `merge-base --is-ancestor` past the cut then returns a "
      "bare exit 1 with no error, which is indistinguishable from a real 'not an ancestor'",
@@ -623,7 +628,7 @@ def _commit_has_pathspec(scrubbed):
     which is precisely what a drift-sweep is not. Two spellings count — an
     explicit `--` separator, and trailing bare operands after the flags.
     """
-    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b([^\n;&|]*)', scrubbed)
+    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])([^\n;&|]*)', scrubbed)
     if not m:
         return False
     rest = m.group(1)
@@ -676,9 +681,9 @@ def _sweep_commit_verdict(cmd, scrubbed, run_dir):
     and this never fires. That is correct: the failure needs a lagging HEAD.
 
     Returns None to allow, or a block-reason string."""
-    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])', scrubbed):
         return None
-    if re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
+    if re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])[^\n;&|]*--amend\b', scrubbed):
         return None   # amend has its own verdict, with its own pin
     if _commit_has_pathspec(scrubbed):
         return None
@@ -716,23 +721,110 @@ def _sweep_commit_verdict(cmd, scrubbed, run_dir):
         return None
     pin = os.environ.get("AMUX_ALLOW_SWEEP_COMMIT", "").strip()
     if pin:
-        # A PIN, NOT A FLAG, for the same reason AMUX_AMEND_EXPECT is one: the
-        # number can only be supplied by someone who ran the count, so the
-        # escape requires having LOOKED. A bare on/off switch would be set once
-        # in a shell profile and never read again.
-        if pin == str(len(drift)):
-            return None
-        return (f"AMUX_ALLOW_SWEEP_COMMIT={pin} does not match the {len(drift)} drift file(s) "
-                f"this commit would sweep — re-read the count and pin THAT, or the escape is "
-                f"authorizing a commit you have not looked at")
-    return (
+        return _sweep_pin_verdict(pin, drift)
+    consent = _write_sweep_consent(drift)
+    head = (
         f"bare `git commit` would sweep {len(drift)} file(s) of index-vs-HEAD DRIFT "
         f"({len(staged)} staged against HEAD, and {len(drift)} of them already match {base}). "
         f"Those are not your work: HEAD lags {base} on this checkout, so the index carries "
         f"the whole gap and a no-pathspec commit takes all of it under YOUR message. "
-        f"Commit your own paths instead: `git commit <your files> -m ...`. "
+        f"Commit your own paths instead: `git commit <your files> -m ...`. ")
+    if consent:
+        return head + (
+            f"If you really mean to commit all {len(drift)}, consent to the exact SET you "
+            f"just looked at: AMUX_ALLOW_SWEEP_COMMIT=@{consent} git commit ... . That file "
+            f"lists the {len(drift)} path(s); the guard re-reads it and refuses any drift "
+            f"path that is NOT in it, naming the additions.")
+    # Could not write the consent file. Fall back to the count rather than
+    # leave the operator with no escape at all, and say which form this is.
+    return head + (
         f"If you really mean to commit all {len(drift)}, pin the count you just read: "
-        f"AMUX_ALLOW_SWEEP_COMMIT={len(drift)} git commit ...")
+        f"AMUX_ALLOW_SWEEP_COMMIT={len(drift)} git commit ... (the path-set consent file "
+        f"could not be written, so this is the count form, which fails if the drift moves "
+        f"between reading it and re-running).")
+
+
+# AF-597 defect 2 (mixpeek-frustrations, 2026-09-08): the escape hatch used to
+# be `AMUX_ALLOW_SWEEP_COMMIT=<count>`, and the count is recomputed live from
+# index-vs-HEAD across every lane sharing one index, so it moves every few
+# seconds. Measured: a lane read "would sweep 36 file(s)", re-ran with 36, and
+# was refused with a demand for 40. Pin-the-number-you-just-read is
+# unsatisfiable by construction on a busy checkout, which makes the documented
+# escape a path nobody can walk truthfully (ethos rules 3 and 6).
+#
+# WHY A PATH SET AND NOT A TOKEN OR A TTL (the reporting lane's argument, and
+# the reason this shape was chosen): a count and a token are both unfalsifiable
+# at the moment of use. Satisfying either proves only that the operator saw a
+# refusal. A path set is a CLAIM ABOUT THE COMMIT, so the guard can compare it
+# to the drift it actually finds and refuse the difference. That is ethos rule 7
+# applied to the escape hatch itself.
+#
+# SUBSET, NOT EQUALITY, and that is what fixes the race. If the drift GROWS
+# between reading and re-running, the extra paths are exactly what was never
+# consented to, so refusing THOSE by name is the correct answer rather than an
+# arithmetic mismatch. If it SHRINKS, every remaining path is still consented,
+# so the commit proceeds.
+_SWEEP_CONSENT_SHOWN = 8
+
+
+def _write_sweep_consent(drift):
+    """Write the drift paths for the operator to pin. Returns the path, or ''.
+
+    A UNIQUE name via mkstemp, never a fixed one: every lane on this box shares
+    one /tmp under one uid, so a fixed path is two lanes writing one inode
+    (~/.claude/CLAUDE.md). Not deleted here on purpose, because the whole point
+    is that it outlives this process and is read by the retry.
+    """
+    import tempfile
+    try:
+        fd, path = tempfile.mkstemp(prefix="amux-sweep-consent-", suffix=".txt")
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(sorted(drift)) + "\n")
+        return path
+    except Exception:
+        return ""
+
+
+def _sweep_pin_verdict(pin, drift):
+    """None to allow, or a block-reason string. `pin` is already stripped."""
+    if pin.startswith("@"):
+        path = pin[1:]
+        try:
+            with open(path) as fh:
+                consented = {l.strip() for l in fh if l.strip()}
+        except Exception as e:
+            return (f"AMUX_ALLOW_SWEEP_COMMIT=@{path} could not be read ({e.__class__.__name__}), "
+                    f"so there is nothing to check this commit against. Re-run the bare "
+                    f"`git commit` to get a fresh consent file.")
+        if not consented:
+            return (f"AMUX_ALLOW_SWEEP_COMMIT=@{path} is empty, which consents to nothing "
+                    f"while reading like consent to everything. Re-run the bare `git commit` "
+                    f"to get a fresh consent file.")
+        unconsented = sorted(drift - consented)
+        if not unconsented:
+            return None
+        shown = ", ".join(unconsented[:_SWEEP_CONSENT_SHOWN])
+        more = ("" if len(unconsented) <= _SWEEP_CONSENT_SHOWN
+                else f" (and {len(unconsented) - _SWEEP_CONSENT_SHOWN} more)")
+        return (f"{len(unconsented)} of the {len(drift)} drift file(s) are NOT in "
+                f"{path}: {shown}{more}. The drift grew after you read it, which is normal "
+                f"on a shared index. Those paths are the ones you have not looked at; re-run "
+                f"the bare `git commit` for a consent file that covers them.")
+    if pin.isdigit():
+        # The legacy count form. Still honoured when it matches exactly, so a
+        # call already in flight is not broken by this change, and no longer
+        # advertised, because on a busy checkout it usually will not match.
+        if pin == str(len(drift)):
+            return None
+        return (f"AMUX_ALLOW_SWEEP_COMMIT={pin} does not match the {len(drift)} drift file(s) "
+                f"this commit would sweep. A count cannot survive the gap between reading it "
+                f"and using it: the drift is recomputed live across every lane sharing this "
+                f"index. Re-run the bare `git commit` and pin the consent FILE it names "
+                f"(AMUX_ALLOW_SWEEP_COMMIT=@<file>), which is checked as a set and tells you "
+                f"which paths are new.")
+    return (f"AMUX_ALLOW_SWEEP_COMMIT={pin!r} is neither a consent file (@<path>) nor a "
+            f"count. Re-run the bare `git commit` to get a consent file naming the "
+            f"{len(drift)} drift path(s).")
 
 
 def _amend_verdict(cmd, scrubbed, run_dir):
@@ -763,7 +855,7 @@ def _amend_verdict(cmd, scrubbed, run_dir):
     compare-and-amend to build it from. Do not restore the "kills the race"
     wording.
     Returns None to allow, or a block-reason string."""
-    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit\b[^\n;&|]*--amend\b', scrubbed):
+    if not re.search(r'\bgit\s+' + GIT_GLOBALS + r'commit(?![-\w])[^\n;&|]*--amend\b', scrubbed):
         return None
     import subprocess
     def _git(*args):
@@ -1307,6 +1399,111 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             "they may be yours, a peer's with no record, or both. " + tail)
 
 
+# ---------------------------------------------------------------- AF-577 ----
+# A LINKED WORKTREE SHARES .git/config WITH THE MAIN CHECKOUT.
+#
+# Any `git config` run inside one, without --worktree, rewrites the file every
+# other worktree and the main checkout read. No GIT_DIR, no inherited
+# environment, no hook involved, which is why a long hunt for an environment
+# channel came back empty (mixpeek-general 132a2b8a, after retracting their own
+# GIT_DIR hypothesis when mixpeek-cicd falsified it).
+#
+# Reproduced here, fresh repo, no GIT_DIR:
+#   BEFORE  main user.email=<real>  core.bare=false
+#   (cd linked && git config user.email t@t.t && git config core.bare true)
+#   AFTER   main user.email=t@t.t   core.bare=true
+#
+# COST WHEN IT LANDS: `core.bare=true` killed every work-tree operation for
+# every lane at once for ~30 minutes on the mixpeek checkout (MG-1648), and the
+# identity half authored 9 commits on their origin/main as `t <t@t.t>`.
+#
+# WHY --local IS NOT AN EXIT: in a linked worktree "local" IS the shared file.
+# That is the whole defect, so listing --local as an escape would recommend the
+# thing being refused.
+#
+# WHY THIS GUARD AND NOT extensions.worktreeConfig: enabling the extension makes
+# a private config POSSIBLE; it does not stop a bare `git config` from still
+# writing shared. The protection has to sit where the command is issued.
+_CONFIG_READ_FLAGS = (
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color",
+    "--get-colorbool", "--list", "-l", "--default", "--type", "--name-only",
+)
+_CONFIG_WRITE_FLAGS = (
+    "--add", "--replace-all", "--unset", "--unset-all",
+    "--rename-section", "--remove-section", "--edit", "-e",
+)
+# Writes that do NOT touch the shared file. --local is deliberately absent.
+_CONFIG_SCOPE_EXITS = ("--global", "--system", "--worktree", "--file", "-f", "--blob")
+
+
+def _config_write_tokens(scrubbed):
+    """The `git config ...` argument list when this command WRITES, else None.
+
+    Read the OPERANDS, not just the flags: `git config user.email` is a read and
+    `git config user.email x` is a write, and no flag distinguishes them.
+    """
+    m = re.search(r'\bgit\s+' + GIT_GLOBALS + r'config(?![-\w])([^\n;&|]*)', scrubbed)
+    if not m:
+        return None
+    toks = m.group(1).split()
+    if any(t in _CONFIG_SCOPE_EXITS or t.startswith("--file=") or t.startswith("--blob=")
+           for t in toks):
+        return None                      # writes somewhere that is not shared
+    if any(t in _CONFIG_WRITE_FLAGS for t in toks):
+        return toks
+    if any(t in _CONFIG_READ_FLAGS or t.startswith("--type=") or t.startswith("--default=")
+           for t in toks):
+        return None                      # an explicit read
+    operands = [t for t in toks if not t.startswith("-")]
+    # <key> alone is a read; <key> <value> is a write. Zero operands is `git
+    # config` with nothing, which git treats as an error, so it changes nothing.
+    return toks if len(operands) >= 2 else None
+
+
+def _linked_worktree_main(run_dir):
+    """The MAIN checkout path when run_dir is a LINKED worktree, else None.
+
+    Decided by git, not by guessing at path shape: in a linked worktree
+    --git-dir points at <main>/.git/worktrees/<name> while --git-common-dir
+    points at <main>/.git, and in the main checkout the two are equal.
+
+    READS THE STATUS, not just the output. A non-zero git here means the probe
+    could not run (not a repo, git missing, core.bare already broken), and an
+    unrun probe must not produce a verdict about the directory (AF-559).
+    """
+    import subprocess  # imported locally, as everywhere else in this file
+    try:
+        r = subprocess.run(
+            ["git", "-C", run_dir, "rev-parse", "--git-dir", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    parts = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    if len(parts) != 2:
+        return None
+    gitdir, common = (os.path.realpath(os.path.join(run_dir, p)) for p in parts)
+    if gitdir == common:
+        return None                      # the main checkout, or a bare repo
+    return os.path.dirname(common)
+
+
+def _worktree_config_verdict(cmd, scrubbed, run_dir):
+    toks = _config_write_tokens(scrubbed)
+    if not toks:
+        return None
+    main = _linked_worktree_main(run_dir)
+    if not main:
+        return None
+    setting = " ".join(toks[:3])
+    return (
+        "`git config " + setting + "` in a LINKED WORKTREE writes the config SHARED with "
+        + main + " and every other worktree of it, because a linked worktree has no config "
+        "of its own"
+    )
+
+
 def _has_cotenants(run_dir):
     """True if another live session shares this repo root. Fail-CLOSED to False
     (allow) on any error, matching the guard's standing fail-open contract: a
@@ -1415,9 +1612,10 @@ def _skipped_half_note(cmd):
     raw_segments = [seg.strip() for seg in _SHELL_JOINERS.split(cmd)]
     raw_segments = [seg for seg in raw_segments if seg and seg not in delims]
     idx, scrubbed_seg = others[0]
-    display = raw_segments[idx] if len(raw_segments) == len(segments) else scrubbed_seg
+    aligned = len(raw_segments) == len(segments)
+    display = raw_segments[idx] if aligned else scrubbed_seg
     shown = display[:80] + ("..." if len(display) > 80 else "")
-    return (
+    note = (
         "NOTE: the rest of this command did not run either — the block stops the whole "
         f"Bash call, not just the git verb. Skipped {len(others)} non-git segment(s), "
         f"first: `{shown}`.\n"
@@ -1425,6 +1623,180 @@ def _skipped_half_note(cmd):
         "the WHOLE command after fixing the complaint above; do not re-run only the git "
         "half against stale state.\n"
     )
+    unwritten = _unwritten_targets(
+        [(raw_segments[i] if aligned else seg) for i, seg in others])
+    if unwritten:
+        listed = ", ".join(unwritten[:_UNWRITTEN_SHOWN])
+        more = ("" if len(unwritten) <= _UNWRITTEN_SHOWN
+                else f", and {len(unwritten) - _UNWRITTEN_SHOWN} more")
+        note += (
+            f"      NOT WRITTEN: {listed}{more}. A retry that reads any of these gets "
+            f"whatever was there before, with rc=0 and nothing to notice.\n")
+    return note
+
+
+# AF-597 defect 3 (mixpeek-frustrations, 2026-09-08): the note above tells the
+# operator that a skipped half exists, and the operator still has to work out
+# what it was going to do. Measured cost on mixpeek main: a heredoc wrote a
+# commit-message file, the git verb was blocked, the retry fixed only the git
+# half, and the commit landed under the PREVIOUS DAY's message. Content right,
+# subject line false (b354b3d1f8, corrected by e222baefb5).
+#
+# Naming the files the skipped segments were going to WRITE turns a silent
+# stale read into a visible one, and it costs one pass over segments this
+# function has already split. It is the only component positioned to say it:
+# by the time the retry reads the stale file, nothing knows it is stale.
+_UNWRITTEN_SHOWN = 5
+_REDIRECT = re.compile(r"(?:^|\s)\d?>>?\s*([^\s|;&<>()]+)")
+_TEE = re.compile(r"\btee\s+(?:-\w+\s+)*([^\s|;&<>()]+)")
+# /dev/null is written by design and read by nobody, so naming it as an
+# unwritten file would be noise on the common case.
+#
+# `2>&1` and `>&2` need no entry here: `&` is excluded from the target class
+# above, so a descriptor duplication produces no match at all. There was a
+# `target.startswith("&")` check here and it could never fire, which is the
+# shape ethos rule 7 is about — a guard that reads like protection and is not.
+_NOT_A_FILE = {"/dev/null", "/dev/stdout", "/dev/stderr"}
+
+
+def _unwritten_targets(segments):
+    """Paths the skipped segments would have written, in order, deduped."""
+    seen = []
+    for seg in segments:
+        for pat in (_REDIRECT, _TEE):
+            for target in pat.findall(seg):
+                if target in _NOT_A_FILE:
+                    continue
+                if target not in seen:
+                    seen.append(target)
+    return seen
+
+
+# Keep quotes on words: shlex.split alone loses the distinction between
+# '$WT/file' (literal) and "$WT/file" (expands). This is a bounded correction for
+# direct shell invocations, not a shell interpreter or a replacement safety gate.
+# Native permission checks still cover forms we cannot statically recognize.
+_REMOVE_TOKENS = re.compile(
+    r'''(?:'[^']*'|"(?:\\.|[^"\\])*"|\\[^\n]|[^\s;&|()<>"'\\])+|[;&|()<>]|\n'''
+)
+_REMOVE_PREFIX = re.compile(r'^\$(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]|\{([^}]+)\})(?=[/*])')
+
+
+def _expanding_remove_word(raw):
+    """Unquote without expansion; mark literal dollars so they cannot match."""
+    out, quote, i = [], None, 0
+    while i < len(raw):
+        char = raw[i]
+        if char == "'" and quote != '"':
+            quote = None if quote == "'" else "'"
+        elif char == '"' and quote != "'":
+            quote = None if quote == '"' else '"'
+        elif char == "\\" and quote != "'" and i + 1 < len(raw):
+            i += 1
+            escaped = raw[i]
+            out.append("\0" if escaped == "$" else escaped)
+        else:
+            out.append("\0" if char == "$" and quote == "'" else char)
+        i += 1
+    return "".join(out)
+
+
+def _dynamic_remove_operands(command):
+    """Recognize unchecked variable directory prefixes in direct rm/rmdir calls.
+
+    Scan real command positions, including loops and common command wrappers.
+    Inert quoted arguments, comments and document heredocs are not invocations.
+    We deliberately do not evaluate variables, source scripts, or execute shell
+    substitutions. ${ROOT:?reason} is fail-closed on an empty root and is left to
+    Claude's native checks, as are literal paths (which are NOT declared safe).
+    """
+    import shlex
+    tokens = _REMOVE_TOKENS.findall(_strip_heredoc_bodies(command.replace("\\\n", "")))
+    start, removing, redirect, comment = True, False, False, False
+    matched, parents = [], []
+    for raw in tokens:
+        if raw == "\n":
+            start, removing, redirect, comment = True, False, False, False
+            continue
+        if comment:
+            continue
+        if raw.startswith("#"):
+            comment = True
+            continue
+        if raw == "(":
+            parents.append((start, removing, redirect))
+            start, removing, redirect = True, False, False
+            continue
+        if raw == ")":
+            start, removing, redirect = parents.pop() if parents else (True, False, False)
+            continue
+        if raw in (";", "&", "|"):
+            start, removing, redirect = True, False, False
+            continue
+        if redirect:
+            redirect = False
+            continue
+        if raw in ("<", ">"):
+            redirect = True
+            continue
+        if start:
+            try:
+                words = shlex.split(raw)
+            except ValueError:
+                start = False
+                continue
+            word = words[0] if len(words) == 1 else ""
+            if word in ("if", "then", "elif", "else", "do", "while", "until", "!", "{", "command", "exec", "env"):
+                continue
+            if re.match(r'^[A-Za-z_][A-Za-z_0-9]*=', word):
+                continue
+            if word == "--":
+                continue
+            removing = word in ("rm", "/bin/rm", "/usr/bin/rm", "rmdir", "/bin/rmdir", "/usr/bin/rmdir")
+            start = False
+            continue
+        if removing:
+            operand = _expanding_remove_word(raw)
+            match = _REMOVE_PREFIX.match(operand)
+            if match and not re.match(r'^[A-Za-z_][A-Za-z_0-9]*:\?', match.group(1) or ""):
+                matched.append(raw)
+    return matched
+
+
+def _remove_correction(command):
+    """Return a deny decision to the model before native interactive approval."""
+    worker = os.environ.get("AMUX_SESSION") or os.environ.get("AMUX_WORKER")
+    if not worker:
+        return None
+    operands = _dynamic_remove_operands(command)
+    if not operands:
+        return None
+    # Only hashes/counts reach the audit: commands and paths may contain secrets.
+    import hashlib
+    try:
+        log = pathlib.Path(os.environ.get("AMUX_HOME") or pathlib.Path.home() / ".amux") / "logs/tool-corrections.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if log.exists() and log.stat().st_size > 4 * 1024 * 1024:
+            log.replace(log.with_suffix(".jsonl.1"))
+        with log.open("a") as stream:
+            stream.write(json.dumps({"ts": time.time(), "event": "unsafe_remove_operand",
+                                    "session": worker, "verdict": "deny", "measured": True,
+                                    "n_considered": len(operands),
+                                    "command_sha256": hashlib.sha256(command.encode()).hexdigest()}) + "\n")
+    except OSError:
+        pass  # unavailable telemetry must not defeat the correction
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            "amux: rm/rmdir has an unchecked variable directory prefix (for example $WT/$f). "
+            "An empty prefix changes the deletion target; Claude may demand interactive approval even in bypass mode. "
+            "This entire Bash call was rejected before execution: none of its commands ran. "
+            "Inspect the resolved targets first, verify they stay inside your intended worktree and belong to this task, "
+            "then retry only necessary deletions with explicit literal paths. For already-landed files, compare exact "
+            "contents with the intended commit; git cat-file -e proves existence, not equality. Preserve differing or "
+            "peer-owned work, or use a fresh isolated worktree. Correct the command and continue; do not wait for "
+            "a human to approve this form or switch tools to evade the native deletion check."
+        )}}
 
 def main():
     data = json.load(sys.stdin)
@@ -1433,6 +1805,10 @@ def main():
     cmd = (data.get("tool_input") or {}).get("command", "") or ""
     global _LAST_CMD
     _LAST_CMD = cmd
+    correction = _remove_correction(cmd)
+    if correction:
+        print(json.dumps(correction))
+        return 0  # hook JSON deny cancels the call and feeds the reason to Claude
     scrubbed = _scrub(cmd)                       # match only real invocations
     cwd = data.get("cwd") or os.getcwd()
     shared = [os.path.realpath(os.path.expanduser(p)) for p in
@@ -1589,6 +1965,46 @@ def main():
         # prefix with a trailing variable (`-C /shared/root/$X reset --hard`)
         # must stay guarded even when the session cwd is elsewhere.
         _scope_dirs.append(os.path.realpath(os.path.expanduser(_unexpanded_c)))
+    # RUNS BEFORE THE STATIC-SCOPE GATE, for the same reason the discard check
+    # above does, and more sharply: AMUX_SHARED_CHECKOUTS defaults to
+    # ~/Dev/mixpeek, and a LINKED WORKTREE IS NEVER INSIDE THE CHECKOUT IT
+    # BELONGS TO. Our own convention puts them in /tmp (CLAUDE.md:185 says
+    # `git worktree add --detach /tmp/push-check main`), so gating this on that
+    # list would make it structurally unable to fire on any real target.
+    #
+    # Caught by testing it: placed after the gate it returned 0 for every cell,
+    # including `git config core.bare true` from a linked worktree, which is the
+    # exact command that took the mixpeek fleet down. An inert guard that reads
+    # as installed is worse than no guard, because nobody looks again.
+    #
+    # It needs no list. It self-scopes on a FACT about the repo (is this cwd a
+    # linked worktree, decided by git rev-parse), not on a static membership
+    # roll that drifts by construction.
+    # AF-577: a `git config` WRITE from inside a linked worktree lands in the
+    # config shared with the main checkout and every sibling worktree. Checked
+    # before the sweep verdict because its blast radius is the whole repo for
+    # every lane at once (core.bare=true took the mixpeek fleet down for ~30
+    # minutes), where a sweep buries one tree.
+    wt_why = None
+    try:
+        wt_why = _worktree_config_verdict(cmd, scrubbed, run_dir)
+    except Exception:
+        wt_why = None  # fail-open, same posture as the rest of the guard
+    if wt_why:
+        if _consume_override(cmd):
+            sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned): {wt_why}\n")
+        else:
+            sys.stderr.write(
+                f"BLOCKED by amux shared-checkout guard: {wt_why}.\n"
+                f"EXITS, and --local is NOT one of them (in a linked worktree \"local\" IS "
+                f"the shared file, which is the whole defect):\n"
+                f"  --global / --system   for anything about you rather than this repo\n"
+                f"  --worktree            needs `git config --global extensions.worktreeConfig "
+                f"true` first; without it a worktree has NO private config\n"
+                f"  run it from the MAIN checkout, if the setting really is repo-wide\n"
+                f"OWNER-AUTHORIZED one-off: write the exact command to ~/.amux/guard-allow-once "
+                f"and re-run (consumed once, audit-logged).\n")
+            return 2
     if not any(d == s or d.startswith(s + os.sep) for d in _scope_dirs for s in shared):
         if not _has_cotenants(run_dir):
             return 0

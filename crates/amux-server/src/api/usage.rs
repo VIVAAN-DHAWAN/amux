@@ -1,9 +1,14 @@
-//! GET /api/usage — subscription usage for the Settings meter (port of
-//! Python's `_fetch_claude_usage`, amux-server.py ~:3189).
+//! GET /api/usage — provider subscription usage for the Settings meter.
 //!
-//! # Why this does not go through `ProviderAdapter::usage()`
+//! The legacy top-level response remains Anthropic's body plus `available`, so
+//! older clients keep working. The `providers[]` collection is the complete
+//! Settings contract: Claude, Codex, Gemini, and the honest unmetered state for
+//! local Ollama. Provider-specific fields stay under their provider row rather
+//! than being collapsed into a lowest-common-denominator percentage.
 //!
-//! It used to, and that is why the meter was dark. The adapter returns
+//! # Why the detailed rows do not go through `ProviderAdapter::usage()`
+//!
+//! The Claude meter used to, and that is why it was dark. The adapter returns
 //! NORMALIZED [`UsageWindow`]s for capacity routing, which is a deliberately
 //! lossy view: it keeps kind/percent/reset and discards the provider-specific
 //! fields this SPA renders — `limits[].scope.model.display_name` (the
@@ -33,13 +38,13 @@
 //!
 //! # Secrets
 //!
-//! No response on any path can contain the token: [`UsageProbe`] cannot carry
-//! it, failure reasons are built from a status code or a fixed word, and the
-//! upstream response BODY is never echoed on a failure — only on 2xx, where
-//! it is the usage report itself.
+//! No response on any path can contain a token. Claude's [`UsageProbe`] cannot
+//! carry one, and the Codex/Gemini shapers allow-list quota, plan, and credit
+//! fields instead of forwarding either provider's account envelope.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +53,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::AppState;
 use crate::provider::claude::{probe_usage_raw, UsageProbe};
@@ -170,8 +176,8 @@ pub async fn background_should_pause_now() -> bool {
         *g = Some(Instant::now());
     }
     let probe = crate::provider::claude::probe_usage_raw().await;
-    if let UsageProbe::Ok(body) = probe {
-        if let Some(pct) = session_pct_of(&shape_probe(UsageProbe::Ok(body))) {
+    if let Some(body) = probe.exact_body() {
+        if let Some(pct) = session_pct_of(&shape_probe(UsageProbe::Ok(body.clone()))) {
             note_window_pct(pct);
             return background_should_pause(Some(pct), reserve);
         }
@@ -245,6 +251,22 @@ fn usage_stale_window() -> Duration {
 pub type ProbeFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = UsageProbe> + Send>> + Send + Sync>;
 
+#[derive(Debug, Clone)]
+enum ProviderProbe {
+    Ok(Value),
+    Unavailable { cause: &'static str, reason: String },
+}
+
+type ProviderProbeFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ProviderProbe> + Send>> + Send + Sync>;
+
+#[derive(Clone)]
+struct UsageProbes {
+    claude: ProbeFn,
+    codex: ProviderProbeFn,
+    gemini: ProviderProbeFn,
+}
+
 #[derive(Default)]
 struct UsageCache {
     /// The shaped body WITHOUT its age field — age is stamped per response,
@@ -257,24 +279,45 @@ struct UsageCache {
     last_good_at: Option<Instant>,
 }
 
-/// Production wiring: the real read-only probe from the Claude adapter.
+/// Production wiring: every provider's real read-only usage surface.
 pub fn routes() -> Router<AppState> {
-    routes_with(Arc::new(|| Box::pin(probe_usage_raw())))
+    routes_with_probes(UsageProbes {
+        claude: Arc::new(|| Box::pin(probe_usage_raw())),
+        codex: Arc::new(|| Box::pin(probe_codex_usage())),
+        gemini: Arc::new(|| Box::pin(probe_gemini_usage())),
+    })
 }
 
-/// Test seam.
+/// Existing Claude-focused test seam. Other providers degrade explicitly so
+/// old tests stay hermetic while the response still proves total coverage.
 pub fn routes_with(probe: ProbeFn) -> Router<AppState> {
+    let unavailable = |provider: &'static str| -> ProviderProbeFn {
+        Arc::new(move || Box::pin(async move { ProviderProbe::Unavailable {
+            cause: "test_probe_not_configured",
+            reason: format!("{provider} usage test probe is not configured"),
+        }}))
+    };
+    routes_with_probes(UsageProbes {
+        claude: probe,
+        codex: unavailable("Codex"),
+        gemini: unavailable("Gemini"),
+    })
+}
+
+fn routes_with_probes(probes: UsageProbes) -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(get_usage))
         .route("/attribution", axum::routing::get(get_attribution))
-        .layer(Extension(probe))
+        // AMUX-4584: the same numbers as markdown, deterministic, for MDAI.
+        .route("/report.md", axum::routing::get(get_usage_report_md))
+        .layer(Extension(probes))
         .layer(Extension(Arc::new(tokio::sync::Mutex::new(
             UsageCache::default(),
         ))))
 }
 
 async fn get_usage(
-    Extension(probe): Extension<ProbeFn>,
+    Extension(probes): Extension<UsageProbes>,
     Extension(cache): Extension<Arc<tokio::sync::Mutex<UsageCache>>>,
 ) -> Response {
     let ttl = usage_ttl();
@@ -285,8 +328,10 @@ async fn get_usage(
     // is the behaviour that provokes the rate limit in the first place.
     let fresh = matches!((&c.data, c.at), (Some(_), Some(at)) if at.elapsed() < ttl);
     if !fresh {
-        let shaped = shape_probe(probe().await);
-        if shaped.get("available") == Some(&json!(true)) {
+        let (claude, codex, gemini) =
+            tokio::join!((probes.claude)(), (probes.codex)(), (probes.gemini)());
+        let shaped = shape_all_providers(claude, codex, gemini);
+        if shaped.get("available") == Some(&json!(true)) && shaped.get("stale") != Some(&json!(true)) {
             c.last_good = Some(shaped.clone());
             c.last_good_at = Some(Instant::now());
         }
@@ -302,17 +347,26 @@ async fn get_usage(
     // changed — and both the age and the live failure travel with it, so the
     // response never claims to be something it is not.
     let mut stale_reason: Option<Value> = None;
-    if body.get("available") != Some(&json!(true)) {
+    if body.get("available") != Some(&json!(true))
+        && body.get("cache_managed") != Some(&json!(true))
+        && matches!(body.get("cause").and_then(Value::as_str), Some("rate_limited" | "probe_failed" | "unexpected_shape")) {
         let stale_window = usage_stale_window();
         if let (Some(good), Some(at)) = (&c.last_good, c.last_good_at) {
             if !stale_window.is_zero() && at.elapsed() < stale_window {
                 stale_reason = body.get("reason").cloned();
+                // Preserve today's Codex/Gemini result, not the old envelope
+                // that happened to accompany the last Claude success.
+                let providers = body.get("providers").cloned();
                 body = good.clone();
+                if let Some(providers) = providers { body["providers"] = providers; }
                 age = at.elapsed();
             }
         }
     }
 
+    if let Some(observed) = body.get("observed_at").and_then(Value::as_i64) {
+        age = Duration::from_secs((chrono::Utc::now().timestamp() - observed).max(0) as u64);
+    }
     // How old is this reading? A meter that silently shows a minute-old
     // number is fine; one that cannot tell you it is doing so is not.
     if let Some(obj) = body.as_object_mut() {
@@ -325,7 +379,358 @@ async fn get_usage(
             obj.insert("stale_reason".into(), reason);
         }
     }
+    // Keep the provider row's age/recovery metadata alongside its own numbers.
+    let claude = shape_claude_provider(&body);
+    if let Some(providers) = body.get_mut("providers").and_then(Value::as_array_mut) {
+        if let Some(row) = providers.iter_mut().find(|p| p["id"] == "claude") { *row = claude; }
+    }
     Json(body).into_response()
+}
+
+/// Read Codex's supported account/rateLimits/read JSON-RPC surface. The
+/// app-server receives no prompt and no mutation method; only the usage result
+/// crosses this boundary, never account identity.
+fn codex_probe_process(shell: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(shell);
+    command.args([
+        "-lc",
+        "exec codex app-server --stdio --disable remote_control",
+    ]);
+    command
+}
+
+async fn probe_codex_usage() -> ProviderProbe {
+    // The server is normally launched by launchd/systemd, whose PATH is not
+    // the user's interactive PATH. On this machine launchd found an abandoned
+    // `/usr/local/bin/codex` wrapper first; the wrapper itself existed, so
+    // spawn succeeded, but its packaged native binary did not. Every worker
+    // launched from amux runs through the user's login shell and found the
+    // current nvm-installed Codex instead. Do the same here: the usage probe
+    // must measure the provider binary the user actually runs, not whichever
+    // stale shim the service manager happens to put first (AMUX-4154).
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut child = match codex_probe_process(&shell)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return provider_probe_unavailable(
+            "codex", "shell_missing", "The user's login shell is unavailable, so Codex usage cannot be read.",
+        ),
+        Err(_) => return provider_probe_unavailable(
+            "codex", "probe_failed", "Codex account usage probe could not start.",
+        ),
+    };
+    let request = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":",
+        "{\"clientInfo\":{\"name\":\"amux-usage-probe\",\"version\":\"1\"},",
+        "\"capabilities\":{\"experimentalApi\":true}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}\n",
+    );
+    let Some(mut stdin) = child.stdin.take() else { return provider_probe_unavailable(
+        "codex", "probe_failed", "Codex account usage probe has no input channel.",
+    ) };
+    let Some(stdout) = child.stdout.take() else { return provider_probe_unavailable(
+        "codex", "probe_failed", "Codex account usage probe has no output channel.",
+    ) };
+    if stdin.write_all(request.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        let _ = child.kill().await;
+        return provider_probe_unavailable(
+            "codex", "probe_failed", "Codex account usage request could not be sent.",
+        );
+    }
+    let read = async {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await? {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+            if message.get("id") == Some(&json!(2)) {
+                return Ok::<Option<Value>, std::io::Error>(message.get("result").cloned());
+            }
+        }
+        Ok(None)
+    };
+    let result = tokio::time::timeout(Duration::from_secs(12), read).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    match result {
+        Ok(Ok(Some(body))) => {
+            tracing::debug!(target: "amux::usage_probe", provider = "codex", verdict = "measured",
+                "subscription usage probe succeeded");
+            ProviderProbe::Ok(body)
+        }
+        Ok(Ok(None)) => provider_probe_unavailable(
+            "codex", "unexpected_shape", "Codex account usage returned no rate-limit snapshot.",
+        ),
+        Ok(Err(_)) | Err(_) => provider_probe_unavailable(
+            "codex", "probe_failed", "Codex account usage probe timed out or disconnected.",
+        ),
+    }
+}
+
+/// Run the Gemini helper through Node stdin so the installed CLI's own OAuth
+/// client is reused without adding its private implementation as a Rust API.
+async fn probe_gemini_usage() -> ProviderProbe {
+    let mut child = match tokio::process::Command::new("node")
+        .args(["--input-type=module", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return provider_probe_unavailable(
+            "gemini", "runtime_missing", "Node.js is not installed, so Gemini CLI quota cannot be read.",
+        ),
+        Err(_) => return provider_probe_unavailable(
+            "gemini", "probe_failed", "Gemini account usage probe could not start.",
+        ),
+    };
+    let script = include_str!("../../../../scripts/provider-usage-gemini.mjs");
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(script.as_bytes()).await.is_err() {
+            let _ = child.kill().await;
+            return provider_probe_unavailable(
+                "gemini", "probe_failed", "Gemini account usage request could not be sent.",
+            );
+        }
+    }
+    let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await;
+    match output {
+        Ok(Ok(output)) => match serde_json::from_slice::<Value>(&output.stdout) {
+            Ok(body) if body.get("available") == Some(&json!(true)) => {
+                tracing::debug!(target: "amux::usage_probe", provider = "gemini", verdict = "measured",
+                    "subscription usage probe succeeded");
+                ProviderProbe::Ok(body)
+            }
+            Ok(body) => {
+                let cause = match body.get("cause").and_then(Value::as_str) {
+                    Some("account_quota_not_reported") => "account_quota_not_reported",
+                    Some("cli_missing") => "cli_missing",
+                    Some("unsupported_cli") => "unsupported_cli",
+                    Some("quota_project_unavailable") => "quota_project_unavailable",
+                    _ => "probe_failed",
+                };
+                let reason = body.get("reason").and_then(Value::as_str)
+                    .unwrap_or("Gemini account usage is unavailable.");
+                provider_probe_unavailable("gemini", cause, reason)
+            }
+            Err(_) => provider_probe_unavailable(
+                "gemini", "unexpected_shape", "Gemini account usage returned an unexpected response.",
+            ),
+        },
+        Ok(Err(_)) | Err(_) => provider_probe_unavailable(
+            "gemini", "probe_failed", "Gemini account usage probe timed out or disconnected.",
+        ),
+    }
+}
+
+fn provider_probe_unavailable(
+    provider: &'static str,
+    cause: &'static str,
+    reason: &str,
+) -> ProviderProbe {
+    tracing::warn!(target: "amux::usage_probe", provider, cause, verdict = "unavailable", "{reason}");
+    ProviderProbe::Unavailable { cause, reason: reason.to_string() }
+}
+
+fn shape_all_providers(
+    claude_probe: UsageProbe,
+    codex_probe: ProviderProbe,
+    gemini_probe: ProviderProbe,
+) -> Value {
+    let mut body = shape_probe(claude_probe);
+    let providers = vec![
+        shape_claude_provider(&body),
+        shape_codex_provider(codex_probe),
+        shape_gemini_provider(gemini_probe),
+        json!({
+            "id": "ollama", "label": "Ollama", "available": true,
+            "measured": true, "n_considered": 0, "metered": false, "local": true,
+            "summary": "Local models have no subscription limit", "windows": [],
+        }),
+        // Muse Code is the first provider that is METERED but UNREADABLE, and
+        // neither existing spelling tells that truth. `metered: false` renders
+        // "Unlimited" (ollama's row, correct for a local model and a lie for a
+        // hosted one); `metered: true` with no windows renders "No active
+        // limits", which asserts a measurement nobody took. Meta ships no usage
+        // API for muse today, so `usage_unknown` says exactly that and the
+        // dashboard prints "Usage unknown" — Invariant 20's whole point is that
+        // an absent number stays absent instead of resolving to a flattering
+        // default. Delete this field the day muse exposes a quota endpoint.
+        json!({
+            "id": "muse", "label": "Muse Code", "available": true,
+            "measured": false, "n_considered": 0, "metered": true,
+            "local": false, "usage_unknown": true,
+            "summary": "Muse Code exposes no usage API; consumption is unknown",
+            "windows": [],
+        }),
+    ];
+    if let Some(obj) = body.as_object_mut() {
+        let measured = providers.iter()
+            .filter(|provider| provider.get("metered") != Some(&json!(false)))
+            .any(|provider| provider.get("measured") == Some(&json!(true)));
+        let n_considered = providers.iter()
+            .filter_map(|provider| provider.get("n_considered").and_then(Value::as_u64))
+            .sum::<u64>();
+        obj.insert("measured".into(), json!(measured));
+        obj.insert("n_considered".into(), json!(n_considered));
+        obj.insert("provider_count".into(), json!(providers.len()));
+        obj.insert("providers".into(), Value::Array(providers));
+    }
+    body
+}
+
+fn shape_claude_provider(body: &Value) -> Value {
+    if body.get("available") != Some(&json!(true)) {
+        return json!({
+            "id": "claude", "label": "Claude", "available": false,
+            "measured": false, "n_considered": 0,
+            "cause": body.get("cause").cloned().unwrap_or(Value::Null),
+            "reason": body.get("reason").cloned()
+                .unwrap_or_else(|| json!("Claude usage is unavailable.")),
+            "retry_at": body.get("retry_at"),
+            "windows": [],
+        });
+    }
+    let windows = body.get("limits").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|limit| {
+            let used = limit.get("percent")?.as_f64()?;
+            let kind = limit.get("kind").and_then(Value::as_str).unwrap_or("limit");
+            let model = limit.pointer("/scope/model/display_name").and_then(Value::as_str);
+            let label = if kind == "session" || kind == "worker" {
+                "5-hour session".to_string()
+            } else if let Some(model) = model {
+                format!("{model} · weekly")
+            } else if kind.starts_with("weekly")
+                || limit.get("group").and_then(Value::as_str) == Some("weekly") {
+                "Weekly · all models".to_string()
+            } else {
+                kind.replace('_', " ")
+            };
+            Some(json!({
+                "label": label, "kind": kind,
+                "group": limit.get("group").cloned().unwrap_or(Value::Null),
+                "scope": limit.get("scope").cloned().unwrap_or(Value::Null),
+                "used_percent": used, "remaining_percent": (100.0 - used).max(0.0),
+                "resets_at": limit.get("resets_at").cloned().unwrap_or(Value::Null),
+                "severity": limit.get("severity").cloned().unwrap_or(Value::Null),
+                "active": limit.get("is_active").cloned().unwrap_or(Value::Null),
+            }))
+        }).collect::<Vec<_>>();
+    json!({
+        "id": "claude", "label": "Claude", "available": true, "measured": true,
+        "n_considered": windows.len(), "metered": true,
+        "source": "Anthropic subscription API", "windows": windows,
+        "observed_at": body.get("observed_at"), "retry_at": body.get("retry_at"),
+        "cache_age_s": body.get("cache_age_s"), "stale": body.get("stale"),
+        "stale_reason": body.get("stale_reason"),
+        "spend": body.get("spend").cloned().unwrap_or(Value::Null),
+        "extra_usage": body.get("extra_usage").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn shape_codex_provider(probe: ProviderProbe) -> Value {
+    let body = match probe {
+        ProviderProbe::Ok(body) => body,
+        ProviderProbe::Unavailable { cause, reason } => return json!({
+            "id": "codex", "label": "Codex", "available": false,
+            "measured": false, "n_considered": 0,
+            "cause": cause, "reason": reason, "windows": [],
+        }),
+    };
+    let fallback;
+    let buckets = if let Some(map) = body.get("rateLimitsByLimitId").and_then(Value::as_object)
+        .filter(|map| !map.is_empty()) {
+        map
+    } else {
+        fallback = serde_json::Map::from_iter([(
+            "codex".to_string(), body.get("rateLimits").cloned().unwrap_or_else(|| json!({})),
+        )]);
+        &fallback
+    };
+    let mut windows = Vec::new();
+    let mut details = Vec::new();
+    for (bucket_id, snapshot) in buckets {
+        let name = snapshot.get("limitName").and_then(Value::as_str).unwrap_or(bucket_id);
+        for (position, key) in [("primary", "primary"), ("secondary", "secondary")] {
+            let Some(window) = snapshot.get(key).and_then(Value::as_object) else { continue };
+            let Some(used) = window.get("usedPercent").and_then(Value::as_f64) else { continue };
+            let minutes = window.get("windowDurationMins").and_then(Value::as_i64);
+            let duration = match minutes {
+                Some(300) => "5-hour".to_string(),
+                Some(10_080) => "7-day".to_string(),
+                Some(mins) if mins % 1_440 == 0 => format!("{}-day", mins / 1_440),
+                Some(mins) if mins % 60 == 0 => format!("{}-hour", mins / 60),
+                Some(mins) => format!("{mins}-minute"),
+                None => position.to_string(),
+            };
+            let label = if name == "codex" { duration } else { format!("{name} · {duration}") };
+            windows.push(json!({
+                "label": label, "kind": position, "limit_id": bucket_id,
+                "limit_name": snapshot.get("limitName").cloned().unwrap_or(Value::Null),
+                "used_percent": used, "remaining_percent": (100.0 - used).max(0.0),
+                "window_minutes": minutes,
+                "resets_at": window.get("resetsAt").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        details.push(json!({
+            "id": bucket_id,
+            "name": snapshot.get("limitName").cloned().unwrap_or(Value::Null),
+            "plan_type": snapshot.get("planType").cloned().unwrap_or(Value::Null),
+            "credits": snapshot.get("credits").cloned().unwrap_or(Value::Null),
+            "individual_limit": snapshot.get("individualLimit").cloned().unwrap_or(Value::Null),
+            "spend_control_reached": snapshot.get("spendControlReached").cloned().unwrap_or(Value::Null),
+            "rate_limit_reached_type": snapshot.get("rateLimitReachedType").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    let plan = body.pointer("/rateLimits/planType").cloned()
+        .or_else(|| details.iter().find_map(|bucket| bucket.get("plan_type").cloned()))
+        .unwrap_or(Value::Null);
+    json!({
+        "id": "codex", "label": "Codex", "available": true, "measured": true,
+        "n_considered": windows.len(), "metered": true, "source": "Codex account API",
+        "plan": plan, "windows": windows, "buckets": details,
+        "reset_credits": body.get("rateLimitResetCredits").cloned().unwrap_or(Value::Null),
+        "upsell": body.get("rateLimitUpsell").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn shape_gemini_provider(probe: ProviderProbe) -> Value {
+    let body = match probe {
+        ProviderProbe::Ok(body) => body,
+        ProviderProbe::Unavailable { cause, reason } => return json!({
+            "id": "gemini", "label": "Gemini", "available": false,
+            "measured": false, "n_considered": 0,
+            "cause": cause, "reason": reason, "windows": [],
+        }),
+    };
+    let windows = body.pointer("/quota/buckets").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|bucket| {
+            let remaining = bucket.get("remainingFraction")?.as_f64()?.clamp(0.0, 1.0);
+            let model = bucket.get("modelId").and_then(Value::as_str).unwrap_or("Model");
+            Some(json!({
+                "label": model, "kind": "model",
+                "used_percent": (1.0 - remaining) * 100.0,
+                "remaining_percent": remaining * 100.0,
+                "remaining_amount": bucket.get("remainingAmount").cloned().unwrap_or(Value::Null),
+                "resets_at": bucket.get("resetTime").cloned().unwrap_or(Value::Null),
+            }))
+        }).collect::<Vec<_>>();
+    json!({
+        "id": "gemini", "label": "Gemini", "available": true, "measured": true,
+        "n_considered": windows.len(), "metered": true,
+        "source": "Gemini Code Assist quota API",
+        "auth_type": body.get("auth_type").cloned().unwrap_or(Value::Null),
+        "plan": body.pointer("/tier/name").cloned().unwrap_or(Value::Null),
+        "tier": body.get("tier").cloned().unwrap_or(Value::Null),
+        "credits": body.get("credits").cloned().unwrap_or(Value::Null),
+        "windows": windows,
+    })
 }
 
 /// One probe outcome -> the wire body the SPA consumes.
@@ -336,6 +741,25 @@ async fn get_usage(
 /// spelled the way `loadUsage()` reads them.
 fn shape_probe(probe: UsageProbe) -> Value {
     match probe {
+        UsageProbe::Snapshot { body, observed_at, retry_at, failure } => {
+            let mut shaped = shape_probe(UsageProbe::Ok(body));
+            shaped["cache_managed"] = json!(true);
+            shaped["observed_at"] = json!(observed_at);
+            shaped["retry_at"] = json!(retry_at);
+            if let Some(failure) = failure {
+                shaped["stale"] = json!(true);
+                shaped["stale_reason"] = shape_probe(*failure)["reason"].clone();
+            }
+            shaped
+        }
+        UsageProbe::Deferred { failure, retry_at } => {
+            let mut shaped = shape_probe(*failure);
+            // The credential-scoped cache owns fallback. The route's legacy
+            // last-good envelope could belong to the previous login.
+            shaped["cache_managed"] = json!(true);
+            shaped["retry_at"] = json!(retry_at);
+            shaped
+        }
         UsageProbe::Ok(body) => match body {
             Value::Object(mut map) => {
                 map.insert("available".into(), json!(true));
@@ -368,8 +792,7 @@ fn shape_probe(probe: UsageProbe) -> Value {
         // own, and telling someone to re-login would be actively wrong.
         UsageProbe::Http(429) => degraded(
             "rate_limited",
-            "Anthropic rate-limited the usage probe (HTTP 429). This clears on its own; \
-             it is usually many Claude processes sharing one account."
+            "Anthropic paused usage refreshes (HTTP 429). amux will retry automatically."
                 .into(),
         ),
         UsageProbe::Http(code) => degraded(
@@ -425,10 +848,10 @@ fn degraded(cause: &str, reason: String) -> Value {
 ///
 /// # Why a separate endpoint rather than a field on /api/usage
 ///
-/// This module's contract is that `/api/usage` returns Anthropic's body
-/// VERBATIM plus `available` — the SPA's `loadUsage()` sees byte-identical
-/// fields to the Python server. Adding keys there would erode the one property
-/// that makes the passthrough safe to reason about.
+/// The provider report and this local attribution ledger have independent
+/// clocks and failure modes. Keeping attribution separate lets Settings still
+/// show every provider limit if the token ledger is unreadable, and vice versa;
+/// the legacy Anthropic fields at the top level remain byte-identical.
 ///
 /// # The millisecond trap, stated because it already bit
 ///
@@ -460,12 +883,11 @@ async fn get_attribution(
         )?;
 
         let mut stmt = conn.prepare(
-            "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1) \
-             SELECT COALESCE((SELECT h.type FROM cmd_history h \
-                                WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                                ORDER BY h.ts DESC LIMIT 1), '') AS trig, \
-                    SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
-             FROM lg GROUP BY 1 ORDER BY 2 DESC",
+            &format!(
+                "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+                 SELECT {PROMPT_SOURCE_TRIG} AS trig, SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
+                 FROM src GROUP BY 1 ORDER BY 2 DESC"
+            ),
         )?;
         let rows = stmt.query_map([cutoff], |r| {
             Ok((
@@ -535,6 +957,229 @@ async fn get_attribution(
     }
 }
 
+// AMUX-4584: GET /api/usage/report.md — the token-usage dashboard as markdown.
+//
+// Deterministic by construction: SQL over token_ledger plus the same prompt
+// attribution join /api/usage/attribution uses, rendered with format!. No model
+// call, so an MDAI file that `fetch:`es this URL renders the same bytes for the
+// same ledger (ethos rule 2: compute what you can compute).
+//
+// Every table states the population it was computed over and is sorted by cost,
+// so "where is most of my token usage going" is answered by reading top-down.
+// Known limits are printed in the report itself, not left to a comment, because
+// the reader of a dashboard never reads the source.
+
+#[derive(serde::Deserialize, Default)]
+struct ReportQuery {
+    days: Option<i64>,
+    limit: Option<usize>,
+}
+
+fn md_money(v: f64) -> String {
+    format!("${:.2}", v)
+}
+
+fn md_tokens(v: i64) -> String {
+    let s = v.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+fn pct(part: f64, total: f64) -> String {
+    if total > 0.0 {
+        format!("{:.1}%", part / total * 100.0)
+    } else {
+        "0.0%".to_string()
+    }
+}
+
+/// One grouped breakdown: `(label, cost, tokens, turns)` rows, already sorted.
+fn md_table(title: &str, key_header: &str, rows: &[(String, f64, i64, i64)], total_cost: f64) -> String {
+    let mut s = format!("\n## {title}\n\n| {key_header} | Cost | Share | Tokens | Turns |\n|---|---:|---:|---:|---:|\n");
+    if rows.is_empty() {
+        s.push_str("| (none in window) | | | | |\n");
+    }
+    for (k, cost, tokens, turns) in rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            md_cell(if k.is_empty() { "(unattributed)" } else { k }),
+            md_money(*cost),
+            pct(*cost, total_cost),
+            md_tokens(*tokens),
+            turns
+        ));
+    }
+    s
+}
+
+const REPORT_TOKENS: &str = "(input + cache_read + cache_write + output)";
+
+fn grouped(
+    conn: &rusqlite::Connection,
+    select_key: &str,
+    cutoff: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, f64, i64, i64)>> {
+    let sql = format!(
+        "SELECT {select_key} AS k, COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) \
+         FROM token_ledger WHERE ts > ?1 GROUP BY k ORDER BY 2 DESC LIMIT ?2"
+    );
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map(rusqlite::params![cutoff, limit as i64], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            r.get::<_, f64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Render the report. Pure over a connection so a test can pin its shape.
+pub(crate) fn render_usage_report(conn: &rusqlite::Connection, days: i64, limit: usize, now: i64) -> rusqlite::Result<String> {
+    let cutoff = now - days * 86_400;
+    let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
+    let (total_cost, total_tokens, turns): (f64, i64, i64) = conn.query_row(
+        &format!("SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) FROM token_ledger WHERE ts > ?1"),
+        [cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let fresh: Option<i64> = conn.query_row("SELECT MAX(ts) FROM token_ledger", [], |r| r.get(0))?;
+    let (cache_read, input_side): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(cache_read),0), COALESCE(SUM(input + cache_read + cache_write),0) FROM token_ledger WHERE ts > ?1",
+        [cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    let mut md = String::new();
+    md.push_str(&format!("# Token usage, last {days} day(s)\n\n"));
+    md.push_str(&format!(
+        "- **Total:** {} across {} API responses, {} tokens {REPORT_TOKENS}\n",
+        md_money(total_cost),
+        turns,
+        md_tokens(total_tokens)
+    ));
+    md.push_str(&format!("- **Cache hit:** {} of input-side tokens were cache reads\n", pct(cache_read as f64, input_side as f64)));
+    md.push_str(&format!(
+        "- **Measured:** {} ledger rows in window of {} total; ledger fresh through {}\n",
+        turns,
+        total_rows,
+        fresh.map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()).unwrap_or_default()).unwrap_or_else(|| "never".into())
+    ));
+    md.push_str("- **Cost basis:** list price per model from runtime_jobs/token_ledger.rs (or ~/.amux/prices.json), not the plan invoice\n");
+
+    md.push_str(&md_table("By worker", "Worker", &grouped(conn, "session", cutoff, limit)?, total_cost));
+    md.push_str(&md_table("By model", "Model", &grouped(conn, "model", cutoff, limit)?, total_cost));
+    md.push_str(&md_table(
+        "Main conversation vs subagents",
+        "Kind",
+        &grouped(conn, "CASE WHEN conversation LIKE 'agent-%' THEN 'subagent' ELSE 'main' END", cutoff, limit)?,
+        total_cost,
+    ));
+
+    // Prompt source: the same definition /api/usage/attribution uses, now
+    // including steering deliveries (AMUX-4582).
+    let mut st = conn.prepare(
+        &format!(
+            "WITH lg AS (SELECT ts, session, cost_usd, input, cache_read, cache_write, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG} AS trig, \
+                    SUM(cost_usd), SUM(input + cache_read + cache_write + output), COUNT(*) \
+             FROM src GROUP BY 1 ORDER BY 2 DESC"
+        ),
+    )?;
+    let sources: Vec<(String, f64, i64, i64)> = st
+        .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    md.push_str(&md_table("By what triggered the turn", "Source (prompt or steering guard)", &sources, total_cost));
+
+    // By card: attributed rows only; the stale task_windows problem is named.
+    md.push_str(&md_table(
+        "By board card",
+        "Card",
+        &grouped(conn, "NULLIF(task, '')", cutoff, limit)?,
+        total_cost,
+    ));
+
+    md.push_str(&md_table(
+        "By day (UTC)",
+        "Day",
+        &{
+            let mut st = conn.prepare(&format!(
+                "SELECT date(ts, 'unixepoch') AS d, SUM(cost_usd), SUM{REPORT_TOKENS}, COUNT(*) FROM token_ledger \
+                 WHERE ts > ?1 GROUP BY d ORDER BY d DESC"
+            ))?;
+            let rows: Vec<(String, f64, i64, i64)> = st
+                .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        },
+        total_cost,
+    ));
+
+    md.push_str(&md_table(
+        "Top conversations",
+        "Worker / conversation",
+        &grouped(conn, "session || ' / ' || conversation", cutoff, limit)?,
+        total_cost,
+    ));
+
+    md.push_str(
+        "\n## Known limits of these numbers\n\n\
+         - Subagent rows indexed before migration 70 can be billed more than once per API response (AMUX-4580); newer rows are keyed by message id.\n\
+         - Card attribution reads `token_ledger.task`, filled from `task_windows`, which has had no writer since 2026-08-09 (AMUX-4581).\n\
+         - Nudges, schedule fires and auto-compacts delivered through the steering queue are credited to the prompt before them (AMUX-4582).\n\
+         - Codex and Gemini usage is not captured yet (AMUX-4583).\n",
+    );
+    Ok(md)
+}
+
+
+/// GET /api/usage/report.md?days=N&limit=M (AMUX-4584). `days` 1..365 (default 7),
+/// `limit` rows per breakdown 1..200 (default 25). text/markdown.
+async fn get_usage_report_md(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ReportQuery>,
+) -> Response {
+    let days = q.days.unwrap_or(7).clamp(1, 365);
+    let limit = q.limit.unwrap_or(25).clamp(1, 200);
+    let store = state.store.clone();
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let conn = store.read()?;
+        Ok(render_usage_report(&conn, days, limit, chrono::Utc::now().timestamp())?)
+    })
+    .await;
+    match out {
+        Ok(Ok(md)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            md,
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string(), "measured": false })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string(), "measured": false })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 struct AttributionQuery {
     hours: Option<i64>,
@@ -542,6 +1187,65 @@ struct AttributionQuery {
 
 /// Plain English, because the audience is a person wondering where their
 /// credits went, not someone who knows what `cmd_history.type` is.
+/// Which prompt a turn is credited to: the LATEST one the lane received at or
+/// before it, from EITHER history table.
+///
+/// AMUX-4582. This used to read `cmd_history` alone. Steering deliveries write
+/// only `steering_history` (board-drive nudges, board-progress, `sched:` fires,
+/// the commit nudge, auto-compact, the browser reaper, the staged guard), so
+/// every turn they started was credited to the prompt BEFORE them, which is
+/// frequently the human's. That is the exact inversion this view exists to
+/// prevent: it answers "did amux hand me this, or did I ask for it?".
+///
+/// Written once and interpolated into all three readers (by_source, top
+/// origins, the markdown report) rather than restated in each: a view must
+/// share the predicate of the mechanism it describes, and three copies of a
+/// join is how two of them end up disagreeing.
+///
+/// # The cmd_history predicate is written for the index (AMUX-4710)
+///
+/// `h.ts` is milliseconds and `lg.ts` is seconds, so the comparison has to
+/// convert. Doing it as `h.ts/1000 <= lg.ts` puts the computation on the
+/// INDEXED side and no index on `h.ts` can serve it. `h.ts <= lg.ts*1000 + 999`
+/// is the same predicate with the arithmetic moved to the constant side, and
+/// the `+ 999` is not a fudge: integer division truncates, so `h.ts/1000 <= X`
+/// admits every millisecond of second X, and dropping it would silently stop
+/// crediting a prompt that landed later in the same second as the turn.
+///
+/// The predicate is the smaller half. Measured on a copy of the live DB,
+/// hours=24: as shipped 3.41 s, predicate alone 3.31 s, migration 0076's
+/// `cmd_history(session, ts)` index alone 0.09 s, both 0.05 s. Identical rows
+/// in all four. The index is what does the work; this form lets it seek the
+/// range rather than walk it.
+const PROMPT_SOURCE_SRC: &str = "\
+ src AS (SELECT lg.*, \
+   (SELECT h.ts/1000 FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts <= lg.ts * 1000 + 999 ORDER BY h.ts DESC LIMIT 1) AS c_ts, \
+   (SELECT COALESCE(h.type,'') FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts <= lg.ts * 1000 + 999 ORDER BY h.ts DESC LIMIT 1) AS c_type, \
+   (SELECT COALESCE(h.origin,'') FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts <= lg.ts * 1000 + 999 ORDER BY h.ts DESC LIMIT 1) AS c_origin, \
+   (SELECT s.delivered_at FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_ts, \
+   (SELECT COALESCE(NULLIF(s.guard,''),'steering') FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_guard, \
+   (SELECT COALESCE(s.sender,'') FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_sender \
+   FROM lg)";
+
+/// The source key. A steering guard becomes `steer:<family>`, the part before
+/// its first colon, so `sched:SCHED-456` and `task-callback:TUBES-2790` group
+/// as `steer:sched` and `steer:task-callback` instead of one bucket per id.
+const PROMPT_SOURCE_TRIG: &str = "CASE WHEN src.s_ts IS NOT NULL AND (src.c_ts IS NULL OR src.s_ts > src.c_ts) \
+   THEN 'steer:' || CASE WHEN instr(src.s_guard, ':') > 0 \
+                         THEN substr(src.s_guard, 1, instr(src.s_guard, ':') - 1) ELSE src.s_guard END \
+   ELSE COALESCE(src.c_type, '') END";
+
+/// Who or what sent it, for the named-offenders list: the steering sender when
+/// steering won, the cmd_history origin otherwise.
+const PROMPT_SOURCE_ORIGIN: &str = "CASE WHEN src.s_ts IS NOT NULL AND (src.c_ts IS NULL OR src.s_ts > src.c_ts) \
+   THEN src.s_sender ELSE COALESCE(src.c_origin, '') END";
+
 fn trigger_label(t: &str) -> &'static str {
     match t {
         "user" => "you typed it",
@@ -552,9 +1256,25 @@ fn trigger_label(t: &str) -> &'static str {
         // board_drive::record_prompt shipped, pickup turns had no row and were
         // credited to whatever prompt preceded them — including the human's.
         "pickup" => "amux handed this lane a board card",
+        // Live on this box: 573 turns and $320 in a day reading as "other"
+        // because only the steering spelling had a label (AMUX-4582).
+        "task-callback" => "a task callback from a peer",
         "system" => "an amux nudge",
         "direct" | "steering" => "a steering message",
         "" => "no prompt matched; the turn predates this lane's history",
+        // AMUX-4582: steering deliveries, named by what sent them. Each of
+        // these was previously credited to the prompt before it.
+        "steer:board-drive" => "amux nudged this lane about a card",
+        "steer:board-progress" => "a board progress note",
+        "steer:sched" => "a schedule fired",
+        "steer:commit-nudge" => "the commit nudge",
+        "steer:auto-compact" | "steer:compact" => "an auto-compact",
+        "steer:task-callback" => "a task callback from a peer",
+        "steer:browser-reaper" => "the browser reaper",
+        "steer:staged-guard" => "the staged guard",
+        "steer:deferred-automation" => "deferred automation",
+        "steer:steering" => "a steering message with no guard",
+        other if other.starts_with("steer:") => "an amux nudge",
         _ => "other",
     }
 }
@@ -562,15 +1282,11 @@ fn trigger_label(t: &str) -> &'static str {
 /// The named offenders inside the background bucket.
 fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1) \
-         SELECT COALESCE((SELECT h.type FROM cmd_history h \
-                            WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                            ORDER BY h.ts DESC LIMIT 1), ''), \
-                COALESCE((SELECT h.origin FROM cmd_history h \
-                            WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                            ORDER BY h.ts DESC LIMIT 1), ''), \
-                lg.session, SUM(cost_usd), COUNT(*) \
-         FROM lg GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10",
+        &format!(
+            "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG}, {PROMPT_SOURCE_ORIGIN}, src.session, SUM(cost_usd), COUNT(*) \
+             FROM src GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10"
+        ),
     )?;
     let rows = stmt.query_map([cutoff], |r| {
         Ok((
@@ -650,6 +1366,19 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// The service manager's PATH may contain a stale but executable shim.
+    /// Keep the probe on the same login-shell resolution path as a real worker.
+    #[test]
+    fn codex_usage_probe_resolves_the_users_login_shell_binary() {
+        let command = codex_probe_process("/bin/example-shell");
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "/bin/example-shell");
+        assert_eq!(
+            command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            ["-lc", "exec codex app-server --stdio --disable remote_control"]
+        );
+    }
 
     /// AMUX-3544. Spend is attributed to WHY the turn happened, and the window
     /// proves it filtered.
@@ -829,6 +1558,107 @@ mod tests {
         );
     }
 
+    /// THE `+ 999` IN THE cmd_history PREDICATE IS LOAD-BEARING (AMUX-4710).
+    ///
+    /// The join was written `h.ts/1000 <= lg.ts`, which puts the arithmetic on
+    /// the indexed column and no index can serve it. Moving it to the constant
+    /// side is what lets `idx_cmd_history_session_ts` seek, and the naive move
+    /// is `h.ts <= lg.ts * 1000`. That is a DIFFERENT predicate: integer
+    /// division truncates, so the original admits every millisecond of the
+    /// ledger row's own second, and the naive form admits only millisecond
+    /// zero.
+    ///
+    /// The fixture is that second. A prompt at `now-60` with 500 ms, a turn at
+    /// `now-60` exactly. Under the original and under `+ 999` the turn is the
+    /// peer's; under `lg.ts * 1000` the peer's prompt is invisible and the turn
+    /// falls back to the human's, which is the same foreground/background
+    /// inversion AMUX-4582 fixed one layer up. A sub-second gap between a
+    /// delivery and the turn it started is the ORDINARY case here, not an edge.
+    ///
+    /// A STEERING ROW SITS BETWEEN THEM ON PURPOSE, so that BOTH cmd_history
+    /// subqueries this predicate appears in are load-bearing. `c_type` supplies
+    /// the answer and `c_ts` decides whether cmd_history beats steering at all;
+    /// with steering empty, a mutation of `c_ts` alone would leave the test
+    /// green and the coverage would be for one of two copies.
+    #[tokio::test]
+    async fn a_prompt_later_in_the_same_second_as_the_turn_still_credits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("attr-ms.db")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        store
+            .write(move |conn| {
+                // The human, a clear second earlier.
+                conn.execute(
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
+                    rusqlite::params!["p", "user", "lane", (now - 120) * 1000, ""],
+                )?;
+                // A steering delivery in between: newer than the human, older
+                // than the peer. It wins only if the peer's row is dropped.
+                conn.execute(
+                    "INSERT INTO steering_history (id, session, text, delivered_at, guard, sender) \
+                     VALUES (?,?,?,?,?,?)",
+                    rusqlite::params!["s1", "lane", "nudge", (now - 90) as f64, "", "amux"],
+                )?;
+                // The peer's message, in the SAME second as the turn, 500 ms in.
+                conn.execute(
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
+                    rusqlite::params!["p", "session", "lane", (now - 60) * 1000 + 500, "peer-lane"],
+                )?;
+                conn.execute(
+                    "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                     cache_write, output, cost_usd, task) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![now - 60, "lane", "c", "opus", 10, 0, 0, 5, 4.0, ""],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = axum::Router::new()
+            .nest(
+                "/api/usage",
+                routes_with(probe_fn(UsageProbe::Ok(json!({})), Arc::new(AtomicUsize::new(0)))),
+            )
+            .with_state(state);
+        let res = app
+            .oneshot(
+                Request::builder().uri("/api/usage/attribution?hours=1").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let by: std::collections::HashMap<String, f64> = v["by_source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["source"].as_str().unwrap_or("").to_string(), r["cost_usd"].as_f64().unwrap_or(0.0)))
+            .collect();
+        assert_eq!(
+            by.get("session"),
+            Some(&4.0),
+            "the prompt 500 ms into the turn's own second must still win: {v}"
+        );
+        assert_eq!(
+            by.get("user"),
+            None,
+            "4.0 here is the truncation bug — the human absorbed a peer-triggered turn: {v}"
+        );
+        assert_eq!(
+            by.get("steer:steering"),
+            None,
+            "and 4.0 HERE is the same bug seen through c_ts: with the peer's row dropped, the \
+             steering delivery at now-90 becomes the newest thing this lane received: {v}"
+        );
+        assert_eq!(v["background_pct"], json!(100.0), "{v}");
+    }
+
     /// A fixture probe that counts how many times it was called.
     fn probe_fn(outcome: UsageProbe, calls: Arc<AtomicUsize>) -> ProbeFn {
         Arc::new(move || {
@@ -841,7 +1671,8 @@ mod tests {
         })
     }
 
-    fn app(probe: ProbeFn) -> axum::Router {
+    fn app(probe: ProbeFn) -> axum::Router { app_routes(routes_with(probe)) }
+    fn app_routes(routes: Router<AppState>) -> axum::Router {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("usage-test.db")).unwrap();
         std::mem::forget(dir);
@@ -853,7 +1684,7 @@ mod tests {
         reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         Router::new()
-            .nest("/api/usage", routes_with(probe))
+            .nest("/api/usage", routes)
             .with_state(state)
     }
 
@@ -892,6 +1723,112 @@ mod tests {
                  "resets_at": "2026-08-12T00:00:00Z"}
             ]
         })
+    }
+
+    /// AMUX-4154: "all provider usage" is a totalizing claim. Compare the
+    /// response against the production registry, not a second hand-written
+    /// list, so provider five makes this fail until Settings covers it too.
+    #[test]
+    fn settings_usage_covers_every_default_provider_with_full_windows() {
+        let codex = json!({
+            "accountId": "must-never-reach-settings",
+            "rateLimits": {"planType": "pro"},
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitName": "codex", "planType": "pro",
+                    "primary": {"usedPercent": 45, "windowDurationMins": 300, "resetsAt": 1788652800},
+                    "secondary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1789084800},
+                    "credits": {"hasCredits": true, "unlimited": false, "balance": "12.50"}
+                },
+                "codex_bengalfox": {
+                    "limitName": "Spark", "planType": "pro",
+                    "primary": {"usedPercent": 3, "windowDurationMins": 300, "resetsAt": 1788656400},
+                    "secondary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 1789088400}
+                }
+            },
+            "rateLimitResetCredits": {"availableCount": 2, "credits": [{"expiresAt": 1789257600}]},
+            "rateLimitUpsell": {"eligible": false}
+        });
+        let gemini = json!({
+            "available": true, "auth_type": "oauth-personal",
+            "tier": {"id": "standard", "name": "Google AI Pro"}, "credits": 1000,
+            "quota": {"buckets": [
+                {"modelId": "gemini-3.5-pro", "remainingFraction": 0.72,
+                 "remainingAmount": 144, "resetTime": "2026-09-06T20:00:00Z"},
+                {"modelId": "gemini-3.5-flash", "remainingFraction": 0.91,
+                 "remainingAmount": 910, "resetTime": "2026-09-06T20:00:00Z"}
+            ]}
+        });
+        let body = shape_all_providers(
+            UsageProbe::Ok(live_shaped_body()),
+            ProviderProbe::Ok(codex),
+            ProviderProbe::Ok(gemini),
+        );
+        let providers = body["providers"].as_array().expect("provider rows");
+        let mut response_ids = providers.iter()
+            .map(|provider| provider["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        response_ids.sort();
+        let mut registry_ids = crate::provider::default_registry().ids().into_iter()
+            .map(|id| match id.as_str() {
+                "claude-code" => "claude".to_string(),
+                other => other.to_string(),
+            }).collect::<Vec<_>>();
+        registry_ids.sort();
+        assert_eq!(response_ids, registry_ids, "every shipped provider needs a Settings row");
+        assert_eq!(body["provider_count"], json!(providers.len()));
+
+        let provider = |id: &str| providers.iter().find(|provider| provider["id"] == id)
+            .unwrap_or_else(|| panic!("missing {id}: {body}"));
+        let codex = provider("codex");
+        assert_eq!(codex["windows"].as_array().unwrap().len(), 4);
+        assert!(codex["windows"].as_array().unwrap().iter().any(|window| {
+            window["label"] == "Spark · 7-day"
+                && window["remaining_percent"].as_f64() == Some(93.0)
+                && window["resets_at"].as_i64() == Some(1789088400i64)
+        }));
+        assert_eq!(codex["reset_credits"]["availableCount"], 2);
+        assert_eq!(codex["buckets"][0]["credits"]["balance"], "12.50");
+        let gemini = provider("gemini");
+        assert_eq!(gemini["plan"], "Google AI Pro");
+        assert_eq!(gemini["windows"].as_array().unwrap().len(), 2);
+        assert_eq!(gemini["windows"][0]["remaining_amount"], 144);
+        assert_eq!(provider("ollama")["metered"], false);
+        assert_eq!(body["n_considered"], 9);
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(!wire.contains("must-never-reach-settings"), "account identity leaked: {wire}");
+        assert!(!wire.contains("accountId"), "account identity field leaked: {wire}");
+    }
+
+    #[test]
+    fn one_unavailable_probe_does_not_hide_the_other_provider_rows() {
+        let body = shape_all_providers(
+            UsageProbe::NoToken,
+            ProviderProbe::Unavailable {
+                cause: "cli_missing",
+                reason: "Codex CLI is not installed on this host.".into(),
+            },
+            ProviderProbe::Unavailable {
+                cause: "account_quota_not_reported",
+                reason: "This Gemini authentication mode has no account-wide quota.".into(),
+            },
+        );
+        let providers = body["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 5);
+        assert_eq!(providers.iter().filter(|p| p["available"] == false).count(), 3);
+        assert_eq!(
+            providers.iter().find(|p| p["id"] == "ollama").unwrap()["available"],
+            true,
+            "local usage remains truthful when every subscription probe is unavailable"
+        );
+        // Muse has no probe to fail: it exposes no usage API at all, so a dead
+        // Codex/Gemini probe cannot make it unavailable. "Available with unknown
+        // usage" and "unavailable" are different states and the row must not
+        // collapse them — unavailable would read as "muse is broken".
+        let muse = providers.iter().find(|p| p["id"] == "muse").unwrap();
+        assert_eq!(muse["available"], true);
+        assert_eq!(muse["usage_unknown"], true);
+        assert_eq!(muse["measured"], false, "nothing was measured, so say so");
     }
 
     #[tokio::test]
@@ -1096,6 +2033,52 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn dated_snapshot_reaches_the_provider_row_and_cold_retry_has_no_numbers() {
+        let body=shape_probe(UsageProbe::Snapshot { body:live_shaped_body(), observed_at:1000,
+            retry_at:1660, failure:Some(Box::new(UsageProbe::Http(429))) });
+        let row=shape_claude_provider(&body);
+        assert_eq!(row["observed_at"],1000); assert_eq!(row["retry_at"],1660);
+        assert_eq!(row["stale"],true); assert_eq!(row["windows"].as_array().unwrap().len(),3);
+        let cold=shape_claude_provider(&shape_probe(UsageProbe::Deferred { failure:Box::new(UsageProbe::Http(429)),retry_at:1660 }));
+        assert_eq!(cold["available"],false); assert_eq!(cold["retry_at"],1660);
+        assert!(cold["windows"].as_array().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn route_cache_cannot_resurrect_previous_credentials_reading() {
+        let (probe,_) = probe_sequence(vec![
+            UsageProbe::Ok(live_shaped_body()),
+            UsageProbe::Deferred { failure:Box::new(UsageProbe::Http(429)), retry_at:1660 },
+            UsageProbe::NoToken,
+        ]);
+        let app=app(probe);
+        temp_env_ttl("0",||async {
+            let (_,first)=get(&app).await; assert_eq!(first["available"],true);
+            for _ in 0..2 {
+                let (_,next)=get(&app).await;
+                assert_eq!(next["available"],false);
+                assert!(next["providers"][0]["windows"].as_array().unwrap().is_empty());
+            }
+        }).await;
+    }
+    #[tokio::test]
+    async fn claude_stale_fallback_does_not_rewind_other_providers() {
+        let (claude,_) = probe_sequence(vec![UsageProbe::Ok(live_shaped_body()),UsageProbe::Http(429)]);
+        let n=Arc::new(AtomicUsize::new(0));
+        let codex:ProviderProbeFn=Arc::new(move || {
+            let used=n.fetch_add(1,Ordering::SeqCst)*20;
+            Box::pin(async move { ProviderProbe::Ok(json!({"rateLimits":{"primary":{"usedPercent":used,"windowDurationMins":300}}})) })
+        });
+        let probes=UsageProbes { claude,codex,gemini:Arc::new(||Box::pin(async { ProviderProbe::Unavailable{cause:"test",reason:"test".into()} })) };
+        let app=app_routes(routes_with_probes(probes));
+        temp_env_ttl("0",||async {
+            let (_,first)=get(&app).await; let (_,second)=get(&app).await;
+            assert_eq!(first["providers"][1]["windows"][0]["used_percent"],0.0);
+            assert_eq!(second["providers"][1]["windows"][0]["used_percent"],20.0);
+            assert_eq!(second["providers"][0]["stale"],true);
+        }).await;
+    }
+
     #[tokio::test]
     async fn a_failure_with_no_prior_reading_stays_degraded() {
         // The fallback must never manufacture a first reading.
@@ -1189,5 +2172,159 @@ mod tests {
     #[test]
     fn ttl_default_and_override() {
         assert_eq!(usage_ttl(), Duration::from_secs(DEFAULT_USAGE_TTL_S));
+    }
+}
+
+#[cfg(test)]
+mod usage_report_tests {
+    use super::render_usage_report;
+
+    use super::trigger_label;
+
+    fn ledger_row(conn: &rusqlite::Connection, session: &str, ts: i64, cost: f64) {
+        conn.execute(
+            "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+             VALUES (?1, ?2, 'conv', 'claude-opus-5', 10, 0, 0, 5, ?3, '')",
+            rusqlite::params![ts, session, cost],
+        )
+        .unwrap();
+    }
+
+    fn typed_prompt(conn: &rusqlite::Connection, session: &str, ts_secs: i64, kind: &str) {
+        conn.execute(
+            "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES ('do the thing', ?1, ?2, ?3, 'ethan')",
+            rusqlite::params![kind, session, ts_secs * 1000],
+        )
+        .unwrap();
+    }
+
+    fn steering_delivery(conn: &rusqlite::Connection, id: &str, session: &str, ts_secs: i64, guard: &str, sender: &str) {
+        conn.execute(
+            "INSERT INTO steering_history (id, session, text, queued_at, delivered_at, guard, sender) \
+             VALUES (?1, ?2, 'nudge text', ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, session, ts_secs as f64, ts_secs as f64, guard, sender],
+        )
+        .unwrap();
+    }
+
+    fn source_keys(md: &str) -> Vec<String> {
+        // Stop at the next heading: the report has more tables below this one,
+        // and reading past it collected their rows as sources.
+        let section = md.split("## By what triggered the turn").nth(1).unwrap();
+        let section = section.split("\n## ").next().unwrap_or(section);
+        section
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.contains("---"))
+            .skip(1)   // the table's own header row is not a source
+            .map(|l| l.trim_start_matches("| ").split(" |").next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// AMUX-4582: a turn a NUDGE started is credited to the nudge.
+    ///
+    /// Before this, the nudge wrote only `steering_history`, the join saw only
+    /// `cmd_history`, and the turn was charged to the human prompt that
+    /// happened to precede it. That inverts the one question this view exists
+    /// to answer, and it inflates what looks like human-requested spend.
+    #[test]
+    fn a_steering_delivered_turn_is_credited_to_the_steering_guard() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+
+        // The human typed something an hour before; then amux nudged; then the
+        // lane spent tokens. The spend belongs to the nudge.
+        typed_prompt(&conn, "amux", now - 3600, "user");
+        steering_delivery(&conn, "s1", "amux", now - 120, "board-drive", "");
+        ledger_row(&conn, "amux", now - 60, 4.0);
+
+        // A lane whose newest prompt really is the human's keeps it: the CONTROL
+        // that separates "reads steering" from "always says steering".
+        typed_prompt(&conn, "solo", now - 300, "user");
+        ledger_row(&conn, "solo", now - 60, 1.0);
+
+        // A schedule fire groups by family, not one bucket per schedule id.
+        steering_delivery(&conn, "s2", "cron", now - 200, "sched:SCHED-456", "");
+        ledger_row(&conn, "cron", now - 60, 2.0);
+
+        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        let keys = source_keys(&md);
+        assert!(keys.contains(&"steer:board-drive".to_string()), "the nudge is its own source: {keys:?}");
+        assert!(keys.contains(&"steer:sched".to_string()), "sched:SCHED-456 groups as its family: {keys:?}");
+        assert!(keys.contains(&"user".to_string()), "a genuinely human-prompted turn still reads user: {keys:?}");
+        assert!(!keys.iter().any(|k| k.contains("SCHED-456")), "not one bucket per schedule id: {keys:?}");
+
+        // And the money moved with it: $4 of nudge-driven spend that used to be
+        // filed under the human prompt.
+        let section = md.split("## By what triggered the turn").nth(1).unwrap();
+        let section = section.split("\n## ").next().unwrap_or(section);
+        let nudge_line = section.lines().find(|l| l.starts_with("| steer:board-drive")).unwrap();
+        assert!(nudge_line.contains("$4.00"), "{nudge_line}");
+        let human_line = section.lines().find(|l| l.starts_with("| user")).unwrap();
+        assert!(human_line.contains("$1.00"), "only the lane that really typed it: {human_line}");
+    }
+
+    /// A steering row OLDER than the lane's newest prompt must not win: the rule
+    /// is "the latest prompt", not "steering beats everything".
+    #[test]
+    fn the_newest_prompt_wins_whichever_table_it_came_from() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+        steering_delivery(&conn, "s1", "amux", now - 600, "board-drive", "");
+        typed_prompt(&conn, "amux", now - 120, "user");
+        ledger_row(&conn, "amux", now - 60, 3.0);
+        let keys = source_keys(&render_usage_report(&conn, 1, 25, now).unwrap());
+        assert_eq!(keys, vec!["user".to_string()], "the human typed after the nudge: {keys:?}");
+    }
+
+    #[test]
+    fn every_steering_family_reads_as_itself_and_an_unknown_one_still_reads_as_a_nudge() {
+        assert_eq!(trigger_label("steer:board-drive"), "amux nudged this lane about a card");
+        assert_eq!(trigger_label("steer:sched"), "a schedule fired");
+        assert_eq!(trigger_label("steer:commit-nudge"), "the commit nudge");
+        assert_eq!(trigger_label("steer:auto-compact"), "an auto-compact");
+        assert_eq!(trigger_label("steer:task-callback"), "a task callback from a peer");
+        // A guard nobody has taught this table still reads as amux, not "other":
+        // the question is "did amux hand me this", and the answer is yes.
+        assert_eq!(trigger_label("steer:some-future-job"), "an amux nudge");
+        assert_eq!(trigger_label("user"), "you typed it");
+        // Both spellings of the same thing read the same: cmd_history writes
+        // `task-callback`, steering writes the guard.
+        assert_eq!(trigger_label("task-callback"), trigger_label("steer:task-callback"));
+    }
+
+    #[test]
+    fn the_markdown_report_is_sorted_by_cost_and_states_its_population() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+        for (session, conv, model, cost, out) in [
+            ("amux", "c1", "claude-opus-5", 5.0, 100),
+            ("amux", "agent-x", "claude-opus-5", 1.0, 10),
+            ("studio-plg", "c2", "claude-sonnet-5", 9.0, 50),
+        ] {
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+                 VALUES (?1, ?2, ?3, ?4, 10, 20, 30, ?5, ?6, '')",
+                rusqlite::params![now - 60, session, conv, model, out, cost],
+            ).unwrap();
+        }
+        // Outside a 1-day window: must not be counted.
+        conn.execute(
+            "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+             VALUES (?1, 'old', 'c9', 'claude-opus-5', 1, 1, 1, 1, 100.0, '')",
+            [now - 3 * 86_400],
+        ).unwrap();
+        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        assert!(md.starts_with("# Token usage, last 1 day(s)"), "{md}");
+        assert!(md.contains("$15.00 across 3 API responses"), "window excludes the old row: {md}");
+        assert!(md.contains("3 ledger rows in window of 4 total"), "population stated: {md}");
+        let worker = md.split("## By worker").nth(1).unwrap();
+        let studio = worker.find("studio-plg").unwrap();
+        let amux = worker.find("| amux |").unwrap();
+        assert!(studio < amux, "sorted by cost, the $9 worker first: {worker}");
+        assert!(md.contains("| subagent | $1.00 |"), "subagent vs main split: {md}");
+        assert!(!md.contains("| old |"), "the out-of-window worker is absent");
+        assert!(md.contains("## Known limits of these numbers"));
+        // Deterministic: the same ledger renders the same bytes.
+        assert_eq!(md, render_usage_report(&conn, 1, 25, now).unwrap());
     }
 }

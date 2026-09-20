@@ -37,6 +37,16 @@ on:
   pull_request:
     paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
 
+# No group ran the full ~20min check+e2e once per push with nothing
+# superseding anything, so a burst of pushes to main paid full price for
+# every one of them (mixpeek-cicd, 2026-09-14: rust was 82% of this repo's
+# GitHub Actions minutes, $222/mo of that in e2e alone). Group by PR number
+# when this is a pull_request run, by ref otherwise (push to main) — a new
+# push cancels its own stale run rather than racing it to completion.
+concurrency:
+  group: rust-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -77,8 +87,11 @@ jobs:
       # quiet for a few days; leaving it advisory forever would make it
       # decoration.
       - name: cargo test (workspace) — tree-residue guarded
+        env:
+          AMUX_REQUIRE_TMUX: '1'
         run: |
           set -uo pipefail
+          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
           bash scripts/test-tree-clean.sh cargo test --workspace
           rc=$?
           if [ "$rc" = "3" ]; then
@@ -184,17 +197,30 @@ jobs:
       - name: runtime smoke -- hooks install from HEAD, not the worktree (AMUX-3682)
         run: bash scripts/test-hook-install-from-head.sh
 
-  e2e:
+  e2e-shards:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
+      # AF-932. The `check` job installs tmux (above); this job never did.
+      # The dashboard's own session/fleet code shells out to `tmux
+      # list-sessions` and degrades gracefully (a WARN log, "fleet will read
+      # as not-running") when it is missing — but a golden scenario that
+      # asserts on real running-session state has nothing graceful to show
+      # instead, so the gap surfaced as `element(s) not found` /
+      # `toBeVisible()` failures rather than as this job's own missing step.
+      - name: Install tmux (dashboard session state depends on it)
+        run: command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; }
       - name: Install Playwright
         # webkit is NOT optional: the ios-safari project (devices['iPhone 15'])
         # is a webkit project, and this job runs EVERY project (no --project
@@ -211,6 +237,10 @@ jobs:
         # worker delete 2026-08-09): an undefined name in an async handler makes
         # the click do nothing. This gate fails the build on that class.
         run: bash scripts/spa-lint.sh
+      - name: Dashboard outage recovery contracts
+        run: node --test tests/dashboard-outage-recovery.mjs
+      - name: No assignment to an undeclared client-side global (AF-940)
+        run: node --test tests/spa-no-undeclared-global-assignment.test.mjs
       # The CI checkout IS committed HEAD, so serve-head's worktree hop is
       # pure duplicate work here — and worse: without these env vars the
       # prebuild below went to ./target while serve-head defaulted to
@@ -223,14 +253,63 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
       - name: Golden scenarios (desktop + mobile + ios-safari)
-        run: npx playwright test --config e2e/playwright.config.ts
+        run: npx playwright test --config e2e/playwright.config.ts --workers=2 --shard=${{ matrix.shard }}/4 --global-timeout=1200000
         env:
+          AMUX_E2E_EVIDENCE_DIR: ci-results/shard-${{ matrix.shard }}
           AMUX_E2E_WORKING_TREE: '1'
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      - name: Upload traces on failure
-        if: failure()
+      # Runner deadline leaves time for partial evidence even when tests time out.
+      - name: Upload execution evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-results
+          name: e2e-evidence-${{ matrix.shard }}
+          path: ci-results/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results-${{ matrix.shard }}
           path: test-results/
+          retention-days: 7
+
+  # Preserve the e2e check name; a green subset cannot satisfy it.
+  e2e:
+    needs: e2e-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci --ignore-scripts
+      - name: Collect the full unchanged population (no execution claim)
+        run: npx playwright test --config e2e/playwright.config.ts --list
+        env:
+          AMUX_E2E_EVIDENCE_DIR: ci-full
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          pattern: e2e-evidence-*
+          path: ci-results
+          merge-multiple: true
+      - name: Require all shards and account for every test
+        if: always()
+        run: |
+          set -o pipefail
+          node scripts/check-e2e-evidence.mjs ci-results ci-full/manifest.json 4 | tee e2e-verdict.json
+      - name: Require successful setup and test jobs too
+        if: always()
+        env:
+          SHARD_RESULT: ${{ needs.e2e-shards.result }}
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-verdict
+          path: e2e-verdict.json
+          if-no-files-found: error
           retention-days: 7

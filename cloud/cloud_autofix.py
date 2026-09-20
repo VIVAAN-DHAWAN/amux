@@ -53,7 +53,7 @@ def ssh(script, timeout=90):
     """Run a python3 script on the cloud host via stdin. Returns stdout or ''."""
     try:
         r = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=8",
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30",
              "-i", SSH_KEY, "root@%s" % HOST, "python3 -"],
             input=script, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip()
@@ -154,7 +154,7 @@ print("restored %%d keys" %% len(merged))
     return ok
 
 
-def fix_logs():
+def fix_logs(emergency=False):
     # `truncate -s 0`, NOT open(f,"w").close(). Replacing the file contents out
     # from under the docker daemon WEDGES `docker logs` for that container until
     # it is restarted — measured 2026-08-27: an open()-truncate of 7 live json
@@ -167,18 +167,38 @@ def fix_logs():
     # disk kept climbing (AC-414). truncate -s 0 is inode-safe here too: a process
     # holding the fd open for append keeps writing at its old offset (sparse
     # regrow), and df is relieved immediately.
-    out = ssh(r'''
+    #
+    # EMERGENCY (AC-414, 2026-09-05): at the 0-bytes-free cliff the >20MB floor
+    # reclaims NOTHING — there are no large logs left, so the automatic guard was
+    # useless exactly when it mattered and the disk truncated gateway.env. In
+    # emergency mode drop the size floor (truncate EVERY log), vacuum the journal
+    # hard, and clear the apt cache. All non-customer-data and regenerable; this
+    # is the hand reclaim that pulled the host back from 0KB, now automatic.
+    min_size = "0" if emergency else str(20 * 1024 * 1024)
+    journal_keep = "30M" if emergency else "100M"
+    # Emergency also clears REGENERABLE non-customer caches — apt, snap downloads, and
+    # the npm cache. On 2026-09-06 /root/.npm (~430M) + snap cache were what actually
+    # recovered prod (logs gave only 8-21M; the gateway needs sustained headroom to
+    # SERVE, not just start), so the emergency reclaim must include them (AC-414).
+    apt_line = ("subprocess.run(['apt-get','clean'],capture_output=True,timeout=30); "
+                "subprocess.run(['bash','-c','rm -rf /var/lib/snapd/cache/* 2>/dev/null'],timeout=30); "
+                "subprocess.run(['bash','-c','npm cache clean --force 2>/dev/null || rm -rf /root/.npm/_cacache 2>/dev/null'],timeout=90)"
+                if emergency else "pass")
+    script = r'''
 import subprocess, glob, os
 n = 0
+MIN = __MIN__
 for f in glob.glob("/var/lib/docker/containers/*/*-json.log") + glob.glob("/var/log/*.log"):
     try:
-        if os.path.getsize(f) > 20*1024*1024:
+        if os.path.getsize(f) > MIN:
             subprocess.run(["truncate", "-s", "0", f], timeout=10); n += 1
     except Exception: pass
-subprocess.run(["journalctl", "--vacuum-size=100M"], capture_output=True)
+subprocess.run(["journalctl", "--vacuum-size=__JOURNAL__"], capture_output=True)
+__APT__
 print("truncated %d logs" % n)
-''')
-    trace("truncate_logs", out[:60], "truncated" in out)
+'''.replace("__MIN__", min_size).replace("__JOURNAL__", journal_keep).replace("__APT__", apt_line)
+    out = ssh(script)
+    trace("truncate_logs" + ("(emergency)" if emergency else ""), out[:60], "truncated" in out)
     return "truncated" in out
 
 
@@ -336,14 +356,32 @@ def check_deploy_freshness():
         except Exception:
             return ""
     sh("git", "fetch", "origin", "-q")
-    deployed = sh("gh", "run", "list", "--workflow=deploy-cloud.yml", "-L", "20",
-                  "--json", "headSha,conclusion", "-q",
-                  'map(select(.conclusion=="success"))[0].headSha')
+    # -L 100, and filter in Python rather than with a jq -q selector: during a
+    # prolonged red-CI stretch EVERY deploy-cloud run is 'skipped', so the last
+    # SUCCESS scrolls far past a 20-run window. At -L 20 this returned empty and
+    # reported "gh failed?", which is three different states ("gh failed", "no
+    # runs", "last success beyond the window") collapsed into one string and,
+    # worse, blinds the FROZEN detector during exactly the long-red-CI scenario
+    # AC-344 exists to catch (an error return skips the FROZEN branch below). So
+    # distinguish them honestly and publish n_considered beside the answer
+    # (ethos rule 4; seen live 2026-09-08, 25+ consecutive skips past -L 20).
+    raw = sh("gh", "run", "list", "--workflow=deploy-cloud.yml", "-L", "100",
+             "--json", "headSha,conclusion")
+    if not raw:
+        return {"error": "deploy-cloud freshness probe: gh run list returned nothing (gh failed or unauthenticated)"}
+    try:
+        runs = json.loads(raw)
+    except Exception:
+        return {"error": "deploy-cloud freshness probe: unparseable gh output"}
+    n = len(runs)
+    deployed = next((r.get("headSha", "") for r in runs if r.get("conclusion") == "success"), "")
     if not deployed:
-        return {"error": "no successful deploy-cloud run found (gh failed?)"}
+        return {"error": "no successful deploy-cloud run in last %d runs "
+                         "(all skipped/failed — main CI red for an extended period?)" % n,
+                "n_considered": n}
     behind = sh("git", "rev-list", "--count", "%s..origin/main" % deployed)
     behind = int(behind) if behind.isdigit() else -1
-    res = {"deployed": deployed[:12], "behind": behind}
+    res = {"deployed": deployed[:12], "behind": behind, "n_considered": n}
     if behind <= 0:
         res["state"] = "current"
         return res
@@ -533,11 +571,36 @@ def main():
                   _disk.get("pct", 0) < 90)
             if _disk.get("pct", 0) >= 95 and not no_fix:
                 _fb = _disk.get("free_gb", 0)
-                fix_logs()
+                # At the cliff (<~300MB free) drop the 20MB log floor and clear the
+                # journal + apt cache too, or the guard reclaims 0 (AC-414 2026-09-05).
+                fix_logs(emergency=_fb < 0.5)
                 _disk = check_disk(); result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _fb), _disk.get("pct", 100) < 95)
-            result["healthy"] = _disk.get("pct", 100) < 98
+            # AC-414 (2026-09-06 outage): a full disk crash-loops the gateway (exit
+            # 120 — it cannot write startup files), and the loop itself eats any space
+            # freed, so reclaiming WHILE it loops never breaks it. If the gateway is
+            # down, stop the loop, reclaim with it stopped, then restart — the exact
+            # hand recovery from today's 502, now automatic in the 30-min guard so a
+            # disk-induced outage self-heals instead of waiting for a human.
+            if not no_fix:
+                # Trigger on a real PROD PROBE, not systemctl is-active: a crash-looping
+                # unit flashes 'active' between restarts and raced the is-active check
+                # (AC-414 2026-09-06). 502/000 = down.
+                _st = probe_cloud()
+                if _st not in (200, 301, 302, 401, 403):
+                    ssh("import subprocess; subprocess.run(['systemctl','stop','amux-gateway'])", timeout=30)
+                    fix_logs(emergency=True)
+                    ok = restart_gateway()
+                    _st2 = probe_cloud()
+                    trace("gateway_recover", "prod was %d -> stop+reclaim+restart ok=%s, reprobe %d"
+                          % (_st, ok, _st2), _st2 in (200, 301, 302, 401, 403))
+                    result["gateway_recovered"] = _st2 in (200, 301, 302, 401, 403)
+            # Verdict on ABSOLUTE free space, not pct: this is a 49G disk, so 98% used
+            # is still ~1GB free — plenty for the gateway to serve — yet `pct < 98`
+            # cried CRITICAL every cycle at healthy headroom (AC-414). The gateway
+            # crash-loops near 0 and serves fine at ~1GB, so 500MB is the honest floor.
+            result["healthy"] = _disk.get("free_gb", 0) >= 0.5
         ssh("import json; open('/var/log/cloud-autofix.jsonl','a').write(%r+chr(10))"
             % json.dumps({"ts": int(time.time()), "disk_only": True, "trace": TRACE}), timeout=20)
         if as_json:
@@ -645,13 +708,20 @@ def main():
             _truncated_this_tick = False
             if _disk.get("pct", 0) >= 95 and not no_fix:
                 _free_before = _disk.get("free_gb", 0)
-                _truncated_this_tick = fix_logs()
+                # At the cliff (<~300MB free), emergency mode: all logs + journal + apt.
+                _truncated_this_tick = fix_logs(emergency=_free_before < 0.5)
                 _disk = check_disk()
                 result["disk"] = _disk
                 trace("disk_preventive", "after truncate: %.1f%% used, %.1fGB free (was %.1fGB)"
                       % (_disk.get("pct", 0), _disk.get("free_gb", 0), _free_before),
                       _disk.get("pct", 100) < 95)
-            hi = _disk.get("pct", 0) >= 90
+            # Escalate a board card only when the disk is GENUINELY at-risk (free <
+            # 0.4GB, past the stopgap), not merely >=90% used: on this 49G disk 99%
+            # used is ~0.5GB, which the host cron holds and the gateway serves fine,
+            # so a pct>=90 trigger filed a DUPLICATE disk card every daily run (AC-419
+            # dup of AC-414). AC-414 already carries the standing resize escalation;
+            # only re-escalate if the contained state breaks down.
+            hi = _disk.get("free_gb", 99) < 0.4
             if hi and not env_problem:
                 _tried = " (logs already truncated this tick — this is the net-negative disk, only a resize or deprovision fixes it)" \
                     if _truncated_this_tick else ""

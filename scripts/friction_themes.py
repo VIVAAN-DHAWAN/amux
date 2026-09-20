@@ -68,6 +68,11 @@ MIXPEEK_REPO = os.environ.get("MIXPEEK_REPO") or os.path.expanduser("~/Dev/mixpe
 DAYS = float(os.environ.get("FRICTION_DAYS", "1"))
 BASELINE_DAYS = float(os.environ.get("FRICTION_BASELINE_DAYS", "14"))
 MAX_PER_SIGNAL = int(os.environ.get("FRICTION_MAX_EVIDENCE", "6"))
+# Distinct lanes receiving a message in the SAME minute before that minute is
+# called a fan-out, and the share of evidence in such minutes before the whole
+# signal is called a broadcast.
+BROADCAST_LANES = int(os.environ.get("FRICTION_BROADCAST_LANES", "5"))
+BROADCAST_SHARE = float(os.environ.get("FRICTION_BROADCAST_SHARE", "0.5"))
 
 # Board id prefix -> which repo's fix sites that card's friction points at.
 # Unlisted prefixes are reported under 'other' rather than silently dropped:
@@ -394,6 +399,8 @@ class Signal:
         self.active = False
         self.evidence = []
         self.detail = {}
+        # AF-511: computed over the FULL matching set, not `evidence`.
+        self.concentration = None
 
     def to_dict(self):
         return {
@@ -407,9 +414,101 @@ class Signal:
             "baseline": self.baseline,
             "baseline_means": self.baseline_label,
             "active": self.active,
+            "concentration": self.concentration,
             "evidence": self.evidence[:MAX_PER_SIGNAL],
             "detail": self.detail,
         }
+
+
+def concentration(pairs):
+    """How CONCENTRATED a signal's evidence is, over the FULL set (AF-511).
+
+    `n` alone cannot separate a recurring class from one long incident: n=11
+    spread over eleven lane-days and n=11 from one lane in one hour print
+    identically, and only the first is a theme. Measured 2026-09-05, the three
+    loudest signals of the day — idle-stall (7.5x baseline), deploy-live (13x)
+    and verification — were ALL amux-testing-e2e on 2026-09-04, one
+    ATE-44/ATE-45 incident. Ranked by n they were the day's top themes.
+
+    That matters more here than in an ordinary dashboard because
+    docs/friction-themes.md increments OCCURRENCES from these signals, and its
+    own header calls an inflated OCCURRENCES the one way the file can corrupt
+    itself. The LAST_SEEN guard does not catch this, because a run that sees one
+    incident is legitimately a new run.
+
+    No threshold and no judgement call: this prints the three numbers and lets
+    the reading session discriminate. A verdict computed here would be a second
+    opinion the reader cannot audit, and `incident_shaped` below is deliberately
+    a DESCRIPTION of the numbers rather than a filter that hides anything.
+
+    `pairs` is [(session, ts_ms)] over EVERY matching row, never the displayed
+    sample — the evidence list truncates at MAX_PER_SIGNAL, so computing this
+    from it would measure the truncation.
+    """
+    pairs = [(sess or "?", ts) for sess, ts in pairs if ts is not None]
+    if not pairs:
+        return None
+    lanes = Counter(sess for sess, _ in pairs)
+    lane_days = {(sess, time.strftime("%Y-%m-%d", time.localtime(ts / 1000)))
+                 for sess, ts in pairs}
+    days = {d for _, d in lane_days}
+    top_lane, top_n = lanes.most_common(1)[0]
+    share = top_n / len(pairs)
+
+    # ONE LANE, not one calendar date. `len(days) == 1` was the old incident
+    # test and it could not fire on a rolling window: a 24h window starting at
+    # 11:01 always covers two dates, so on 2026-09-08 all 11 active signals
+    # reported distinct_days=2 and incident_shaped=False — including
+    # deploy-live at n=39 from ONE lane at 100%, the exact specimen this
+    # docstring cites. The same five-message, four-minute, one-lane incident
+    # read True at noon and False at 00:02; the verdict was decided by where
+    # midnight fell, not by the data.
+    #
+    # Span replaced it for one draft and suppressed that same specimen from the
+    # other side: deploy-live ran 21.1h of a 24h window, so any "clustered"
+    # threshold reads it as chronic. Inside a one-day window you cannot tell a
+    # burst from a chronic lane problem, and you do not need to — a signal from
+    # ONE lane must not increment a FLEET theme either way. So the boolean asks
+    # only what the window can answer, and the span is published beside it for
+    # a reader at a wider window.
+    span_ms = max(ts for _, ts in pairs) - min(ts for _, ts in pairs)
+
+    # FAN-OUT: one message delivered to many lanes reads as maximal breadth.
+    # The mirror of the incident shape and the more dangerous of the two,
+    # because every number above makes a broadcast look MORE like a theme:
+    # measured 2026-09-08, one minute (09-07 18:09) carried an identical
+    # message to 41 lanes, another to 28, and "continue" to 24 and 19 — while
+    # rule-restatement:idle-stall reported 55 lanes with a top-lane share of
+    # 31%, the most theme-shaped concentration a signal can have. Counting
+    # those as 83 independent observations of a friction is the same error as
+    # counting one incident 39 times, one axis over.
+    by_minute = defaultdict(set)
+    for sess, ts in pairs:
+        by_minute[int(ts // 60_000)].add(sess)
+    widest_minute = max(len(v) for v in by_minute.values())
+    fanout_minutes = {m for m, v in by_minute.items() if len(v) >= BROADCAST_LANES}
+    in_fanout = sum(1 for _, ts in pairs if int(ts // 60_000) in fanout_minutes)
+    fanout_share = in_fanout / len(pairs)
+
+    return {
+        "sampled_over": len(pairs),
+        "distinct_lanes": len(lanes),
+        "distinct_lane_days": len(lane_days),
+        "distinct_days": len(days),
+        "top_lane": top_lane,
+        "top_lane_share": round(share, 2),
+        "evidence_span_hours": round(span_ms / 3_600_000, 1),
+        "widest_minute_lanes": widest_minute,
+        "fanout_share": round(fanout_share, 2),
+        # One lane, clustered inside the window, and more than a couple of
+        # messages. Stated as what the numbers ARE, so a reader who disagrees
+        # can see why.
+        "incident_shaped": bool(len(lanes) == 1 and len(pairs) >= 3),
+        # Most of the evidence arrived in minutes where one message reached
+        # many lanes at once. Not a per-lane friction, however wide it looks.
+        "broadcast_shaped": bool(widest_minute >= BROADCAST_LANES
+                                 and fanout_share >= BROADCAST_SHARE),
+    }
 
 
 def db_connect():
@@ -515,6 +614,10 @@ def signal_rule_restatement(con, now_ms, prompts_doc):
         # ordinary conversation, and at n>=1 every class fired every day.
         s.active = (s.value > max(2.0, baseline_rate * 1.5)) or (
             already_written and s.value >= 2)
+        # OVER `in_win`, THE FULL SET — `evidence` below truncates at
+        # MAX_PER_SIGNAL, and computing concentration from it would measure the
+        # truncation rather than the signal (AF-511).
+        s.concentration = concentration([(r["session"], r["ts"]) for r in in_win])
         s.evidence = [
             {"msg": f"MSG-{r['id']}", "session": r["session"],
              "ts": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"] / 1000)),
@@ -545,6 +648,29 @@ def shingle(text, n=5):
     # the same instruction sent to five lanes.
 
 
+# An attachment's storage path is transport metadata, not repeated human prose.
+# Keep ordinary filesystem instructions intact; only strip amux @-upload refs.
+UPLOAD_REFERENCE = re.compile(r"@/(?:[^\s/]+/)*\.amux/uploads/[^\s]+")
+
+
+def log_attachment_exclusion(considered, excluded):
+    event = {"event": "friction_attachment_metadata_excluded", "measured": True,
+             "n_considered": considered, "ignored_upload_references": excluded,
+             "ts": int(time.time())}
+    log_friction_event(event)
+
+
+def log_friction_event(event):
+    try:
+        folder = os.path.join(os.environ.get("AMUX_HOME", os.path.expanduser("~/.amux")), "logs")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "friction-sweep.log"), "a") as stream:
+            stream.write(json.dumps(event, sort_keys=True) + "\n")
+    except OSError as error:
+        print(json.dumps({**event, "event": "friction_audit_unavailable",
+                          "reason": type(error).__name__}), file=sys.stderr)
+
+
 def signal_cross_lane_repeat(con, now_ms):
     if con is None:
         return [Signal("cross-lane-repeat", "both", "Same ask sent to multiple lanes",
@@ -559,8 +685,11 @@ def signal_cross_lane_repeat(con, now_ms):
                "The same instruction sent to two or more different lanes",
                n_considered=len(rows))
     shingles = defaultdict(list)
+    ignored_upload_references = 0
     for r in rows:
-        instr = instruction_of(r["text"])
+        own_text, excluded = UPLOAD_REFERENCE.subn("", r["text"] or "")
+        ignored_upload_references += excluded
+        instr = instruction_of(own_text)
         if len(instr) < 40:
             continue
         for sh in shingle(instr):
@@ -585,8 +714,14 @@ def signal_cross_lane_repeat(con, now_ms):
             "text": (hits[0]["text"] or "")[:200],
         })
     s.evidence.sort(key=lambda e: (not e["cross_repo"], -len(e["lanes"])))
+    evidence_repos = {repo for e in s.evidence for repo in e["repos"]}
+    s.repo_scope = "both" if {"amux", "mixpeek"} <= evidence_repos else (
+        "amux" if "amux" in evidence_repos else "mixpeek" if "mixpeek" in evidence_repos else "other")
     s.active = s.value > 0
-    s.detail = {"cross_repo_instances": sum(1 for e in s.evidence if e["cross_repo"])}
+    s.detail = {"cross_repo_instances": sum(1 for e in s.evidence if e["cross_repo"]),
+                "ignored_upload_references": ignored_upload_references}
+    if ignored_upload_references:
+        log_attachment_exclusion(len(rows), ignored_upload_references)
     return [s]
 
 
@@ -731,15 +866,15 @@ def signal_ledger_clusters(now_ms):
 
 
 # ---------------------------------------------------------------------------
-# Signal 4: nudge pressure that does not move a queue
+# Signal 4: board-drive nudge pressure without terminal completions
 #
-# A lane that received many machine nudges and closed nothing is a loop with no
-# negative feedback term. Per repo, because the two halves of the fleet run on
-# different cadences and averaging them hides both.
+# Peer collaboration is not a nudge. Terminal closures alone cannot measure
+# useful nonterminal movement, so this signal is an inspection candidate, not
+# a finding that a lane made no progress.
 # ---------------------------------------------------------------------------
 def signal_nudge_without_movement(con, now_ms):
     if con is None:
-        return [Signal("nudge-no-movement", "both", "Nudges sent to lanes whose queue did not move",
+        return [Signal("nudge-no-movement", "both", "Repeated board-drive nudges without a terminal completion",
                        measured=False, why_unmeasured="amux.db unreadable")]
     win_ms = int(DAYS * 86400_000)
     since = now_ms - win_ms
@@ -756,16 +891,18 @@ def signal_nudge_without_movement(con, now_ms):
         "WHERE closed_at IS NOT NULL AND closed_at >= ? GROUP BY session",
         (since // 1000,)).fetchall())
 
-    per_lane = defaultdict(lambda: {"machine": 0, "human": 0})
+    per_lane = defaultdict(lambda: {"machine": 0, "human": 0, "nudges": 0})
     for r in msgs:
         bucket = "human" if (r["type"] == "user" and not r["origin"]) else "machine"
         per_lane[r["session"]][bucket] += r["c"]
+        if r["type"] == "pickup" and r["origin"] == "board-drive":
+            per_lane[r["session"]]["nudges"] += r["c"]
 
     s = Signal("nudge-no-movement", "both",
-               "Lanes nudged repeatedly whose board queue did not move",
+               "Repeated board-drive nudges without a terminal completion",
                n_considered=sum(v["machine"] + v["human"] for v in per_lane.values()))
-    for lane, counts in sorted(per_lane.items(), key=lambda kv: -kv[1]["machine"]):
-        if counts["machine"] < 10:
+    for lane, counts in sorted(per_lane.items(), key=lambda kv: -kv[1]["nudges"]):
+        if counts["nudges"] < 10:
             continue
         moved = closed.get(lane, 0)
         if moved > 0:
@@ -774,15 +911,26 @@ def signal_nudge_without_movement(con, now_ms):
         s.evidence.append({
             "lane": lane, "repo": lane_repo(lane),
             "machine_msgs": counts["machine"], "human_msgs": counts["human"],
+            "nudge_msgs": counts["nudges"],
+            "other_machine_msgs": counts["machine"] - counts["nudges"],
             "cards_closed_in_window": moved,
         })
     s.active = s.value > 0
+    repos = {e["repo"] for e in s.evidence}
+    s.repo_scope = "both" if {"amux", "mixpeek"} <= repos else (
+        "amux" if "amux" in repos else "mixpeek" if "mixpeek" in repos else "other")
     s.detail = {
         "lanes_over_threshold": s.value,
-        "threshold": "10+ machine messages and 0 cards closed",
+        "threshold": "10+ board-drive pickup messages and 0 terminal completions",
         "total_machine_msgs": sum(v["machine"] for v in per_lane.values()),
         "total_human_msgs": sum(v["human"] for v in per_lane.values()),
+        "total_nudge_msgs": sum(v["nudges"] for v in per_lane.values()),
+        "other_machine_msgs": sum(v["machine"] - v["nudges"] for v in per_lane.values()),
+        "nonterminal_movement_measured": False,
+        "why_nonterminal_movement_unmeasured": "Only closed_at is counted; nonterminal transitions and useful work are not measured",
     }
+    log_friction_event({"event": "friction_nudge_population", "measured": True,
+                       "n_considered": s.n_considered, "ts": int(time.time()), **s.detail})
     return [s]
 
 
@@ -959,6 +1107,26 @@ def main():
                  if s.baseline is not None else "")
               + f", considered {s.n_considered})")
         print(f"  {s.headline}")
+        c = s.concentration
+        if c:
+            # Both flags print. A payload field the default view drops is a
+            # field nobody reads (ethos rule 1), and broadcast_shaped exists
+            # precisely because the numbers beside it look reassuring.
+            flags = []
+            if c["incident_shaped"]:
+                flags.append("  <-- INCIDENT-SHAPED: one lane, clustered in time")
+            if c["broadcast_shaped"]:
+                flags.append(f"  <-- BROADCAST-SHAPED: {int(c['fanout_share']*100)}% of "
+                             f"evidence arrived in fan-out minutes "
+                             f"(widest: {c['widest_minute_lanes']} lanes in one minute). "
+                             f"Lane breadth here is delivery, not adoption.")
+            print(f"  concentration: {c['distinct_lanes']} lane(s), "
+                  f"{c['distinct_lane_days']} lane-day(s), "
+                  f"top lane {c['top_lane']} {int(c['top_lane_share']*100)}% "
+                  f"(over all {c['sampled_over']}), "
+                  f"span {c['evidence_span_hours']}h")
+            for f in flags:
+                print(f)
         if s.detail:
             print(f"  detail: {json.dumps(s.detail)}")
         for e in s.evidence[:MAX_PER_SIGNAL]:

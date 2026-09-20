@@ -313,11 +313,9 @@ if [ -f "$REPO/amux" ]; then
     case " $seen_cli " in *" $cand "*) continue ;; esac
     seen_cli="$seen_cli $cand"
     diff -q "$REPO/amux" "$cand" >/dev/null 2>&1 && continue
-    # SYMLINK, NOT `cp`. This block used to prescribe a copy, which fixes the
-    # report and rebuilds the hazard: a copy is stale again the next time anyone
-    # edits ./amux, and that is exactly how the specimen below came to exist.
-    # ~/.local/bin/amux has been a symlink since install.sh created it, so the
-    # copy was also the only one of the two that could drift.
+    # Installation must validate a snapshot before publishing it (ATE-136).
+    # A symlink would publish every mid-edit and merge conflict to the fleet.
+    # Difference alone does not authorize publishing this checkout's drafts.
     #
     # Measured 2026-08-24: /usr/local/bin/amux was an Aug-6 227-line STUB that
     # knew two verbs and defaulted AMUX_URL to https://localhost:8822, the
@@ -327,12 +325,12 @@ if [ -f "$REPO/amux" ]; then
     if [ "$cand" = "$live_cli" ]; then
       out+="  - installed CLI differs from this checkout: ${cand}  (THIS is the one you run)"$'\n'
       out+="    an unknown verb there may print help and exit 0 — a silent no-op"$'\n'
-      out+="    ln -sfn \"$REPO/amux\" \"$cand\"   # a symlink cannot go stale; a copy can"$'\n'
+      out+="    after reviewing a resolved checkout: make -C \"$REPO\" install-cli BIN_DIR=\"$(dirname "$cand")\""$'\n'
     else
       out+="  - a SHADOWING amux copy differs from this checkout: ${cand}"$'\n'
       out+="    your PATH runs ${live_cli:-none} instead, so it is inert HERE and not"$'\n'
       out+="    for a lane whose PATH orders those directories the other way"$'\n'
-      out+="    ln -sfn \"$REPO/amux\" \"$cand\"   # or remove it, if nothing should install there"$'\n'
+      out+="    after reviewing a resolved checkout: make -C \"$REPO\" install-cli BIN_DIR=\"$(dirname "$cand")\""$'\n'
     fi
   done
 fi
@@ -451,6 +449,16 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
     out+="    running: ${_pgd}"$'\n'
     out+=$'    it has NO git-hook installer of its own and is not in the list above;\n'
     out+=$'    a repo edit reaches nobody until someone installs it (AF-409)\n'
+    out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
+  fi
+  # The read router has the same blind spot and cost eight days (AMUX-4544):
+  # every lane ran 6bce0158's copy after 4c068e80 changed the committed one.
+  _rrd="${AMUX_READ_ROUTER_DEST:-$HOME/.amux/hooks/large-read-guard.py}"
+  _rrs="$REPO/scripts/hooks/large-read-guard.py"
+  if [ -f "$_rrs" ] && [ -f "$_rrd" ] && ! cmp -s "$_rrs" "$_rrd"; then
+    out+="  - the PreToolUse large-read router differs from this checkout"$'\n'
+    out+="    running: ${_rrd}"$'\n'
+    out+=$'    every Read and Bash call on this box runs it; a repo edit reaches nobody until it is installed (AMUX-4544)\n'
     out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
   fi
 

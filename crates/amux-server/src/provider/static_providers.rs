@@ -1,4 +1,4 @@
-//! Minimal adapters for gemini, codex, ollama, and grok (RR-0043).
+//! Minimal adapters for gemini, codex, ollama, grok, and muse (RR-0043).
 //!
 //! "Minimal" is a statement about USAGE, not a placeholder: none of the three
 //! exposes a usage/quota API amux can read on this host today
@@ -49,8 +49,7 @@ impl ProviderAdapter for GeminiAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // The CLI's own selectable tiers; no listing endpoint to query.
-        vec!["gemini-2.5-pro".into(), "gemini-2.5-flash".into()]
+        crate::provider::model_catalog::worker_model_ids("gemini")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
@@ -100,9 +99,10 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // No enumerable model surface from the CLI; empty is honest — the
-        // configured model rides in WorkerConfig, not here.
-        Vec::new()
+        // Codex itself has no subscription model-listing command. The dated
+        // official fallback is therefore the enumerable surface, while the
+        // configured model remains an unrestricted open string.
+        crate::provider::model_catalog::worker_model_ids("codex")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
@@ -244,10 +244,28 @@ impl ProviderAdapter for OllamaAdapter {
                 "workspace-write".into(),
                 // Local models don't support extended thinking (xhigh). The
                 // global ~/.codex/config.toml may set model_reasoning_effort=xhigh
-                // for OpenAI models; override it here so ollama workers use low
-                // effort and are responsive (xhigh hangs qwen, ~30min wasted: AH-81).
+                // for OpenAI models; override it here so ollama workers are
+                // responsive (xhigh hangs qwen, ~30min wasted: AH-81).
+                //
+                // `none`, NOT `low` (AMUX-4611). `low` is a guaranteed failure
+                // for a model without the `thinking` capability: qwen3-coder
+                // died on every turn with `does not support thinking`, 32
+                // occurrences in one exec. Measured 2026-09-16 on codex-cli
+                // 0.153.4, `none` works for both a thinking and a non-thinking
+                // model; `low`, `minimal` and omitting the flag all fail the
+                // non-thinking one (omitting inherits "medium" from the global
+                // config, so it is not a neutral choice).
+                //
+                // THIS PATH CANNOT PROBE and the launch arm can, which is why
+                // they differ. `build_command` is sync, so it has no way to ask
+                // `ollama show` what the model can do; session_verbs.rs's arm
+                // is async and keeps `low` for thinking-capable models because
+                // that is the setting measured good for them. A caller that
+                // cannot discriminate takes the value that never hard-fails.
+                // `provider.launch_matches_adapter` compares the BINARY, not
+                // the flags, so this difference is not drift it would flag.
                 "-c".into(),
-                "model_reasoning_effort=low".into(),
+                "model_reasoning_effort=none".into(),
             ],
             PromptMode::HeadlessStructured => vec![
                 "codex".into(),
@@ -307,6 +325,75 @@ impl ProviderAdapter for GrokAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Muse Code
+// ---------------------------------------------------------------------------
+
+/// Meta's Muse Code CLI (`muse`, measured against 1.0.3-R2198.1 on macOS).
+///
+/// HOOKS ARE TRUE HERE, and that is the row that matters. Every other non-Claude
+/// adapter reports `hooks: false` because its CLI has no hook surface at all —
+/// docs/provider-parity.md row 11 records that as a GAP (upstream) for Gemini,
+/// with terminal scraping as the sanctioned fallback per D1. Muse ships the
+/// SAME contract Claude Code does: the nine events (UserPromptSubmit,
+/// PreToolUse, PostToolUse, SessionStart, SessionEnd, Stop, SubagentStop,
+/// Notification, PreCompact), the `hookSpecificOutput.hookEventName` envelope,
+/// and a `$HOME/.config/muse/settings.json` to declare them in. Verified by
+/// inspecting the shipped binary, not from documentation.
+///
+/// So a muse lane can self-report through the D1 path instead of being scraped,
+/// which is the difference between board attribution that is TOLD what happened
+/// and board attribution that infers it from pixels. Wiring those hooks is a
+/// separate change; this flag is what tells the rest of amux it is possible.
+///
+/// No usage/quota API on this host, so `usage()` stays Unknown (Invariant 20).
+pub struct MuseAdapter;
+
+#[async_trait]
+impl ProviderAdapter for MuseAdapter {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("muse")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            hot_model_switch: false,
+            reports_usage: false,
+            // `muse exec --json` emits machine-readable JSONL events.
+            structured_events: true,
+            // See the doc comment: Claude-Code-parity hook contract, verified.
+            hooks: true,
+        }
+    }
+
+    async fn usage(&self) -> ProviderUsage {
+        ProviderUsage::unknown(self.id())
+    }
+
+    async fn models(&self) -> Vec<String> {
+        // From the live provider catalog written by the CLI itself
+        // (~/.local/share/muse/model-catalog/*.json): 1.3-contributor carries
+        // is_default/is_current, so it leads. Ordered newest-first, not
+        // alphabetically — the picker shows this order.
+        vec![
+            "muse-spark-1.3-contributor".into(),
+            "muse-spark-1.3".into(),
+            "muse-spark-1.2".into(),
+        ]
+    }
+
+    fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
+        match prompt_mode {
+            PromptMode::Interactive => vec!["muse".into()],
+            // `exec` is the headless verb; `--json` is what makes it structured.
+            // Both are required — bare `muse --json` is not a thing.
+            PromptMode::HeadlessStructured => {
+                vec!["muse".into(), "exec".into(), "--json".into()]
+            }
+        }
+    }
+}
+
 /// Parse `ollama list` output: a header line, then one model per line with
 /// the name as the first whitespace-separated column, e.g.
 /// `llama3:latest    365c0bd3c000    4.7 GB    2 weeks ago`.
@@ -331,6 +418,7 @@ mod tests {
             &CodexAdapter,
             &OllamaAdapter::default(),
             &GrokAdapter,
+            &MuseAdapter,
         ] {
             let usage = adapter.usage().await;
             assert_eq!(usage.provider, adapter.id());
@@ -361,6 +449,14 @@ mod tests {
         assert!(!grok.hooks);
         assert!(!grok.reports_usage);
         assert!(!grok.hot_model_switch);
+        // Muse is the ONLY non-Claude adapter claiming hooks. If this assert is
+        // ever "fixed" by flipping it to false, docs/provider-parity.md row 11
+        // silently regresses from MET to a scrape fallback for muse lanes.
+        let muse = MuseAdapter.capabilities();
+        assert!(muse.hooks, "muse ships the Claude-parity hook contract");
+        assert!(muse.structured_events);
+        assert!(!muse.reports_usage);
+        assert!(!muse.hot_model_switch);
     }
 
     #[test]
@@ -376,6 +472,23 @@ mod tests {
     }
 
     #[test]
+    fn muse_builds_muse_command() {
+        assert_eq!(MuseAdapter.build_command(PromptMode::Interactive), vec!["muse"]);
+        // `exec` AND `--json`: bare `muse --json` is not a valid invocation.
+        assert_eq!(
+            MuseAdapter.build_command(PromptMode::HeadlessStructured),
+            vec!["muse", "exec", "--json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn muse_models_lead_with_the_catalog_default() {
+        let m = MuseAdapter.models().await;
+        assert_eq!(m.first().map(String::as_str), Some("muse-spark-1.3-contributor"));
+        assert!(m.iter().any(|x| x == "muse-spark-1.2"));
+    }
+
+    #[test]
     fn ollama_builds_codex_oss_command() {
         let a = OllamaAdapter::with_model("qwen3.8:27b");
         // Interactive: includes -a never + --sandbox workspace-write so both the
@@ -384,7 +497,10 @@ mod tests {
         let interactive_expected = vec![
             "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
             "-a", "never", "--sandbox", "workspace-write",
-            "-c", "model_reasoning_effort=low",
+            // `none`, not `low` (AMUX-4611): this path is sync and cannot ask
+            // `ollama show` whether the model can think, and `low` is a
+            // guaranteed per-turn failure for one that cannot.
+            "-c", "model_reasoning_effort=none",
         ];
         // HeadlessStructured: no extra flags needed (headless driver handles approvals).
         let headless_expected = vec![

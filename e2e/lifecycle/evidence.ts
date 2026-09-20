@@ -1,0 +1,125 @@
+import { expect, Page, TestInfo, APIRequestContext, Response } from '@playwright/test';
+import { captureState } from '../ux-discovery/crawler';
+
+export async function boot(page: Page) {
+  await page.goto('/');
+  await page.waitForFunction(() => typeof (window as any).apiCall === 'function');
+  await page.addLocatorHandler(page.locator('#sw-fail-bar'), async bar => {
+    await bar.locator('button').last().click();
+  });
+  const onboarding = page.locator('#wt-overlay.open');
+  await onboarding.waitFor({ state: 'visible', timeout: 4000 }).catch(() => {});
+  if (await onboarding.isVisible()) await page.locator('#wt-tooltip .wt-skip').click();
+}
+
+// Discovery is evidence of visibility, never a claim that a control's effect works.
+export async function checkpoint(page: Page, info: TestInfo, name: string) {
+  const state = await captureState(page, 0);
+  await info.attach(`${name}-controls`, {
+    body: JSON.stringify({ ...state, coverage: 'discovered; effects require scenario assertions' }, null, 2),
+    contentType: 'application/json',
+  });
+  await info.attach(name, { body: await page.screenshot({ fullPage: !(await page.locator('.overlay.active').count()), animations:'disabled' }), contentType: 'image/png' });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1),
+    `${name}: page must fit the viewport`).toBe(true);
+}
+
+export async function auth(page: Page) {
+  const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
+  expect(token).toBeTruthy();
+  return { Authorization: `Bearer ${token}` };
+}
+
+// GET /api/sessions can legitimately 503 once when a concurrent session
+// create/delete races the single-flight list build — the server fails
+// closed rather than serve a stale snapshot and says so in its own error
+// ("sessions list changed during discovery; retry"). These specs create
+// several sessions back-to-back, which is exactly the shape that triggers
+// it, so a single unguarded request.get here reads as a product bug when it
+// is really a documented, retryable race. Retry instead of asserting on the
+// first attempt.
+export async function getSessionsResilient(
+  request: APIRequestContext, headers: Record<string, string>, attempts = 5,
+) {
+  let response = await request.get('/api/sessions', { headers });
+  for (let i = 1; i < attempts && !response.ok(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 250 * i));
+    response = await request.get('/api/sessions', { headers });
+  }
+  return response;
+}
+
+export async function deleteOwnedWorkers(page: Page, request: APIRequestContext,
+  headers: Record<string, string>, names: string[]) {
+  for (const name of names) {
+    expect(name.startsWith('lc-'), 'cleanup must target a run-owned fixture').toBe(true);
+    const response = await getSessionsResilient(request, headers);
+    expect(response.ok(), 'sessions listing must recover from a transient race').toBeTruthy();
+    if (!(await response.json()).some((row: any) => row.name === name)) continue;
+    // A THROW HERE REPLACES THE TEST'S OWN ERROR. This helper runs in the
+    // spec's `finally`, and in JS a finally that throws discards the try
+    // block's exception, so a teardown that cannot click reports itself as the
+    // failure and hides what actually broke. That is what made AMUX-4642 read
+    // as "Back click times out" for two days: the real failure was earlier, and
+    // this click was only blocked by the overlay that earlier failure left open.
+    // Close the topmost layer by calling its handler, which cannot be
+    // intercepted, so teardown stops competing with the bug it is hiding.
+    await page.evaluate(() => (window as any).closeFilePreview?.());
+    const closeDetail = page.locator('#board-detail-overlay.active > .overlay-header').getByRole('button', { name: 'Back', exact: false });
+    if (await closeDetail.isVisible()) await closeDetail.click();
+    const closePeek = page.locator('#peek-overlay.active').getByRole('button', { name: 'Close worker', exact: true });
+    if (await closePeek.isVisible()) await closePeek.click();
+    // An explicit destination prevents a delayed saved-peek restore from
+    // covering the Workers tab while teardown is trying to click it.
+    await page.goto('/#view=sessions');
+    await expect(page.locator('#peek-overlay')).not.toHaveClass(/active/);
+    await page.locator('#tab-sessions').click();
+    const card = page.locator(`.card[data-session="${name}"]`).locator('visible=true').first();
+    await expect(card).toBeVisible();
+    await card.locator('.card-menu-btn').click();
+    await page.locator('.card-menu.open [data-worker-action="delete"]').click();
+    await expect(page.locator('#modal-msg')).toHaveText(`Delete worker "${name}"?`);
+    await page.locator('#modal-btns').getByRole('button', { name: 'Delete', exact: true }).click();
+    await expect.poll(async () => {
+      const rows = await getSessionsResilient(request, headers);
+      // A transient race here is "unknown", not "still present" — report not-yet-
+      // confirmed-deleted so the poll keeps waiting instead of hard-failing on a
+      // 500 that a moment later would have resolved on its own.
+      if (!rows.ok()) return true;
+      return (await rows.json()).some((row: any) => row.name === name);
+    }, { message: `UI deletion must actually unregister ${name}`, timeout: 15_000 }).toBe(false);
+  }
+}
+
+// A mobile retry can return a durable dedupe receipt, or a queued acceptance.
+// Neither promises immediate submission. Verify the original request reached
+// history with a confirmed terminal outcome instead of resending it.
+export async function expectDelivered(page: Page, response: Response) {
+  expect(response.ok(), await response.text()).toBe(true);
+  const receipt = await response.json();
+  expect(receipt.ok).toBe(true);
+  const sent = response.request().postDataJSON();
+  expect(typeof sent.text).toBe('string');
+  expect(sent.text.length).toBeGreaterThan(0);
+  const name = decodeURIComponent(new URL(response.url()).pathname.split('/').at(-2)!);
+  const headers = await auth(page);
+  const startedAt = response.request().timing().startTime / 1000;
+  await expect.poll(async () => {
+    const history = await page.request.get(`/api/history?session=${encodeURIComponent(name)}&limit=250`, { headers });
+    if (!history.ok()) return false;
+    if ((await history.json()).some((message: any) =>
+      String(message.text).includes(sent.text) && message.delivered_at > 0
+      && ['confirmed', 'retried'].includes(message.submit_verdict))) return true;
+    // Queued submissions are stamped by the drain in steering history, not
+    // cmd_history. Dead-letter rows also have timestamps, so require a real
+    // submission verdict and match this send's identity (or exact unique text).
+    const steering = await page.request.get(`/api/sessions/${encodeURIComponent(name)}/steer?history=1`, { headers });
+    if (!steering.ok()) return false;
+    return (await steering.json()).some((message: any) =>
+      (receipt.queue_id ? message.id === receipt.queue_id :
+        message.text === sent.text && message.queued_at >= startedAt - 2) &&
+      message.delivered_at > 0 && ['confirmed', 'retried'].includes(message.submit_verdict));
+  }, { timeout: 180_000, intervals: [1000, 3000, 5000],
+    message: `${name}: accepted message must actually reach the terminal` }).toBe(true);
+  await expect(page.locator('#peek-cmd-input')).toHaveValue('');
+}

@@ -43,11 +43,44 @@ applies one exact string, runs the command, and reverts in a trap even if the
 command is killed. Do not use `cp file bak` on this shared checkout; it is a
 whole-file write and has reverted a peer's in-flight work twice.
 
+## Installer Rust source and artifact isolation (`install.sh`)
+
+```bash
+python3 scripts/test-install-committed-source.py
+```
+
+Pass: `install committed source: 79 passed, 0 failed`. The actual installer runs
+through both Rust binary publications in eleven disposable Git fixtures; the
+compiler reads committed/dirty specimen files and installation targets temporary
+paths. The fixture stops before Bash CLI installation, hooks, services or databases.
+It covers dirty/untracked source, HEAD advance, relative target, unresolved index,
+missing Git, failed build, shared-output replacement at compiler return and at
+publication, replacement between binaries, and altered private artifact refusal.
+Old installed sentinels must survive every refusal. Private stages are cleaned.
+
+Dependencies still use the shared Cargo target. Final executables are linked
+straight into a private directory using `cargo rustc -- --emit=link=<private>`;
+both publication candidates must match a pinned-commit SHA256 manifest before
+any live rename. Each rename is atomic; the pair is not a filesystem transaction.
+Source decisions, artifact identities, mismatches, partial publication failures and
+successful publication self-announce in `$AMUX_HOME/logs/server-install.log`
+(default `~/.amux/logs/server-install.log`). The fixture does not deploy a server
+or substitute for a real compiler check of the private link-output path.
+
 ## Dashboard client JS (`crates/amux-dashboard/static`)
 
 ```bash
 node --check crates/amux-dashboard/static/app.js
+npm run build:state
+bash scripts/spa-lint.sh
+npm run test:state
 ```
+
+Commit the regenerated `static/state/control-registry.json` and `kernel.js`
+when handlers change. `spa-lint.sh` checks their freshness before ESLint; a
+targeted Playwright configuration can skip that preflight and pass against a
+stale interaction bundle. When testing candidate assets against a running
+server, set `AMUX_E2E_STATE_KERNEL` alongside the candidate app/HTML/CSS paths.
 
 Then bump `APP_VER` (`app.js`) and `CACHE` (`sw.js`) **together**. A change to
 one without the other ships code nobody's browser will fetch.
@@ -72,8 +105,13 @@ surface, and layout breaks live at 375px.
 
 ## e2e (`e2e/`)
 
+For the combined product lifecycle, use `npm run test:lifecycle` and
+[the consolidated acceptance guide](docs/consolidated-lifecycle.md). It retains
+per-stage failures, skipped prerequisites, visual evidence, real task completion
+and peer coordination. `npm run test:lifecycle:browser` is the browser-only scope.
+
 ```bash
-npx playwright test e2e/<spec>.spec.ts
+npx playwright test --config=e2e/playwright.config.ts e2e/<spec>.spec.ts
 ```
 
 Pass: the spec name and `N passed`. If e2e infra is genuinely unavailable, say

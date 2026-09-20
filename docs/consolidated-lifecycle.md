@@ -1,0 +1,1162 @@
+# Amux consolidated lifecycle acceptance
+
+One suite, one run directory, one evidence ledger. This consolidates the golden
+scenarios, RR-0133 all-subsystem acceptance, the seven claims in
+`docs/e2e-acceptance.md`, worker configurations, browser regressions and UX discovery.
+Same-group and cross-group peer discovery, task awareness, request/reply boundaries,
+changes-requested review, independent re-review and dependent integration are
+first-class scenarios. Existing specs remain independently runnable; no coverage is deleted or duplicated
+by importing test files into a giant order-dependent test.
+
+Current release evidence and every known unresolved lifecycle gap are tracked in
+[Lifecycle status and closure checklist](lifecycle-open-work.md), with the latest
+[steering and sync validation](lifecycle-validation-2026-09-12.md). That status is
+INCOMPLETE; the case catalog is not a completed test run.
+
+## Run
+
+```bash
+npm ci
+npx playwright install chromium webkit
+python3 scripts/lifecycle/run.py plan
+python3 scripts/lifecycle/run.py browser
+python3 scripts/lifecycle/run.py full
+```
+
+`plan` lists every browser case and inventories supporting tests without starting a
+server. `browser` builds this checkout, pins a private executable, boots separate
+temporary homes for desktop Chromium, 375px Chromium and iPhone WebKit, and runs all
+browser specs plus the connected journey. `full` also runs workspace syntax and
+Rust unit/integration tests, existing opt-in real-provider/backend scenarios, and
+the new autonomous worker journey. The shell/node regression files are inventoried;
+only those invoked by existing Rust contracts or CI equivalents are automated here.
+
+For the autonomous journey configure a dedicated amux test installation with a
+working provider, an EMPTY scratch repository accessible to that installation,
+the normal harness and board driver enabled, and these environment variables:
+
+```bash
+export AMUX_LIFECYCLE_LAB_URL=https://localhost:YOUR_TEST_PORT
+export AMUX_LIFECYCLE_LAB_WORKSPACE=/absolute/path/to/empty/scratch-repo
+export AMUX_LIFECYCLE_LAB_ACK=dedicated-test-instance
+# Optional: AMUX_LIFECYCLE_PROVIDER=claude|codex|gemini|ollama
+# Optional: AMUX_LIFECYCLE_STORAGE_STATE=/path/to/test-browser-auth.json
+python3 scripts/lifecycle/run.py live
+```
+
+Isolated workers are first-class cases: `LC-08` runs in all three browser
+projects; `LC-ISOLATED-NATIVE` runs the real queued-file/raw-provider scenario.
+Queue persistence alone is not evidence that the provider consumed the message.
+The remaining board/restart/offline continuation is guided and must be recorded
+separately; see [isolated lifecycle validation](lifecycle-isolated-validation-2026-09-12.md).
+
+```bash
+python3 scripts/lifecycle/run.py browser --grep LC-ISOLATED
+AMUX_LIFECYCLE_PROVIDER=claude python3 scripts/lifecycle/run.py live --grep LC-ISOLATED-NATIVE
+AMUX_LIFECYCLE_PROVIDER=gemini python3 scripts/lifecycle/run.py live --grep LC-ISOLATED-NATIVE
+```
+
+For background browser expiry, run the real scratch-Chrome case explicitly:
+
+```bash
+AMUX_LIFECYCLE_BROWSER_TTL_S=20 python3 scripts/lifecycle/run.py browser   --project desktop --grep LC-BROWSER-BACKGROUND
+python3 scripts/lifecycle/run.py browser   --grep 'LC-SYNC-PROGRESS|LC-COMPOSER-FILES|LC-COMPOSER-LAYOUT'
+AMUX_LIFECYCLE_PROVIDER=claude python3 scripts/lifecycle/run.py live --grep LC-STEERING-AUTO
+AMUX_LIFECYCLE_PROVIDER=gemini python3 scripts/lifecycle/run.py live --grep LC-STEERING-AUTO
+bash scripts/test-contended.sh -p amux-server --lib real_tmux_submission_replay_keeps_generating_input_unconfirmed -- --ignored --nocapture
+```
+
+The TTL setting is scoped to temporary test servers; it disables their idle and
+activity expiry so the hard lifetime is independently exercised. Only the browser
+reaper is enabled through existing per-job controls; every other catalogued loop
+stays disabled, and the test verifies that isolation before launching Chrome. Run
+the TTL selection separately from ordinary browser tests; those retain global
+fleet isolation. Omitting the TTL setting
+skips the real-Chrome case, which is not a pass. Native steering requires normal
+worker admission, uploaded bytes, confirmed automatic delivery and an original
+terminal task with evidence. Its preflight refuses a denied host before creation.
+
+The live phase also runs two three-worker coordination journeys: all peers in one
+group, then implementation in one group and review/integration in another. The
+reviewer must reject a seeded defect, the author must revise, the reviewer must
+approve, and the consumer must finish its dependent task. Durable message origin
+and ordering, actual peer task IDs, final board state and independent artifact
+checks are required; an operator writing a review file cannot substitute for the
+peer-message evidence. The deterministic policy test separately checks discovery,
+peer task reads, explicit cross-group denial and same-group isolation.
+
+The lab is separate because the ordinary browser harness disables host-wide fleet
+jobs and seeds a fake provider key. Those prerequisites cannot prove autonomous
+work. Do not use a production URL. The live test creates one uniquely named worker
+through the UI with three real deliverables. After submission the observer only
+reads state: it does not PATCH tasks forward or supply their evidence. It records
+the timeline, final card details, actual file bytes, and a rendered HTML artifact.
+A timeout is a failure, with the unfinished tasks retained for diagnosis.
+
+A focused development run is `browser --project desktop --grep LC-BOARD`.
+`--binary /path/to/server` saves build time but records unverified source provenance;
+it does not prove that binary corresponds to this checkout. Every invocation gets
+a fresh output directory. Never combine stale evidence from previous runs.
+
+## Coverage and verdicts
+
+The runner emits `index.html`, `summary.json`, per-stage logs, the Playwright HTML
+report, traces, videos, screenshots, discovered control inventories, and a copy of
+`cases.json` initialized to NOT_RUN. PASS, FAIL, INCOMPLETE and NOT_RUN are distinct.
+A skipped or unavailable real provider is not a pass. Exit 1 means failure, 2 means
+incomplete, 0 means only that the selected automated scope passed. A `full` run
+stays INCOMPLETE until a reviewer finishes the guided/visual ledger; there is no
+automatic claim of total UI coverage. The ledger is a review artifact, not a way
+to override automated failures.
+
+For each case below record viewport/provider, exact action, entity IDs, screenshot,
+read-only API or file proof, result and any failure reason. Follow each discovered
+control into its dialog/popover and add a ledger row for new controls. A control
+merely being present, or a mocked response rendering, is not a successful effect.
+Do not equate crawler fixture coverage with shipped-dashboard coverage.
+
+For **every button, menu item, tab, link, input, select, switch, draggable row and
+keyboard shortcut** in each surface: open/use it, check the visible outcome, verify
+persisted state where applicable, reload, cancel without mutation, try invalid and
+empty input, and repeat at phone width. Also check keyboard focus, Tab order,
+Enter/Escape, screen-reader name, disabled/loading state, clipping, touch reach,
+long text and back navigation. Do not force-click or replace DOM state to make a
+journey pass. For external sends use only a configured test sink and explicit
+recipient authorization; otherwise leave the send case INCOMPLETE.
+
+Inspect the images: desktop, 375px, real WebKit, light/dark, empty/populated,
+loading/error, long text and on-screen keyboard. Record actual defects, including
+which control is obscured. Retain the screenshot before changing anything.
+
+## Ordered acceptance cases
+
+Run in the order below within a scratch installation. The matrix is a canonical
+operator script for coverage that is not yet fully automated. Automated tests are
+supporting evidence; their existence does not pre-mark any of these rows PASS.
+
+### LC-01 — Fresh install and onboarding
+
+Open a fresh home; exercise setup, provider-key entry, walkthrough Next/Back/Skip/reopen, and empty-state Create.
+
+Pass requires: No blank or permanently connecting screen; missing prerequisites are actionable; setup persists.
+
+Supporting coverage: `e2e/settings.spec.ts`, `e2e/phase0.spec.ts`.
+
+### LC-02 — Navigation and customization
+
+Open every top-level tab, overflow menu, hide/show/reorder tabs, reload, use Back/Forward and a direct entity link.
+
+Pass requires: Selected view and scope match the URL; hidden tabs remain discoverable; no offscreen controls.
+
+Supporting coverage: `e2e/lifecycle/journey.spec.ts`, `e2e/tab-customizer.spec.ts`, `e2e/browser-history.spec.ts`.
+
+### LC-03 — Worker creation
+
+Create a worker from New worker; exercise name validation, provider/model, cwd autocomplete, template, branch and worktree choices; cancel a second creation.
+
+Pass requires: Exactly one durable worker; correct provider/cwd/branch; cancellation creates nothing; no false successful start.
+
+Supporting coverage: `e2e/lifecycle/live-journey.spec.ts`, `e2e/control-plane.spec.ts`.
+
+### LC-04 — Worker start/stop/restart
+
+Start, send a short task, observe running/working/idle, stop, restart and reopen terminal.
+
+Pass requires: Real process and displayed state agree; output resumes once; unrelated workers are untouched.
+
+Supporting coverage: `crates/amux-server/tests/golden_live.rs`.
+
+### LC-05 — Worker menu and identity
+
+Exercise every card-menu and peek-menu action, rename, duplicate/clone, pin/unpin, archive/restore and search; verify aliases and copied links.
+
+Pass requires: Actions produce the named effect; rename preserves board/history identity; copies do not silently share identity.
+
+Supporting coverage: `e2e/worker-action-parity.spec.ts`, `crates/amux-server/tests/rename_covers_every_session_table.rs`.
+
+### LC-06 — Worker configuration changes
+
+Edit description, label, cwd, branch, model, provider, effort, permissions, isolation and MCP; reload and restore.
+
+Pass requires: Durable values match UI; restart/apply timing is explained; prior task context is retained.
+
+Supporting coverage: `e2e/worker-configurations.spec.ts`, `crates/amux-server/tests/golden_remaining.rs`.
+
+### LC-07 — Configuration inheritance
+
+At global/group/worker levels edit memory, instructions, environment, rules, connectors, skin and gates; override then Inherit.
+
+Pass requires: Source and effective value agree; sibling scope is unaffected; Inherit removes only the override.
+
+Supporting coverage: `e2e/worker-configurations.spec.ts`.
+
+### LC-08 — Isolated worker boundary
+
+Create an isolated worker with same-group and outside-group peers. Warm owner and peer rosters, toggle isolation through Configurations, reload, and check discovery after each change. Try direct and queued peer sends with explicit allowances. Queue an owner message, reload/toggle, then retry the same operation identity.
+
+Pass requires: Owner access and the durable queue survive isolation changes; cached peer rosters hide isolated workers immediately. Same-group and cross-group peers cannot bypass isolation through Send or Queue, and refusals create no grants, tasks, history or queued messages. A stopped worker remains pending, never falsely delivered. The ordinary peer stays visible.
+
+Supporting coverage: `e2e/isolated-worker.spec.ts`, `crates/amux-server/src/api/session_verbs.rs`.
+
+### LC-09 — Worker lists and working indicators
+
+Filter/search/group/sort/freeze the worker list; put one worker on one task then let it finish.
+
+Pass requires: Exactly the claimed task is Working now; counts, ordering and final idle state agree with authoritative data.
+
+Supporting coverage: `e2e/working-now-accuracy.spec.ts`, `e2e/worker-card-counts.spec.ts`, `e2e/worker-status-order.spec.ts`.
+
+### LC-10 — Groups lifecycle
+
+Create/rename a group, add/remove workers, edit scoped configuration, switch scope, then remove the empty test group.
+
+Pass requires: Membership and inherited settings persist; no cross-group data leakage or accidental mass mutation.
+
+Supporting coverage: `crates/amux-server/tests/golden_remaining.rs`.
+
+### LC-11 — Prompt to task decomposition
+
+Submit one instruction with at least three distinct deliverables and dependencies through the worker composer.
+
+Pass requires: Separate actionable tasks are created and linked to the source message; no untouched capture shell counts as work.
+
+Supporting coverage: `e2e/lifecycle/live-journey.spec.ts`, `docs/e2e-acceptance.md`.
+
+### LC-12 — Board create/edit/reload/export
+
+Create through the UI with notes, owner, group, due time and gate; reopen, edit, search, filter, switch views and export Markdown/JSON.
+
+Pass requires: Exactly one task persists, all fields and export match, empty search has a useful state, cancel preserves old values.
+
+Supporting coverage: `e2e/lifecycle/journey.spec.ts`, `e2e/board-search-slim.spec.ts`, `e2e/board-slim-consumers.spec.ts`.
+
+### LC-13 — Card detail and navigation
+
+Open old/new deep links; inspect status, next action, owner, blockers, history, evidence and outputs; follow worker and file links.
+
+Pass requires: The card alone explains work and next action; the exact linked entity opens; details fit every viewport.
+
+Supporting coverage: `e2e/card-details.spec.ts`, `e2e/peek-path-links.spec.ts`.
+
+### LC-14 — Column lifecycle and gates
+
+Create custom test columns and gates; reorder them; edit a gate; transition a scratch task with a missing condition, then supply real proof.
+
+Pass requires: The refusal names the unmet gate; permitted transition records actor/time; custom terminal state is honored.
+
+Supporting coverage: `e2e/worker-configurations.spec.ts`, `crates/amux-server/tests/board_api.rs`.
+
+### LC-15 — Backlog autonomous pickup
+
+Create backlog work with a clear next action; leave the observer idle for several driver ticks. Exercise both Backlog and Todo on each of two real workers, with dependencies in opposite initial-state order and no chat prompt, observer claim, evidence write or status advancement.
+
+Pass requires: Work progresses to todo and doing without observer nudges; history attributes the promotion. Every original seeded ID reaches an evidenced terminal state; completing only one worker is INCOMPLETE. Retain timelines for starvation or acknowledgement-generated work.
+
+Supporting coverage: `docs/e2e-acceptance.md`, `crates/amux-server/tests/golden_scenarios.rs`, `e2e/lifecycle/sonnet-queue.ts`.
+
+### LC-16 — Overdue ordering
+
+Create three scratch backlog cards due seven, three and one days ago, with a deterministic tied-due pair.
+
+Pass requires: Promotion is oldest due first, then stable ID order; partial promotion explains rate limit or WIP.
+
+Supporting coverage: `docs/e2e-acceptance.md`.
+
+### LC-17 — WIP and ownership
+
+Queue work behind a claimed task; attempt a second claim and a competing-worker claim.
+
+Pass requires: One owner/lease wins; blocked work explains WIP; after completion the next task starts once.
+
+Supporting coverage: `e2e/queued-behind-wip.spec.ts`, `crates/amux-server/tests/task_graph.rs`.
+
+### LC-18 — Dependency chain and cycle
+
+Create parent/children and a blocked dependency; attempt a cycle; complete children through real work.
+
+Pass requires: Cycles are rejected; parents remain blocked until all prerequisites meet their required terminal conditions.
+
+Supporting coverage: `crates/amux-server/tests/golden_scenarios.rs`, `crates/amux-server/tests/task_graph.rs`.
+
+### LC-19 — Review and negative gates
+
+Attempt done without an artifact, without evidence, and with a false gate acknowledgment; then supply real results.
+
+Pass requires: All invalid closures are refused visibly; legitimate closure preserves command, result and accessible output.
+
+Supporting coverage: `crates/amux-server/tests/board_api.rs`, `docs/e2e-acceptance.md`.
+
+### LC-20 — Blocked/needs-you/recovery
+
+Create a genuine missing-input or dependency blocker; inspect card and worker; provide the input through normal UI.
+
+Pass requires: Blocked state names reason/owner/next action; work resumes without resetting unrelated tasks.
+
+Supporting coverage: `crates/amux-server/tests/golden_scenarios.rs`.
+
+### LC-21 — Code change to finished artifact
+
+Run the three-part live journey: implement sum, test it, add non-finite validation, retest, produce HTML and Markdown results.
+
+Pass requires: Actual files change, independent tests pass, tasks finish with evidence; generated HTML renders its unique run marker.
+
+Supporting coverage: `e2e/lifecycle/live-journey.spec.ts`.
+
+### LC-22 — Verification and reopen
+
+Independently run the artifact tests, inspect its rendered result, verify task, then reopen with a concrete correction and repeat.
+
+Pass requires: Verified is backed by fresh checks; reopened work is driven back to a terminal state; history retains both cycles.
+
+Supporting coverage: `crates/amux-server/tests/golden_scenarios.rs`, `crates/amux-server/tests/golden_remaining.rs`.
+
+### LC-23 — Board archive/discard/cleanup
+
+Archive/restore and discard only test cards; inspect terminal availability; try the column migration dialog then Cancel.
+
+Pass requires: No unintended card moves; cancelled migration changes nothing; archived/discarded items remain traceable.
+
+Supporting coverage: `crates/amux-server/tests/board_api.rs`.
+
+### LC-24 — Composer and delivery
+
+Type/paste multiline text, expand composer, switch send modes, send once, inspect pending/sent/failed, retry a controlled failure.
+
+Pass requires: Exact text and origin reach the right worker once; drafts survive failures and worker switching.
+
+Supporting coverage: `e2e/message-resend.spec.ts`, `e2e/suggestion-control-verdict.spec.ts`.
+
+### LC-25 — Message-to-task links
+
+Send multipart work and inspect message card chips; open each child task and navigate back.
+
+Pass requires: Every durable card link opens the exact child and its state/artifacts; source kind and MSG ID remain truthful.
+
+Supporting coverage: `e2e/terminal-message-navigation.spec.ts`, `e2e/msg-id-copy.spec.ts`, `e2e/messages-default-kind.spec.ts`.
+
+### LC-26 — Peer requests and callbacks
+
+In a test-only group make one worker request work from another, wait for completion/callback, inspect both boards.
+
+Pass requires: Own-board boundary enforced; links and callbacks preserve attribution; no duplicate unowned task escape.
+
+Supporting coverage: `e2e/worker-request-callback.spec.ts`.
+
+### LC-27 — Terminal reading and controls
+
+Open terminal/transcript; navigate earlier/later messages, source/content filters, Find, copy, path links and focus mode; test long output. For Gemini and Sonnet, send human and peer messages, produce enough output to require older-history loading, then find each exact message under its origin filter and open its linked task on desktop and phone.
+
+Pass requires: Scroll anchors and filter selection survive refresh; no cross-worker output/draft/card mixing; toolbar is reachable. Durable peer history must remain navigable after it leaves the live terminal frame; paint-log fallback cannot count as verified structured provider history.
+
+Supporting coverage: `e2e/terminal-message-navigation.spec.ts`, `e2e/terminal-scroll-accuracy.spec.ts`, `e2e/peek-default-tab.spec.ts`, `e2e/lifecycle/sonnet-crossgroup.ts`.
+
+### LC-28 — Read-aloud and media controls
+
+Start/pause/resume/seek/close read-aloud, change worker mid-playback, and interrupt playback.
+
+Pass requires: Player controls match audio state, stale playback stops appropriately, and no inaccessible overlay remains.
+
+Supporting coverage: `e2e/read-aloud-player.spec.ts`.
+
+### LC-29 — File upload and retry
+
+Upload a text file, close peek mid-transfer, cancel another, force failure, retry and download.
+
+Pass requires: File bytes match; transfer survives closing; cancel is not an error; failed chip retains its retryable file.
+
+Supporting coverage: `e2e/upload-chip-escape.spec.ts`, `e2e/lifecycle/uploads.spec.ts`, `e2e/lifecycle/files-upload.spec.ts`, `e2e/lifecycle/composer.spec.ts`, `e2e/lifecycle/sonnet-upload.ts`.
+
+### LC-30 — Files and previews
+
+Browse scratch directories, breadcrumb, search, open text/image/PDF/HTML, edit/save/reopen, create/rename/delete scratch files.
+
+Pass requires: Correct file and content open; binary/large/missing files explain limitations; previews fit phone screens.
+
+Supporting coverage: `e2e/peek-path-links.spec.ts`, `e2e/worker-action-parity.spec.ts`.
+
+### LC-31 — Memories and instructions
+
+Create/read/edit/delete worker memory, inspect inherited memory, search and reload; have worker use a unique fact.
+
+Pass requires: Version/content and effective scope persist; subsequent worker output uses the saved fact.
+
+Supporting coverage: `crates/amux-server/tests/golden_live.rs`.
+
+### LC-32 — Scheduler lifecycle
+
+Create schedule, choose worker/cadence/timezone, edit, disable/enable, run now, wait for natural fire, then delete.
+
+Pass requires: One attributed run per trigger; disabled schedule does not fire; history includes edited/deleted jobs.
+
+Supporting coverage: `e2e/scheduler-audit.spec.ts`, `crates/amux-server/tests/system_jobs.rs`.
+
+### LC-33 — System jobs and stalled work
+
+Open SYSTEM jobs, expand details, compare healthy/stalled/disabled jobs; use Run now only on the dedicated lab.
+
+Pass requires: UI agrees with registry/timestamps; stalled job is distinct; automation actually advances eligible tasks.
+
+Supporting coverage: `e2e/system-jobs.spec.ts`.
+
+### LC-34 — Calendar and timezone
+
+Create/edit/move/delete a scratch calendar event; inspect all-day/timezone/day boundaries and exported iCal.
+
+Pass requires: UI and feed represent the same event and timezone; deletion removes only that event.
+
+Supporting coverage: `docs/rust-rebuild-plan.md`.
+
+### LC-35 — Browser profiles and history
+
+Create test profile, start, navigate local artifact, view live screen, screenshot, history Back/Forward, open/close tab and stop.
+
+Pass requires: Real browser output updates; active/locked/unavailable states are distinguishable; process ends after Stop.
+
+Supporting coverage: `e2e/browser-history.spec.ts`, `e2e/browser-liveview-fail.spec.ts`.
+
+### LC-36 — Email draft and test send
+
+Create/edit/discard a draft; with explicit test-recipient authorization send to a controlled sink and inspect Sent.
+
+Pass requires: Draft persists; actual test delivery and Sent agree; failure preserves draft and visible error.
+
+Supporting coverage: `docs/rust-rebuild-plan.md`.
+
+### LC-37 — Connectors and authentication
+
+Add a test connector, configure scope, connect/disconnect, deny and expire auth, test and retry.
+
+Pass requires: Auth health and scoped availability are accurate; credentials are masked; revoked connector cannot act.
+
+Supporting coverage: `e2e/settings.spec.ts`.
+
+### LC-38 — Environment and provider keys
+
+Edit a test env variable/key through supported UI, reload, clear override, enter invalid value and test unavailable provider.
+
+Pass requires: Saved/effective config agree without stale refresh overwrite; absent/invalid key has a recoverable state.
+
+Supporting coverage: `e2e/settings.spec.ts`.
+
+### LC-39 — Search and cross-entity discovery
+
+Create uniquely named worker/task/group/memory/file; search globally and within tabs, filters, zero results and deep links.
+
+Pass requires: Every supported entity type is findable and opens correct scope; unsupported search domains are recorded as gaps.
+
+Supporting coverage: `crates/amux-server/tests/search_index.rs`, `e2e/board-search-slim.spec.ts`.
+
+### LC-40 — Offline write/reconnect
+
+Go offline, create three cards and edit existing work, reload offline, reconnect and wait for replay.
+
+Pass requires: Durable queue retains exact intent, server receives each mutation once, UI converges and queue drains.
+
+Supporting coverage: `e2e/golden.spec.ts`, `e2e/outbox-connectivity.spec.ts`.
+
+### LC-41 — Concurrent clients and conflicts
+
+Open two clients; edit the same task and distinct tasks concurrently; reconnect a stale client.
+
+Pass requires: Visible revision conflict protects both drafts; unrelated changes converge with no lost update.
+
+Supporting coverage: `e2e/local-multiplayer.spec.ts`, `e2e/golden.spec.ts`.
+
+### LC-42 — Connection failures and recovery
+
+Interrupt SSE without a clean close, cut network, restore; provoke bad auth and unavailable API.
+
+Pass requires: Status reflects usable data, zombie stream recovers, auth failure differs from retryable outage, no endless silent spinner.
+
+Supporting coverage: `e2e/golden.spec.ts`, `e2e/conn-history-classify.spec.ts`.
+
+### LC-43 — Service worker and PWA
+
+Install/open PWA, offline launch, cached-version upgrade, failure bar dismissal, save below banner.
+
+Pass requires: Upgrade does not lose drafts; failure explains offline limits; Save stays tappable on phone.
+
+Supporting coverage: `e2e/sw-fail-bar.spec.ts`.
+
+### LC-44 — Settings appearance and device
+
+Exercise every settings tab and control: theme, zoom, tabs, offline limits, device name, defaults, connections, About, devtools and walkthrough.
+
+Pass requires: Persisted controls survive reload; local-only settings remain local; modals close by keyboard and pointer.
+
+Supporting coverage: `e2e/settings.spec.ts`.
+
+### LC-45 — Usage, cost and limits
+
+Run real work; inspect token/cost ledger, worker/task attribution, limits, budget exhaustion and recovery.
+
+Pass requires: Nonzero real usage appears under correct identity; unknown/unmeasured is not zero; budget stops and recovery are clear.
+
+Supporting coverage: `e2e/settings.spec.ts`, `crates/amux-server/tests/golden_remaining.rs`.
+
+### LC-46 — Logs and diagnostics
+
+Inspect logs search/filter/details, measured diagnostic endpoints, invariant failures and client action error.
+
+Pass requires: Failed actions produce an attributable diagnostic signal; measured/n_considered distinguish empty from unmeasured.
+
+Supporting coverage: `crates/amux-server/tests/diagnostic_contract.rs`, `e2e/worker-toolbar-boot.spec.ts`.
+
+### LC-47 — Workspace, map and metrics
+
+Open Workspace grid, add/remove panes, resize/focus, switch worker; open map/graph and metrics filters.
+
+Pass requires: Pane identity remains correct; graph/metrics reflect scratch tasks and terminal states; no stale cross-worker data.
+
+Supporting coverage: `e2e/lifecycle/journey.spec.ts`.
+
+### LC-48 — Auxiliary tabs and empty capabilities
+
+Inspect MDAI, Proxies, Skills, Database, Torrents, journal/habits where enabled; use their creation/edit/cancel controls on test fixtures.
+
+Pass requires: Each advertised control works or explains its prerequisite; missing capabilities are recorded, not silently skipped.
+
+Supporting coverage: `e2e/lifecycle/journey.spec.ts`.
+
+### LC-49 — Multiplayer scope and revocation
+
+Invite test members/devices, restrict group access, edit concurrently, revoke one member and retest both clients.
+
+Pass requires: Authorized client continues; revoked client loses access; no hidden mutation leaks across scope.
+
+Supporting coverage: `e2e/local-multiplayer.spec.ts`.
+
+### LC-50 — Provider/model continuity
+
+Repeat core task flow on installed providers; switch model/provider mid-work and inspect continuation, rate-limit recovery and cancellation.
+
+Pass requires: Same durable task context and identity survive supported swaps; unavailable providers remain INCOMPLETE.
+
+Supporting coverage: `crates/amux-server/tests/golden_remaining.rs`.
+
+### LC-51 — Restart and persistence
+
+Restart only dedicated lab server and worker process during queued and active work; reconnect UI.
+
+Pass requires: Tasks/messages/files/gates persist; ownership reconciles; no duplicate execution; build identity brackets evidence.
+
+Supporting coverage: `crates/amux-server/tests/restart_persistence.rs`, `crates/amux-server/tests/backend_conformance.rs`.
+
+### LC-52 — Visual and accessibility sweep
+
+Inspect each checkpoint and every open dialog/popover across desktop, 375px, iPhone WebKit, light/dark, empty/populated/error/long text.
+
+Pass requires: No clipping/overlap or inaccessible action; focus/labels/keyboard/touch work; discovered controls have explicit effect-verification rows.
+
+Supporting coverage: `e2e/lifecycle/journey.spec.ts`, `e2e/ux-discovery/crawler.ts`.
+
+### LC-54 — Same-group peer awareness
+
+Create author, reviewer and consumer in one test group. Each reads its own and peers’ actual tasks, identifies ownership/status/blockers and names the exact IDs in messages. Repeat discovery and peer task reads with a worker that has no group, in both directions.
+
+Pass requires: Roster and board facts are correct without operator-pasted task context; same-group access is a positive control.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`, `e2e/lifecycle/ungrouped.spec.ts`.
+
+### LC-55 — Cross-group awareness and delivery
+
+Place author in build and reviewer/consumer in quality. Discover peers, inspect permitted task context, request work and wait for response with normal open defaults.
+
+Pass requires: Actual originated peer messages cross groups; request and response identify the right cards and artifacts.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-56 — Cross-group deny/allow/inherit
+
+Set a worker/group deny, attempt a new cross-group request, allow one destination, retry, clear override and inspect effective policy.
+
+Pass requires: Denied request is visibly refused with no delivered work; allowed destination succeeds; inheritance restores the documented default, not blanket access by accident.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-57 — Reply exception and isolation
+
+With initiation restricted, test a reply to an actual incoming request, an unsolicited new message, and a message to an isolated worker in the same group.
+
+Pass requires: Documented reply path works only with genuine inbound history; unsolicited initiation respects policy; isolation cannot be bypassed by group membership.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-58 — Peer review requests changes
+
+Author supplies a deliberate empty-input defect and requests review. Reviewer discovers the task, independently runs the failing test, owns a review task and sends REVIEW_CHANGES.
+
+Pass requires: Reviewer is a different worker, cites actual task/file/failure, and the implementation cannot be treated as approved before repair.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`, `e2e/lifecycle/live-sonnet-pair.spec.ts`.
+
+### LC-59 — Revision and independent re-review
+
+Author revises after reviewer feedback, records the changed artifact and tests, asks for re-review. Reviewer reruns tests and sends REVIEW_APPROVED.
+
+Pass requires: Durable message timestamps prove rejection precedes approval; approval refers to the revised work and actual successful tests, not the old artifact.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`, `e2e/lifecycle/live-sonnet-pair.spec.ts`.
+
+### LC-60 — Dependent integration and callback
+
+Consumer reads author/reviewer tasks, creates its own dependent integration task, waits for approval, tests the artifact, and sends HANDOFF_DONE. After HANDOFF_DONE, observe three complete board-driver cycles with no new user input; record cycle boundaries, per-worker open task IDs, messages and model calls.
+
+Pass requires: Integration finishes after approval; linked task IDs belong to the correct peers; callback wakes requester and all three workers reach evidenced terminal states. A completion callback must not request another acknowledgement or manufacture another review task solely to process its receipt. Completion receipts do not generate recursively captured acknowledgement tasks; all original deliverables remain terminal and no new model turn exists solely to acknowledge a receipt.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-61 — No peer ownership hijack or duplicate dispatch
+
+Two workers attempt to claim one task; repeat request/callback delivery; ask a peer for work without changing its owned task directly.
+
+Pass requires: One claim wins; one callback effect; task ownership and verified message origin stay accurate; duplicate work is not manufactured.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-62 — Unavailable peer and recovery
+
+Stop reviewer before request, resume it later; separately test archived, isolated, error and rate-limited reviewers. Also test host admission denial separately from provider quota exhaustion; retry in a dedicated lab only after the actual blocking condition clears.
+
+Pass requires: Requester shows who/what it awaits, retains its next action, avoids false completion, and resumes when the actual reviewer returns. Health may be OK while new worker admission is denied. Unavailable prerequisites remain BLOCKED/INCOMPLETE and never satisfy native delivery or task-completion assertions.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-63 — Group changes during coordination
+
+Move reviewer between test groups or change its scope while a review is pending, then refresh both workers and both dashboard clients.
+
+Pass requires: Effective policy and peer awareness refresh; pending work remains attributable and either completes through permitted routing or visibly explains the new restriction.
+
+Supporting coverage: `e2e/lifecycle/coordination.spec.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `e2e/worker-request-callback.spec.ts`, `e2e/isolated-worker.spec.ts`.
+
+### LC-53 — Final state and run-owned cleanup
+
+Inventory every run-owned entity; inspect all deliverables, verify results, stop/archive test workers and disable/delete test schedules.
+
+Pass requires: All requested work is terminal with proof; no active leases, duplicate dispatches or orphan jobs; unresolved work is explicitly failed/incomplete.
+
+Supporting coverage: `e2e/lifecycle/live-journey.spec.ts`.
+
+### LC-LINKED-RECORD — Linked outcome board and task record
+
+Create an epic and linked dependent children; inspect evidence and acceptance criteria; follow task, message, file, file URL, HTTP URL and git commit links. Repeat at desktop and phone widths.
+
+Pass requires: Every link reaches its exact persisted target; evidence stays readable; no fabricated progress or overflow.
+
+Supporting coverage: `e2e/lifecycle/linked-record.spec.ts`.
+
+### LC-COMPLEX-VERIFIED — Autonomous complex decomposition and verification
+
+Send one substantive request to two real Sonnet workers. Require worker-created epic/children, dependencies, source-message links, peer review, produced artifacts and exact execution evidence. Change Verified criteria mid-work; observe discovery, extra work and independent verification.
+
+Pass requires: Workers create the decomposition and satisfy the current gate. Every required deliverable reaches Verified. Stale acknowledgments fail, and no observer writes work evidence or closes deliverable cards.
+
+Supporting coverage: `e2e/lifecycle/live-complex-verified.spec.ts`.
+
+### LC-GATE-REVISION — Gate changes and historical verification
+
+Edit inherited and overridden criteria before transition and after verification; retry an old checklist, then supply current checks; reload details.
+
+Pass requires: The effective gate is authoritative; changed criteria are visible; prior verification cannot silently claim the newer requirements.
+
+Supporting coverage: `crates/amux-server/tests/board_api.rs`, `e2e/lifecycle/gate-revision.spec.ts`, `crates/amux-server/tests/harness_enforcement.rs`.
+
+### LC-SEMANTIC-INTAKE — Semantic task intake
+
+Create tasks through both the direct board API and six actual composer messages to a real worker: initial request, paraphrase, added context, revised requirements, independent UI outcome and separate-domain output. Use the real helper model and inspect task/message links in desktop and phone views.
+
+Pass requires: The six messages produce exactly three tasks. Paraphrase/context/refinement preserve one survivor ID, increasing revision, all four linked full source messages and original requirements. Logs must record measured create/append/update decisions. Distinct outcomes remain separate. No explicit task IDs, mocked classifier, observer board/history writes or manual completion can manufacture the result; unavailable comparison fails the live case.
+
+Supporting coverage: `e2e/lifecycle/live-semantic-intake.spec.ts`, `e2e/lifecycle/live-semantic-messages.spec.ts`, `crates/amux-server/src/api/board_intake.rs`.
+
+### LC-LOCAL-OUTBOX — Durable local message acceptance
+
+Send multiline text and an uploaded file; delay the server response, type a newer draft, reload, lose the response after delivery, retry, refuse submission and simulate full device storage. Inspect terminal and pending Messages. Fill the real browser storage quota with disposable caches, keep another draft and a pending message, then send a large message. Repeat with unrecoverable storage failure and inspect Sync diagnostics.
+
+Pass requires: Local persistence clears only the accepted draft immediately; attachment paths and one stable message ID survive retry/reload. Delivery requires a confirmed/deferred/deduplicated receipt. Refused or ambiguous operations remain reviewable and preserve ordering. Failed local storage keeps the draft and sends nothing. Cache pressure is reclaimed before local refusal, without discarding user intent. Normal sends keep Send stable and emit no queue/sync completion flash. Irrecoverable storage failures have precise, content-free diagnostics.
+
+Supporting coverage: `e2e/lifecycle/composer.spec.ts`, `tests/dashboard-outage-recovery.mjs`, `e2e/lifecycle/live-complex-verified.spec.ts`, `e2e/lifecycle/composer-cards.spec.ts`, `e2e/mobile-offline-ux.spec.ts`.
+
+### LC-FOCUS-NAVIGATION — Worker creation focus and explicit navigation
+
+Type the worker directory while initial focus is delayed; reload a saved terminal and select the Workers tab before restoration runs.
+
+Pass requires: Directory typing stays in its selected field. Explicit navigation cancels a delayed old-terminal restoration, and the requested main page remains usable.
+
+Supporting coverage: `e2e/lifecycle/create-focus.spec.ts`.
+
+### LC-COMPOSER-LAYOUT — Long-draft composer layout
+
+Enter short and long multiline drafts; toggle Send/Queue on desktop, 320px mobile, iPhone Safari, landscape and reduced keyboard viewports. Open Attach file and cancel the chooser, then clear the draft.
+
+Pass requires: Phone inputs retain at least 120px of compact writing space beside aligned 44px controls. Actions and attachment menus remain inside the viewport, mode changes and cancelling file selection preserve text, and clearing a long draft reclaims its height.
+
+Supporting coverage: `e2e/lifecycle/composer-layout.spec.ts`.
+
+### LC-DEEPLINK — Linked task and worker navigation
+
+Edit a task without saving; follow a worker deep link in the same page; return to the task.
+
+Pass requires: The previous task overlay no longer intercepts worker actions, and the unsaved task edit survives.
+
+Supporting coverage: `e2e/lifecycle/deeplink-surfaces.spec.ts`.
+
+### LC-PROVIDER-FRESH — Provider conversation reset
+
+On a real Gemini worker with existing peer messages, choose New conversation, upload a file and submit a task. Restart normally afterward. Repeat the fresh reset contract for Codex.
+
+Pass requires: A fresh launch never resumes the prior provider ID. Uploaded input reaches the actual provider and its receipt task reaches an evidenced terminal state. A normal restart retains the newly created conversation identity. A following ordinary message is durably accepted during restart, retries produce one queue copy, and delivery waits for the replacement process.
+
+Supporting coverage: `e2e/lifecycle/sonnet-upload.ts`, `crates/amux-server/src/api/session_verbs.rs`.
+
+### LC-BOARD-SOURCE-MESSAGE — Task recovery and linked assignment
+
+Capture an assignment with required file paths and schema beyond its 300-character card preview. Read it through board show, then its --messages option, and recover the worker after restart.
+
+Pass requires: The compact view exposes source message IDs and a supported full-read command. Full linked assignments preserve attachment paths and acceptance criteria; recovery does not guess from truncated text or search terminal logs.
+
+Supporting coverage: `scripts/test-board-show-messages.py`, `e2e/lifecycle/sonnet-upload.ts`.
+
+### LC-BLOCKED-OUTBOX — Failed and retryable offline edits
+
+Create a real board revision conflict, go offline, inspect its review link, enqueue a second edit, dismiss only the failed change, then reconnect. Exercise all browser projects and a stale failed-row dismissal after another tab resumes the operation. Reload an 18-hour-old blocked uncertain message with a file reference.
+
+Pass requires: Blocked edits never promise automatic retry. Mixed queues count failed and retryable changes separately. Dismissal preserves resumed/pending work; reconnect applies only the pending edit and leaves the newer peer revision intact. Uncertain messages retain their original identity and file references across boot and sync until acknowledged or explicitly dismissed.
+
+Supporting coverage: `e2e/lifecycle/blocked-outbox.spec.ts`, `tests/dashboard-outage-recovery.mjs`.
+
+### LC-HELPER-FAILURE — Semantic helper failure and recovery
+
+In an isolated subprocess fixture make the configured helper exit nonzero with quota text on stdout, diagnostic stderr, empty output, and JSON-shaped stdout; also exercise timeout and successful JSON. Then restore an available real helper and resend a paraphrase through the actual composer. The subprocess matrix is automated in mdai::tests::helper_failure; real model recovery remains a separate live prerequisite.
+
+Pass requires: Unsuccessful classifier processes never count as measured decisions or bad-JSON model answers. Bounded diagnostics identify exit/timeout and provider availability. Requests and original IDs remain attributable; the documented fallback is visible. Recovery produces a measured semantic append/update with all source links. Failed helper calls do not silently claim deduplication.
+
+Supporting coverage: `crates/amux-server/src/api/mdai.rs`, `crates/amux-server/src/api/board_intake.rs`, `e2e/lifecycle/live-semantic-messages.spec.ts`.
+
+The pipe-I/O regression matrix also exercises two MiB prompts, simultaneous input
+and output, 512 KiB each on stdout/stderr, unread stdin, and descendants retaining
+pipes after their parent exits. Require one deadline for the whole exchange,
+explicit output-limit failure, preserved quota diagnostics after early input
+closure, and a live unrelated peer after cleanup. `AMUX_HELPER_OUTPUT_MAX_BYTES`
+sets the combined stdout/stderr retention budget (positive bytes, default 8 MiB).
+Over-budget output fails instead of becoming a truncated model decision. Helper
+process groups are isolated at spawn; timeout cleanup cannot target the server's
+or a worker's process group. No reader or writer thread outlives the call.
+
+### LC-TOKEN-EFFICIENCY — Measured tokens per completed outcome
+
+Run matched scratch workloads before and after an optimization with the same provider/model, input files, gate criteria and output checks. Record native-worker and helper calls separately, input/output/cache tokens when reported, task/message growth and elapsed time. Include a completed coordination chain with three quiet board-driver cycles. This is guided measurement, not an existing automated benchmark.
+
+Pass requires: Compare tokens per independently verified outcome, not per message. Quality, semantic target selection, source links and peer review stay equal. Missing provider counters are UNMEASURED, never zero. Duplicate acknowledgement turns cease; claimed savings have baseline and candidate evidence with model/settings and commit identities.
+
+Supporting coverage: `e2e/lifecycle/sonnet-queue.ts`, `e2e/lifecycle/live-coordination.spec.ts`, `crates/amux-server/src/api/board_intake.rs`, `crates/amux-server/src/api/mdai.rs`.
+
+### LC-SYNC-PROGRESS — Offline reconnect receipts
+
+Persist three edits offline. Reconnect and pause each transport step; acknowledge the first, conflict the second and acknowledge the third. Review the retained failure, retry it explicitly and reload. Also return uncertain native message submission.
+
+Pass requires: Only acknowledged operations receive checkmarks. Running and failed rows remain distinct; failed results stay visible for review. Uncertain message text, attachment references and client identity remain durable without a false synced receipt. Earlier acknowledged rows remain visible across retries; a removed operation is skipped without a success checkmark.
+
+Supporting coverage: `e2e/lifecycle/sync-progress.spec.ts`, `tests/dashboard-outage-recovery.mjs`.
+
+### LC-COMPOSER-FILES — Worker card and details upload/send parity
+
+On desktop, mobile Chromium and iPhone WebKit paste a real File into a worker card and select one through the worker-details file picker. Read downloaded bytes, submit with Send and Queue while offline, reconnect, then reload with a newer draft. Separately run the interrupted large-file scenario and native file-reading assignment.
+
+Pass requires: The card accepts pasted files and details provides a reachable file picker; the intentionally removed card Attach button stays absent. Exact uploaded bytes and references survive offline acceptance; one stable operation reaches the transport and newer drafts survive. Controlled receipts prove client behavior only; native execution and large-file recovery have separate evidence.
+
+Supporting coverage: `e2e/lifecycle/composer-file-surfaces.spec.ts`, `e2e/lifecycle/composer-layout.spec.ts`, `e2e/lifecycle/live-steering-pickup.spec.ts`, `e2e/lifecycle/sonnet-upload.ts`.
+
+### LC-BROWSER-BACKGROUND — Non-disruptive automation and browser lifetime
+
+Run with AMUX_LIFECYCLE_BROWSER_TTL_S=20 in the isolated harness. Start a scratch browser through the real API with default settings, click a page button, capture its rendered output and compare foreground application before/after. Wait for real expiry with idle/activity expiry disabled, then verify saved profile bytes survive. Exercise capture failure in the CDP contract.
+
+Pass requires: Default automation is headless and never raises a window; screenshot failure never invokes bringToFront. Hard TTL still releases the process when idle expiry is disabled, retaining profile data. Explicit headed login remains a separate intentional UI action.
+
+Supporting coverage: `e2e/lifecycle/browser-background.spec.ts`, `crates/amux-server/src/integrations/browser.rs`, `crates/amux-server/src/runtime_jobs/browser_reaper.rs`.
+
+### LC-STEERING-AUTO — Automatic native pickup with linked file evidence
+
+In an admitted dedicated lab create a fresh Sonnet worker, then Gemini. Upload a JSON assignment through details, choose Queue and provide no Send-now, Enter or reminder. Observe the exact steering ID receive a confirmed submission verdict, read the produced receipt and inspect its original evidenced terminal board task. Repeat a busy-boundary arrival as a guided case. Run the existing paired backlog/todo observer and inspect all remaining owned cards.
+
+Pass requires: Automatic pickup produces real file-derived output and finishes the original task under normal gates. No manual state changes, replacement tasks or fabricated evidence satisfy completion. Backlog/todo work and redundant captures are resolved truthfully; three quiet driver cycles produce no acknowledgement loop. Admission/provider failure leaves native execution unverified. Busy-boundary delivery remains guided. The paired queue observer records three real quiet driver cycles; it is not verified until a native run completes.
+
+Supporting coverage: `e2e/lifecycle/live-steering-pickup.spec.ts`, `e2e/lifecycle/sonnet-queue.ts`, `e2e/lifecycle/live-coordination.spec.ts`.
+
+### LC-AUTOFIX-CLEANUP — Truthful automatic cleanup of operational backlog
+
+Use a migrated scratch store with old and recent autofix alerts, a human task, a claimed task, and a fault that still reproduces. Exercise refresh and expiry, including a claim made between candidate selection and update. Read the resulting task state and logs.
+
+Pass requires: Cleanup uses the real issues.created/issues.updated schema, does not fail with missing timestamp columns, and cannot discard active or claimed work merely because a TTL elapsed. Only independently resolved or explicitly obsolete alerts reach a truthful terminal outcome; updates guard against concurrent claims. This case is NOT_RUN: the live expiry query currently fails, and simply enabling its unconditional age-based discard is not an acceptable repair.
+
+Supporting coverage: `crates/amux-server/src/runtime_jobs/autofix.rs`, `crates/amux-server/src/db/board_store.rs`, `crates/amux-server/migrations/0001_baseline.sql`.
+
+### LC-STEER-NATIVE-ACK — Busy worker submission acknowledgement
+
+Replay a running terminal that still holds the exact sent message, then a cleared composer; test fresh exact native enqueue receipts, old identical receipts and quoted receipts. Run the live provider pickup case after admission passes.
+
+Pass requires: Generating alone never confirms submission; the existing bare Enter recovery remains reachable, Escape cannot interrupt a running turn, and only real acceptance removes pending intent.
+
+Supporting coverage: `crates/amux-server/src/api/session_verbs.rs`, `e2e/lifecycle/live-steering-pickup.spec.ts`.
+
+### LC-BOARD-ENQUEUE-RETRY — Board reminder enqueue failure
+
+Refuse queue insertion for advancement and verification reminders; retry the same driver after storage recovers. Cover backlog and decomposition through the shared acknowledged delivery path.
+
+Pass requires: Failed insertion produces nudge-delivery-failed, consumes no reminder budget or cooldown, and recovery queues one reminder.
+
+Supporting coverage: `crates/amux-server/src/runtime_jobs/board_drive.rs`.
+
+### LC-VERIFY-BATCH-DRAIN — Successive verification batches
+
+Seed ten done code tasks; observe the first offered batch, resolve those exact eight tasks, then run the driver again without aging history. Also leave a batch unchanged.
+
+Pass requires: The remaining two tasks are offered immediately after the first batch resolves; unchanged unresolved work does not generate repeated prompts. Normal evidence and verification gates still apply.
+
+Supporting coverage: `crates/amux-server/src/runtime_jobs/board_drive.rs`, `e2e/lifecycle/sonnet-queue.ts`.
+
+### LC-STALE-CLAIM-DRAIN — Abandoned runtime claim and waiting To Do
+
+Seed an exact current claim with an untouched Doing card, exhausted advance budget, and eligible To Do work. Drive recovery and the following pickup; repeat controls with live child work and a fresh claim.
+
+Pass requires: The exact-claim guard cannot veto canonical stale recovery forever. The original card stays recoverable in To Do with a logged reclaim; another eligible card is claimed. Fresh or actively delegated work is protected.
+
+Supporting coverage: `crates/amux-server/src/runtime_jobs/board_drive.rs`.
+
+### LC-CARGO-RESOURCE-BOUNDS — Build and retention resource limits
+
+Run normal, failing, memory-heavy, hung, and disk-growing Cargo fixtures; verify owned children stop, peer processes survive, active target leases prevent cleanup, and unchanged failed builds back off. Build a real tiny crate repeatedly from detached and packed-branch worktrees, then change only the commit identity.
+
+Pass requires: Bounded parallelism, sampled RSS/time/disk limits, visible budget receipts, no active-artifact deletion, changed source retries immediately, and ordinary Cargo exit codes survive. Unchanged builds stay fresh; HEAD or branch advances update the embedded commit. Git watch paths must work when .git is a file.
+
+Supporting coverage: `scripts/test-cargo-budget.py`, `scripts/test-cargo-target-guard.py`, `scripts/test-build-disk-clear.sh`, `crates/amux-server/src/cargo_target_guard.rs`, `scripts/test-cargo-worktree-provenance.py`, `crates/amux-server/build.rs`.
+
+### LC-AUTOMATIC-HOUSEKEEPING — Recurring memory and disk retention
+
+Exercise the hourly sweep with aged uploads, a failed reference query, old diagnostic folders, recent nested writes, open files and working directories, repositories, symlinks, saved messages, queued attachments and task artifact links. Expire deleted-worker transcript cache entries. Inspect deployed storage and browser job schedules.
+
+Pass requires: Old unreferenced output is removed; linked, active and recent files survive. Missing, oversized, truncated or timed-out probes defer cleanup with visible reasons. Cache expiry respects longer TTLs. Report actual bytes deleted separately from log rotation.
+
+Supporting coverage: `crates/amux-server/src/runtime_jobs/log_retention.rs`, `crates/amux-server/src/runtime_jobs/storage.rs`, `crates/amux-server/src/api/session_verbs.rs`, `docs/automatic-housekeeping.md`.
+
+### LC-ISOLATED-NATIVE — Isolated owner delivery and board lifecycle
+
+Run LC-ISOLATED-NATIVE for Claude Sonnet and Gemini: create a raw worker through the UI, queue an owner file assignment, and observe automatic native pickup, real output and absent harness environment. Guided continuation: send a follow-up while busy, disconnect/reconnect, inspect source-message board capture, output/evidence links, and owner-controlled completion. Seed backlog/todo and inspect board-drive diagnostics and delivery refusals. Toggle isolation off and restart, then exercise normal automatic backlog-to-Verified and peer review.
+
+Pass requires: Raw spawn has no injected amux harness/hooks/MCP. Owner messages and files remain usable and are counted delivered only with native submission evidence; owner work can still be linked on the board. Peer delivery stays refused. Automatic task drain must never be certified from selection or a mocked fleet: wake, enqueue, pickup and evidenced terminal state must all agree. Current isolated board selection versus wake/delivery policy conflict is an open failure, not a passing exemption. Normal mode after restart must restore ordinary lifecycle behavior without duplicate messages or lost evidence.
+
+Supporting coverage: `e2e/lifecycle/live-isolated.spec.ts`, `e2e/isolated-worker.spec.ts`, `e2e/lifecycle/live-steering-pickup.spec.ts`, `e2e/lifecycle/live-complex-verified.spec.ts`, `crates/amux-server/src/runtime_jobs/board_drive.rs`, `crates/amux-server/src/api/session_verbs.rs`.
+
+### LC-OFFLINE-ROUNDTRIP — Cold offline app, board edits, messages and large files
+
+Warm the real service worker and complete task snapshots. Disable browser networking. Edit three cached cards through their detail controls, queue two owner messages and upload two files including 32 MiB plus 17 bytes. Reload while still offline, verify durable identities and bytes, then restore networking without clicking Retry. Observe every running/checkmarked row, verify server revisions, message identities and file hashes, and reload again to detect replay duplicates.
+
+Pass requires: All seven operations survive the offline reload. Each receives a checkmark only after its own acknowledgement; all seven reach server state exactly as submitted. Offline retries never cover the editor with spurious failures. Complete cached cards remain editable with their original revision; incomplete snapshots and explicit server refusals do not authorize writes. A queued server message is not claimed as native worker consumption. Controlled conflict, ambiguous receipt and body timeout cases remain part of LC-SYNC-PROGRESS.
+
+Supporting coverage: `e2e/lifecycle/offline-roundtrip.spec.ts`, `e2e/lifecycle/offline-fixtures.ts`, `tests/dashboard-outage-recovery.mjs`.
+
+## End-state and cleanup record
+
+For every created worker, card, dependency, schedule, browser profile, group,
+file, memory and external fixture, record its ID and final state. Completed work
+must have a real artifact and command/result evidence. Review/blocked/needsyou is
+not completion; report the exact blocker and next action. Confirm leases/active
+indicators settle, no duplicate dispatch occurs, and no abandoned recurring job
+continues running. Stop/archive only the run-owned workers and schedules after
+capturing evidence. Keep the run directory and outputs until reviewed.
+
+When a task stalls, distinguish a pending interval/mid-turn from a gate,
+dependency, WIP cap, missing provider, failed delivery or exhausted budget. Capture
+`/api/board/ready?session=...`, `/api/debug/board-drive`, health build, and the card
+history. Do not repair the state from the observer to turn a failure green.
+
+Source inventory is generated on every run with SHA-256 hashes. New browser specs
+are automatically included. Review uncommitted tests in other checkouts separately;
+a stable run of this checkout cannot certify concurrent drafts. The inherited
+Playwright startup banner describes configured browser targets; the report’s
+Selection field and executed test counts are the authoritative scope of this run.
+
+## Running the same lifecycle with Gemini
+
+Set `AMUX_LIFECYCLE_PROVIDER=gemini` for the live command. All live scenarios,
+including the historical `LC-SONNET-*` pair IDs, now use the selected provider;
+those IDs remain stable for the acceptance ledger. The default remains Claude
+Sonnet. The runner records and asserts the actual worker provider, and checks the
+provider identity visible in its terminal before sending pair/complex prompts.
+Gemini uses its configured model (the default is `auto`), not a Sonnet model flag.
+Use a fresh dedicated lab, real Gemini authentication, an empty scratch workspace,
+and the normal board driver. Configure tool approvals deliberately in that lab;
+unanswered provider permission prompts are blocked coverage, not passing tests.
+A worker that merely boots, queues its prompt, or writes a progress claim does not
+pass: task states, real files, tests, peer receipts, and current verification gates
+are still asserted by the same scenarios.
+
+## Two Sonnet workers and uploads
+
+Run the focused real-provider scenario with:
+
+```bash
+python3 scripts/lifecycle/run.py live --grep LC-SONNET
+```
+
+It creates exactly two Claude workers using `--model sonnet` in one group. The
+reviewer must reproduce the seeded failure before approval, the author must revise,
+and both must finish their own work. Message origin, ordering, real card IDs,
+terminal search/navigation, final evidence, independent execution of the resulting
+module, and desktop/phone rendering are checked. A final report's boolean about
+outstanding changes does not replace the durable changes-requested message.
+
+Use a dedicated server/home, a private `TMUX_TMPDIR`, and a scratch Git repository.
+Export both `CC_HOME` and `AMUX_HOME` to that home and `AMUX_API` and `AMUX_URL` to
+that server in the worker environment. Before launching workers, run the checkout's
+`amux url --verify` with those variables and verify the printed endpoint. The CLI
+now resolves its configured home's endpoint consistently for every verb. Put this
+checkout's CLI first on the lab PATH; testing an older installed client measures
+that older client instead.
+
+For subscription authentication, retain the provider's existing login. Isolate the
+server's transcript/usage discovery to the scratch project; importing the host's
+entire history can trip the lab's spend circuit. If the user's login shell changes
+cwd, use a lab-only `CLAUDE_ENV_FILE` to restore the scratch directory and lab
+variables before Bash commands. Do not edit the user's shell profile.
+
+`AMUX_LIFECYCLE_PAIR_RUN=<existing run>` and
+`AMUX_LIFECYCLE_PAIR_OBSERVE=1` resume read-only observation after diagnosis. The
+report identifies observation mode; it is not evidence of a clean autonomous run.
+Retain earlier failed runs and record any operator steering separately.
+
+The ordinary browser phase now includes real multi-chunk text upload, Unicode and
+long filenames, image preview, SHA-256 verification of downloaded bytes, attachment
+removal and worker switching. Controlled delivery tests separately exercise text
+and attachment retention until acceptance, permanent refusals, durable offline
+queuing, duplicate-tap protection, and typing the next draft while a send is pending.
+These controlled transport tests do not substitute for live model execution.
+
+Browser discovery uses a private tmux socket. Focused invocations start only the
+selected project's server. `AMUX_LIFECYCLE_PORT` changes the base port when running
+separate projects concurrently; each invocation still needs its own output directory.
+
+
+The Sonnet selection runs the review pair first, then reuses the author in a fresh
+conversation for a real `fruit-counts.csv` upload. It requires the worker to read
+the uploaded path, produce a JSON receipt (two rows, total six), and finish its
+own task with the receipt as evidence. No receipt or peer review is fabricated by
+the observer. The pair's HTML must fit both 375px and 1280px.
+
+`AMUX_LIFECYCLE_PAIR_RUN` is generated once per live invocation and shared by the
+pair and upload cases. To inspect an existing upload without submitting new work,
+set `AMUX_LIFECYCLE_UPLOAD_OBSERVE=1`, the existing pair run, and optionally
+`AMUX_LIFECYCLE_UPLOAD_RECEIPT` to its receipt filename. Observation is recorded
+explicitly and is not a claim that this invocation created or drove the workers.
+Observe the pair before resetting its author for upload: a new conversation does
+not retain the old terminal's searchable content.
+
+`LC-FILES-UPLOAD` also exercises the Files tab's upload, preview, rename, download,
+and delete controls, including the mobile More menu. Downloaded bytes must equal
+the original uploaded bytes. Composer refusal tests cover peek and card Send /
+Queue and the Control+Enter retry shortcut.
+
+On a machine with other active checkouts, use a private `node_modules` installed
+with `npm ci` and a private browser cache. Do not symlink another lane's mutable
+dependencies: browser revisions can disappear mid-run when that lane upgrades.
+For example, set `PLAYWRIGHT_BROWSERS_PATH` to a task-owned directory and run
+`npx playwright install chromium webkit` before starting the suite. Keep the same
+environment for the suite, and do not replace its pinned executable during a run.
+
+The live pair uses Amux's Bash `amux send` transport explicitly. Claude's native
+`SendMessage` can reach another Claude session while bypassing Amux's history,
+which does not prove Amux routing, verified origins, or policy. The Messages
+check selects the Session filter and searches the visible message list; text in
+an inactive Terminal panel cannot satisfy it.
+
+For a manually provisioned tmux lab, create `TMUX_TMPDIR` before starting the
+server, unset inherited `TMUX`/`TMUX_PANE`, and verify the actual socket before
+creating workers. A nonexistent `TMUX_TMPDIR` can make tmux fall back to its shared
+socket. The bundled browser harness creates its private directory itself.
+
+The final `LC-SONNET-CROSSGROUP` phase reuses those same two workers, moves the
+reviewer into a different group through the UI, and requires each worker to read
+the other's real completed task metadata. Each writes an independently checked
+receipt, sends Amux messages with verified origins, and finishes its own new chore.
+Both terminal search and the visible Session messages are checked at desktop and
+phone widths. `AMUX_LIFECYCLE_CROSSGROUP_OBSERVE=1` observes an existing completed
+phase without changing groups or sending new prompts.
+
+`LC-SONNET-QUEUE` is the final acceptance boundary. It creates four real chore
+cards on the existing pair: each worker gets one Backlog and one To Do card,
+with dependencies in opposite directions. After creation the observer only reads;
+it never sends a wake-up, claims work, changes status, writes receipts or completes
+cards. Every seeded card must reach done/verified with a correct worker-written
+receipt and evidence. Every remaining run-owned capture must also be resolved by
+its worker. A completed handoff alone does not satisfy this boundary.
+`AMUX_LIFECYCLE_QUEUE_OBSERVE=1` checks an existing run without creating cards.
+
+### Linked work, revised verification, and reliable sending
+
+The suite also includes these connected acceptance cases:
+
+- **LC-LINKED-RECORD** opens an epic, children and dependencies, follows a source
+  message into Messages, previews a produced file and `file://` URL, opens a real
+  web URL and inspects the actual Git commit. It repeats on desktop, phone and Safari.
+- **LC-GATE-REVISION** verifies a task, changes its gate in the task editor, checks
+  that retained evidence is labeled as covering the older criteria, refuses an old
+  checklist and explicitly rechecks the new one. Typed criteria have server-owned
+  versions; independent verification must rerun the current version. A checklist
+  acknowledgement is displayed separately from an independently executed test.
+- **LC-COMPLEX-VERIFIED** creates two Claude Sonnet workers in one private group.
+  They decompose an invoice reconciliation project into two linked epics and at
+  least five dependent children, implement a CLI and responsive report, exchange
+  review messages, register artifacts and commits, and finish phase one at Done.
+  The observer then changes the Verified gate to add duplicate-ID and negative
+  amount rejection. The peers implement the amendment and independently execute
+  verification of each other's work. Every real deliverable and epic must reach
+  Verified with current criteria and no remaining open run-owned work. The
+  observer never supplies completion evidence or advances those cards.
+- **LC-SEMANTIC-MESSAGES** sends six actual composer messages to a real worker:
+  initial work, a paraphrase, added context, refined requirements, an independent
+  UI outcome and a separate-domain deliverable. Exactly three tasks must result,
+  with four full source messages linked to one surviving task. It checks increasing
+  revisions, retained requirements, measured create/append/update decisions and
+  desktop/mobile task details without observer board/history writes. No explicit
+  task IDs in the messages can bypass semantic comparison. Unavailable comparison
+  fails the live case. This consolidates incoming requests into an existing task;
+  it does not delete independent subtasks or merge ambiguous existing candidates.
+- **LC-SEMANTIC-INTAKE** uses the real configured helper model to append a
+  paraphrase, update refined requirements and create distinct deliverables.
+  It checks the resulting IDs and preserved context, not only the classifier's
+  explanation. Comparison is scoped to open work with the same ownership.
+  Explicit graph, gate, callback or scheduling metadata is preserved as its own
+  record; ambiguous or unavailable comparison preserves the incoming request.
+  The intake receipt records whether comparison ran and the candidate count.
+- **LC-LOCAL-OUTBOX** uploads a file and sends a multiline draft while the server
+  is delayed. Local persistence must clear only the accepted draft immediately,
+  preserve attachment references and one message ID through reload/retry, and
+  keep newer edits. Refused or ambiguous delivery stays in the outbox for review.
+  Storage failure must retain the draft and cause zero network submissions.
+
+Focused live commands still require the dedicated lab variables above. Set
+`AMUX_HELPER_MODEL=sonnet` on that lab server to exercise semantic comparison
+with Sonnet too. Run the browser cases with the consolidated configuration, and
+run both live cases with `e2e/lifecycle/live.config.ts`. They are automatically
+included by the consolidated runner's existing discovery. Real worker tests
+may take substantially longer than fixture tests; their timeout is a failure,
+not permission to manufacture a terminal state.
+
+The browser runner now checks the **served** `app.js`, `app.css` and `sw.js`
+hashes before executing cases. Each isolated server writes an
+`asset-provenance-<port>.json` receipt with its `/health` build identity and the
+expected/actual hashes. A stale shared-build embed refuses the run immediately;
+a successful cargo exit alone does not establish dashboard provenance.
+
+Install the current Bash client into the dedicated lab with `make install-cli
+BIN_DIR=<lab>/bin` before starting real workers. An old installed client can have
+different retry behavior even when the server is current. Keep that installation
+receipt with the live evidence. `scripts/test-board-help.py` covers read-only
+artifact/decomposition discovery; help must never register an output.
+
+If a provider limit interrupts the complex case before the gate amendment, keep
+its failed run and resume the **same** workers and files using
+`AMUX_LIFECYCLE_COMPLEX_RESUME_PHASE1=1` with the original
+`AMUX_LIFECYCLE_COMPLEX_RUN`. This sends `continue` to each existing worker and
+still requires all phase-one work, the real gate amendment, and independent
+verification. Use `AMUX_LIFECYCLE_COMPLEX_OBSERVE=1` only after the amendment was
+actually delivered. Record any permission-dialog cancellation, environment repair,
+or resume separately; resumed work is not an uninterrupted autonomy result.
+
+Each browser project has its own server, home and tmux socket. The consolidated
+runner permits the three projects to run concurrently but limits each project
+to one worker, preserving serialization of global settings within that server.
+The report names the actual selected scope; a focused run remains partial.
+
+The complex observer follows the workers' registered output paths, including
+subdirectories, and reads the resulting bytes through the file API. Additional
+epics created for a criteria amendment are legitimate work: they must also
+finish, with current independent verification. The seven original minimum task
+IDs are checked in the completion receipt, and every additional Verified card
+must meet the same verification assertions. Preserve extra operator review
+findings and interventions alongside the run rather than describing a resumed
+or steered run as uninterrupted.
+
+Semantic intake currently considers up to 80 recent open candidates within the
+same worker/human ownership scope; receipts expose both considered and available
+counts. It does not merge across owners or reopen completed tasks automatically.
+
+Message retries must also distinguish a server reservation from an acceptance
+receipt. `message_acceptance_` server tests cover simultaneous retries, refused
+steering, unavailable identity storage, old rows without receipts, and long
+response-loss windows. A pending attempt returns a retryable failure; after two
+minutes an unresolved reservation requires terminal review. It cannot become
+"already delivered" merely by existing or aging out. Confirmed receipts retain
+the original response ID for 30 days. Logs use `amux::message_acceptance` to
+identify pending, uncertain, or unrecorded acceptance.
+
+### Expanded verification receipts (2026-09-10)
+
+See [the recorded validation report](lifecycle-validation-2026-09-10.md) for the
+actual Sonnet run, retained failures, repairs, and scope boundaries. Set
+`AMUX_LIFECYCLE_INTERVENTIONS` to a local JSON file to attach operator actions to
+the complex run's proof. Completion receipts may name one epic or an array of
+epics per worker; every named epic must have current independent verification,
+linked messages, and direct output references. After workers stop, the observer
+loads saved terminal records through the UI before searching peer messages.
+
+The consolidated browser suite also covers delayed nonempty history snapshots,
+identical messages sent to different peers, full phone Verified headers, and
+worker menus surviving scroll events from unrelated panels. Queue unit contracts
+execute the shipped functions and check automatic replay while connectivity is
+believed offline, plus quiet normal sends and visible stuck-send status.
+
+### Mobile storage and Gemini terminal regressions (2026-09-11)
+
+`LC-LOCAL-OUTBOX` now fills the actual browser localStorage quota using
+reproducible cache data before sending a large message. The prior queued message
+and another worker's draft must survive. A recoverable quota failure must reclaim
+cache space and accept the message locally. An unrecoverable write must send
+nothing, retain the draft, and expose its specific cause in Sync and
+`outbox-storage` diagnostics without message contents. The normal path keeps the
+Send button stable and avoids queue/sync completion toasts and connection-badge
+flashes. Run this on all three browser projects.
+
+Attachment cancellation is tested across immediate reload while its IndexedDB
+delete is deliberately held open. A cancelled file must not return; if the
+cancellation journal cannot persist, the file must remain available.
+
+Gemini peer prompts must remain searchable through the real Workers filter,
+including multiline input and the current `>` glyph. Claude/Codex output that
+starts with `>` must remain unclassified. Completion callbacks must not instruct
+the requester to notify themselves again; the integration regression inspects
+the durable callback rather than a fabricated reply.
+
+
+Message-driven semantic intake can be selected independently in the dedicated lab:
+
+```bash
+python3 scripts/lifecycle/run.py live --grep LC-SEMANTIC-MESSAGES
+```
+
+This case is discovered automatically by `live`/`full`. The earlier direct-board
+`LC-SEMANTIC-INTAKE` case remains a separate API test and cannot substitute for it.
+The canonical scenarios and expected task/message counts are in `cases.json`.
+
+The `LC-COMPOSER-LAYOUT` browser case also covers the phone composer in Send and
+Queue modes. It measures compact writing space and aligned 44px controls at
+320px, the normal project viewport, landscape, and a reduced keyboard viewport;
+opens the attachment menu and file chooser; and checks draft preservation and
+height recovery. Screenshot checkpoints include short drafts, long drafts and
+open menus. These are simulated browser viewports, not a physical iPhone keyboard
+test. The terminal's existing layout diagnostic now includes `inputW` and
+`actionDelta`, so a reported misalignment can be measured from the affected client.
+
+### LC-MEMORY-ATTRIBUTION — compressed memory and safe recovery
+
+Run `scripts/test-contended.sh -p amux-server --lib runtime_jobs::memory_consumers`.
+On macOS the native test must measure the host through the same bounded, absolute-path
+`top` probe used by the pressure sweep. Replay large compressed consumers and malformed
+output; require process IDs, names with spaces, explicit units and a measured verdict.
+A failed probe must never render as a quiet host. These diagnostics select no kill targets.
+Before releasing test resources, confirm the dedicated socket, exact run identity,
+workspace and lack of attached clients; preserve terminal output. Other applications
+require the user's decision. Repeat `/health` after recovery and only run native
+provider journeys when admission permits them. Historical swap is not proof that
+cleanup recovered capacity, and a diagnostic test is not proof of worker completion.

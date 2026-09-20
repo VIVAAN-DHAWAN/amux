@@ -101,7 +101,7 @@ fn the_app_bundle_still_contains_an_app() {
 /// green line from reading as "all good" and say what isolation does NOT cover.
 ///
 /// Pinned here because it is a CLAIM the UI makes, and this file already holds
-/// the auto-compact copy to the threshold the server really uses. Prose in a
+/// context-management copy to the available provider behavior. Prose in a
 /// template is exactly what rots silently.
 #[test]
 fn the_branch_popover_does_not_read_isolation_as_delivery() {
@@ -145,6 +145,41 @@ fn app_ver_and_the_sw_cache_version_agree() {
     );
 }
 
+/// Model choices used to be copied into app.js and two index.html selects,
+/// which is how current OpenAI, Claude, and Gemini releases each appeared in
+/// only part of the UI. Pin the one-source shape as well as the custom-id exit.
+#[test]
+fn every_dashboard_model_control_uses_the_shared_open_catalog() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    assert!(
+        app.contains("/api/models"),
+        "dashboard never loads the shared catalog"
+    );
+    assert!(
+        app.contains("_fillWorkerModelSelect"),
+        "worker controls bypass the catalog helper"
+    );
+    assert!(
+        app.contains("Custom model ID"),
+        "future model ids have no open-string escape hatch"
+    );
+    for duplicate in ["const claudeModels", "const codexModels", "const geminiModels"] {
+        assert!(
+            !app.contains(duplicate),
+            "duplicated provider list returned: {duplicate}"
+        );
+    }
+    assert!(
+        html.contains("settings-default-model-options"),
+        "Claude default lost catalog-backed suggestions"
+    );
+    assert!(
+        html.contains("create-model-custom"),
+        "create-worker flow lost custom model ids"
+    );
+}
+
 #[test]
 fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
     let app = asset("app.js");
@@ -153,7 +188,7 @@ fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
     let end = tail.find("function updatePeekStatus()").expect("frontier chip must precede peek status");
     let chip = &tail[..end];
 
-    for required in ["readyCards: d.ready || []", "queued behind", "_openIssue("] {
+    for required in ["readyCards: d.ready", "queued behind", "_openWorkQueue(", "worker-queue", "data-queue-retry"] {
         assert!(app.contains(required), "queued-WIP rendering lost `{required}`");
     }
     assert!(chip.contains("work-queued-chip"), "the holding card must be a semantic control");
@@ -187,10 +222,13 @@ fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
     let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
         .expect("the shared renderer must follow its inventory");
     let inventory = &inventory_tail[..inventory_end];
+    // 29 SOURCE entries since 9af1c88b: `pause` and `resume` are the two arms of
+    // one ternary, so the source carries both while a worker renders exactly one
+    // of them. This counts the inventory in source, not the rendered menu.
     assert_eq!(
         inventory.matches("{ key: '").count(),
-        25,
-        "the full running Claude worker fixture has 25 shared worker actions"
+        29,
+        "the shared worker-action inventory has 29 source entries (27 actions plus the pause/resume pair)"
     );
 
     let browse_start = app.find("function _browseWorkerFiles(name, source)")
@@ -271,7 +309,7 @@ fn messages_link_schedule_ids_to_the_scheduler() {
 fn message_card_links_survive_the_capped_board_working_set() {
     let app = asset("app.js");
     let start = app
-        .find("function _msgCardChip(cardId, message)")
+        .find("function _msgCardChip(cardId, message, linkedCard)")
         .expect("message card chip must accept authoritative card metadata");
     let tail = &app[start..];
     let end = tail
@@ -283,7 +321,9 @@ fn message_card_links_survive_the_capped_board_working_set() {
         "message.card_status",
         "message.card_archived",
         "message.card_deleted",
+        "const recorded = linkedCard ||",
         "const c = live ||",
+        "<button type=\"button\" class=\"msg-card-chip\"",
     ] {
         assert!(
             body.contains(needle),
@@ -291,8 +331,14 @@ fn message_card_links_survive_the_capped_board_working_set() {
         );
     }
     assert!(
-        app.contains("_msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e)"),
-        "the shared history row must pass its authoritative card metadata to the chip"
+        app.contains("function _msgOpenCard(cardId)")
+            && app.contains("_bdAudit('message-card-nav'")
+            && body.contains("_msgOpenCard("),
+        "message-card controls must use the shared navigation helper and emit a durable client-debug verdict"
+    );
+    assert!(
+        app.contains("+ _msgCardChips(e);"),
+        "the shared history row must render every authoritative task relation"
     );
     assert!(
         app.contains("card_title: x.card_title, card_status: x.card_status"),
@@ -302,6 +348,10 @@ fn message_card_links_survive_the_capped_board_working_set() {
         app.contains("async function openBoardDetail(id)")
             && app.contains("await apiCall(API + '/api/board/' + encodeURIComponent(id))"),
         "clicking a message's older/terminal task must hydrate it even when the capped board list omitted it"
+    );
+    assert!(
+        !body.contains("<span class=\"msg-card-chip\""),
+        "the message-to-card relation must be a semantic keyboard-accessible control, not a click-handled span"
     );
 }
 
@@ -354,6 +404,17 @@ fn cross_group_default_can_initialize_before_the_main_api_constant() {
         !early_boot.contains("fetch(API + '/api/config/cross-group'"),
         "referencing API before its declaration throws in the temporal dead zone and silently leaves the toggle off"
     );
+    for needle in [
+        "saved.note || 'An explicit empty group or worker setting can deny this for that scope.'",
+        "s.spans_groups_source",
+        "s.spans_groups_reason",
+        "refused (' + esc(source) + ' deny)",
+    ] {
+        assert!(
+            app.contains(needle),
+            "cross-group UI must expose the effective source/reason instead of contradicting enforcement: `{needle}`"
+        );
+    }
 }
 
 #[test]
@@ -399,15 +460,18 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
     let app = asset("app.js");
     let index = asset("index.html");
     let helper_start = app
-        .find("function _cardDoingItem(name)")
-        .expect("dashboard must derive the live doing card from SSE-synced board data");
+        .find("function _runtimeBoardCardId(s)")
+        .expect("dashboard must derive the live doing card from the server's measured runtime truth");
     let helper_tail = &app[helper_start..];
     let helper_end = helper_tail
         .find("function _nudgeWorkersOnBoardChange()")
         .expect("live-card helper must precede board-change invalidation");
     let helper = &helper_tail[..helper_end];
     for needle in [
-        "session.task_board_id",
+        "function _runtimeBoardCardId(s)",
+        "truth.measured !== true",
+        "truth.status !== 'linked'",
+        "truth.card_id",
         "c.id === claimed",
         "c.session === name",
         "c.status === 'doing'",
@@ -421,21 +485,92 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         .expect("session-card renderer must exist");
     let render = &app[render_start..render_start + 16_000.min(app.len() - render_start)];
     for needle in [
-        "const liveBoardTask = _cardDoingItem(s.name)",
-        "liveBoardTask ? (liveBoardTask.title || liveBoardTask.id)",
-        "liveBoardTask ? liveBoardTask.id : s.task_board_id",
-        "_taskIdChip({task_board_id: displayTaskBoardId})",
+        "const runtimeBoard = _runtimeBoardPresentation(s);",
+        "runtimeBoard.cardId",
+        "const displayTaskName = s.task_name || runtimeBoard.cardId || '';",
+        "_workerExecutionBadge(s, runtimeBoard)",
+        "_activeTaskLink(s.name, displayTaskBoardId, displayTaskName)",
     ] {
         assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
     }
+    // Execution badges are shared with worker details; verify the call above
+    // and its implementation rather than demanding the old inline expression.
+    let badge_start = app.find("function _workerExecutionBadge(s, runtimeBoard)").unwrap();
+    let badge_tail = &app[badge_start..];
+    let badge = &badge_tail[..badge_tail.find("function updatePeekStatus()").unwrap()];
+    assert!(badge.contains("runtimeBoard.syncing") && badge.contains("_runtimeBoardSyncBadge()"));
+    assert!(
+        !render.contains("_cardDoingItem(s.name)"),
+        "the worker card must not rebuild runtime truth from an independently refreshed boardItems snapshot"
+    );
     assert!(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
     );
+    // The rule is that a card says "Working now" only when the runtime truth
+    // names THAT card. 6e34096d moved it out of an inline `_liveCard`
+    // expression into a named helper, and this assertion kept demanding the old
+    // spelling, so it failed on a refactor that preserved the rule exactly. A
+    // check pinning a spelling is red for the wrong reason; pin the helper and
+    // the identity test inside it, the way the `_workerExecutionBadge` block a
+    // few lines above already does.
+    let activity_start = app
+        .find("function _boardActivityForCard(item)")
+        .expect("the live-card decision must live in one named helper");
+    let activity_tail = &app[activity_start..];
+    let activity = &activity_tail[..activity_tail.find('\n').unwrap_or(0)
+        + activity_tail[activity_tail.find('\n').unwrap_or(0)..]
+            .find("\n}")
+            .expect("helper must be a complete function")];
     assert!(
-        app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
+        activity.contains("id !== item.id") && activity.contains("return null"),
+        "the helper must refuse any card the runtime truth does not name"
+    );
+    assert!(
+        app.contains("const _liveNow = !!(_activity && _activity.linked)"),
         "only the explicitly claimed card may say Working now"
     );
+    for needle in [
+        "function _runtimeBoardSplitBadge(s)",
+        "s.status !== 'unattributed'",
+        "active-conflicting-claims",
+        "automatically reconciles multiple live task claims",
+        // `>card syncing</span>` was pinned here by 03061448 and deliberately
+        // REMOVED from app.js by 9127257d ("remove false 'card syncing'
+        // badges from worker cards"), which named three distinct causes of
+        // the badge being wrong and left this needle behind. The test then
+        // demanded a treatment the dashboard had stopped rendering on
+        // purpose, so it reddened `rust` on main from 9127257d onward while
+        // describing the failure as lost functionality.
+        "truth.verdict",
+    ] {
+        assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
+    }
+    assert!(!app.contains(">card syncing</span>"),
+        "normal runtime attribution lag must not manufacture a card-syncing warning");
+    assert!(
+        app.contains("verdict === 'active-conflicting-claims'")
+            && app.contains("automatically reconciles multiple live task claims")
+            && app.contains("status-badge waiting"),
+        "competing live claims should stay internal while other unattributed idle states remain visible"
+    );
+    assert!(!app.contains(">card conflict</span>"),
+        "claim reconciliation is harness work, not a human-facing status");
+    assert!(
+        !app.contains(">runtime/board split</span>"),
+        "a recoverable task-link lag must not be presented as a red runtime failure"
+    );
+    for needle in [
+        "let _sessionsSnapshotEpoch = 0",
+        "snapshotEpoch !== _sessionsSnapshotEpoch",
+        "let _boardSnapshotEpoch = 0",
+        "snapshotEpoch !== _boardSnapshotEpoch",
+        "function _runtimeBoardPresentation(s)",
+        "if (status !== 'linked' || !cardId)",
+        "_runtimeBoardSyncBadge()",
+    ] {
+        assert!(app.contains(needle), "a stale poll may publish an unmeasured or stale card link without `{needle}`");
+    }
     for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
         assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
         assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");
@@ -513,6 +648,125 @@ fn the_version_parser_reads_real_values_and_rejects_junk() {
 /// CALLED had been checked to exist — which is the one-directional version of
 /// this check, and the direction that was already covered. Every name you call
 /// must exist; every name you define must not already. This is the mirror.
+/// Body of a top-level `function NAME(` in app.js, brace-matched.
+///
+/// MATCHES `async function NAME(` TOO (AF-639, 2026-09-10). This helper
+/// originally matched only the bare keyword, written against
+/// `_staleShellRecover` when it was synchronous. A later, independent fix
+/// made that same function `async` to await a real fetch, and this helper
+/// went stale silently: `.unwrap_or_else(|| panic!(...))` fires on ANY
+/// missing match, so "the function was renamed" and "the function grew an
+/// `async` keyword" produce an identical panic, and the message names the
+/// former. Confirmed live: `src.find("\nfunction _staleShellRecover(")` is
+/// `None` against the current app.js, where the declaration is
+/// `async function _staleShellRecover()`. Two-fix rule: search both forms
+/// rather than special-case one caller, so the next function that becomes
+/// async does not repeat this.
+fn fn_body(src: &str, name: &str) -> String {
+    let sync_head = format!("\nfunction {name}(");
+    let async_head = format!("\nasync function {name}(");
+    let i = src
+        .find(&sync_head)
+        .or_else(|| src.find(&async_head))
+        .unwrap_or_else(|| panic!("no top-level function {name} in app.js"));
+    let open = src[i..].find('{').expect("function has a body") + i;
+    let bytes = src.as_bytes();
+    let (mut depth, mut end) = (0usize, open);
+    for (k, b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = k;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(end > open, "unbalanced braces reading {name}");
+    src[open..=end].to_string()
+}
+
+/// AF-639. A browser the server refuses to bootstrap 401s on every request for
+/// the life of the window, and `_staleShellRecover` was written for a
+/// DIFFERENT cause (a service-worker-cached shell holding a rotated-away
+/// token) where reloading genuinely fetches a fresh token. Firing it here
+/// reloads into an identical tokenless shell, once every ten minutes, forever,
+/// with nothing on screen. Measured 2026-09-09: 22.5 hours and 28,355 401s
+/// from one laptop, showing a dashboard that looked fine.
+#[test]
+fn a_shell_the_server_withheld_the_token_from_stops_reloading_and_says_so() {
+    let src = asset("app.js");
+
+    // The client must read the server's reason. Deriving it from an empty
+    // token is exactly what it cannot do: auth-disabled looks identical and
+    // must stay silent.
+    assert!(
+        src.contains("window._AMUX_AUTH_WITHHELD"),
+        "app.js never reads the server's withheld flag, so it cannot tell \
+         'auth is off' from 'this browser was refused'"
+    );
+
+    let body = fn_body(&src, "_staleShellRecover");
+    let guard = body
+        .find("_authWithheld")
+        .expect("_staleShellRecover must special-case the withheld shell");
+
+    // THE ANCHOR MOVED (AF-639, 2026-09-10). This assertion originally pinned
+    // `location.reload`, because a blind reload into an identical shell was the
+    // futile act the guard existed to skip. A separate fix landed on main the
+    // same day and rewrote the recovery path to FETCH the real bootstrap and
+    // act only on a genuinely DIFFERENT token (`location.replace('/?_fresh=auth'
+    // ...)`), which already stops the reload storm and does it better. The
+    // string "location.reload" no longer appears in this function's body at
+    // all, so the old `.expect(...)` PANICS rather than failing an assertion --
+    // confirmed live on origin/main's current app.js, where the merge that
+    // combined both fixes kept the code correct (the withheld guard still
+    // precedes the recovery, and still returns) but left this test anchored to
+    // code that had already moved. A clean merge with no conflict markers is
+    // not proof the result stayed testable (CLAUDE.md's own warning, applied to
+    // a test rather than a feature). What survives is the same property this
+    // cell always checked: the guard must precede whatever the OTHER arm does,
+    // and must return before it. The other arm is now the recovery fetch.
+    let recovery = body
+        .find("fetch('/?_fresh=auth'")
+        .expect("the recovery fetch is the other arm; if it moved, re-anchor this deliberately");
+    assert!(
+        guard < recovery,
+        "the withheld check must come BEFORE the recovery fetch, or a browser that already \
+         knows it was refused spends a 12s timeout re-learning it"
+    );
+    assert!(
+        body[..guard].find("sessionStorage").is_none(),
+        "the withheld arm must return before the reload rate-limiter, otherwise it burns the \
+         once-per-10-minutes budget that the real stale-shell case needs"
+    );
+    assert!(
+        body[guard..recovery].contains("return"),
+        "the withheld arm must RETURN; falling through reaches the recovery it exists to skip"
+    );
+
+    // And it must leave something a human can act on, not just skip the
+    // reload. A page that silently stops trying is the failure this card is
+    // about (ethos rule 6: walk the escape).
+    assert!(body.contains("_amuxAuthWithheldBanner"), "{body}");
+    let banner = fn_body(&src, "_amuxAuthWithheldBanner");
+    assert!(
+        banner.contains("?_token="),
+        "the banner must carry the ONE action that fixes this, not only the diagnosis"
+    );
+    assert!(
+        banner.contains("min-height:44px"),
+        "mobile rule: the sign-in controls are touch targets"
+    );
+    assert!(
+        banner.contains("env(safe-area-inset-top"),
+        "mobile rule: a fixed top bar must clear the iOS notch"
+    );
+}
+
 #[test]
 fn no_two_top_level_functions_in_app_js_share_a_name() {
     let src = asset("app.js");
@@ -561,35 +815,16 @@ fn no_two_top_level_functions_in_app_js_share_a_name() {
     );
 }
 
-/// THE AUTO-COMPACT COPY MUST STATE THE REAL THRESHOLD (AMUX-3857).
-///
-/// `COMPACT_BELOW_PCT_REMAINING`'s own doc says it is "named so the policy, its
-/// tests, and any UI copy cannot drift apart". The UI copy was a hardcoded
-/// literal that never read it, so it drifted anyway: the toggle promised
-/// "context < 50%" while the trigger fires below 15% remaining. An operator
-/// watched a lane fall from 50% to 13% with auto-compact ENABLED and correctly
-/// concluded it was broken — it was working, at a number the UI did not say.
-///
-/// A comment asking two files to agree is not a mechanism. This is.
+/// The old toggle wrote a preference no Rust consumer read. Do not offer a
+/// control that claims to disable the provider's native context management.
 #[test]
-fn the_auto_compact_copy_states_the_threshold_the_server_actually_uses() {
+fn context_management_copy_does_not_offer_an_ineffective_toggle() {
     let html = asset("index.html");
-    let pct = amux_server::orchestrator::compaction::COMPACT_BELOW_PCT_REMAINING;
-    let line = html
-        .lines()
-        .find(|l| l.contains("Send /compact when context"))
-        .expect("the auto-compact help copy must exist — if it moved, this check is now blind");
-    assert!(
-        line.contains(&format!("{pct}%")),
-        "the toggle's copy must name the real trigger ({pct}% remaining), got: {line}"
-    );
-    // CONTROL: the old wrong number must not be what satisfies it. Without this
-    // a copy saying "50%" passes the moment somebody sets the constant to 50
-    // for an unrelated reason.
-    assert!(
-        !line.contains("50%") || pct == 50,
-        "copy still names 50% while the constant is {pct}: {line}"
-    );
+    assert!(html.contains("Claude Code compacts context and continues the task automatically."));
+    assert!(html.contains("/config menu"));
+    assert!(!html.contains("auto-compact-checkbox"));
+    let js = asset("app.js");
+    assert!(!js.contains("auto_compact_enabled"));
 }
 
 #[test]
@@ -688,6 +923,10 @@ fn board_detail_leads_with_actionable_task_context() {
         "item.gate_requirements",
         "item.asset_links",
         "a.resolved_ref",
+        "_bdArtifactHref(",
+        "window.location.origin",
+        "Retired artifacts (",
+        "const retiredArtifacts =",
         "const explicitPath =",
         "const serverResolvedPath =",
         "<button type=\"button\" class=\"file-link board-artifact-file\"",
@@ -814,4 +1053,566 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
     ] {
         assert!(css.contains(needle), "Configurations layout lost `{needle}`");
     }
+}
+
+#[test]
+fn worker_board_opens_current_work_without_expanding_every_idle_lane() {
+    let app = asset("app.js");
+    let start = app
+        .find("function toggleSessionGroup(name, currentlyCollapsed)")
+        .expect("worker board needs a visible-state toggle");
+    let tail = &app[start..];
+    let end = tail
+        .find("function _issueRowHTML")
+        .expect("collapse predicate must remain in the board-view section");
+    let board = &tail[..end];
+
+    assert!(
+        board.contains("Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, name)"),
+        "a saved user choice must beat the automatic default"
+    );
+    assert!(
+        board.contains("status === 'doing' || status === 'review'"),
+        "in-flight work must default open"
+    );
+    assert!(
+        board.contains("_sessionGroupCollapsed[name] = !currentlyCollapsed"),
+        "the first click must invert the state on screen, including a default-closed group"
+    );
+    assert!(
+        app.contains("kind: 'board-worker-density'")
+            && app.contains("verdict: 'idle-history-collapsed'")
+            && app.contains("n_considered: sessionNames.length"),
+        "the density fix needs a measured client-log signal"
+    );
+    assert!(
+        !board.contains("const collapsed = _sessionGroupCollapsed[name || '__none__']"),
+        "the old undefined-means-every-worker-open default returned"
+    );
+}
+
+/// AF-390 fixed `#email-approvals-banner` swallowing clicks on the peek
+/// overlay's fixed-position controls (`.overlay { z-index: 100 }`): an
+/// in-flow global banner with `z-index: 200` painted over it once the banner
+/// grew tall enough (narrow viewport -> its text wraps -> its box reaches
+/// further down the screen). The fix set that ONE banner to `z-index: 90`
+/// and left a comment stating the rule for every future one: "NOTHING IN
+/// NORMAL FLOW MAY OUTRANK THESE TWO... If you add another global strip, put
+/// it under 100 too."
+///
+/// AMUX-126 (2026-09-07): three more global banners violated exactly that
+/// rule — `#no-apikey-banner`, `#org-banner`, `#org-invite-banner` all still
+/// carried `z-index: 200`, inherited from before AF-390 landed and never
+/// updated to match. CI caught the symptom (a real `locator.click` timeout on
+/// mobile/ios-safari in `terminal-message-navigation.spec.ts`, `#no-apikey-
+/// banner` named in the error as the element "intercepting pointer events")
+/// but nothing had checked the RULE itself — a comment stating an invariant
+/// is not a check that can fail (ethos rule 7). This scans every global
+/// banner div for its inline z-index and fails if a new one is ever added (or
+/// an old one edited) above the overlay's own 100.
+/// The peek toolbar's message filter is a BUTTON, and a `<select>` must not
+/// come back into that band (AF-591, AMUX-4242).
+///
+/// The old control was `<label class="peek-msg-filter" for="peek-msg-kind">`
+/// wrapping a full-width `<select>`, which spent over half the toolbar's width
+/// on one input and squeezed up, down, find, worker-menu and close to the right
+/// edge. `amux` replaced it in c07923e6 with a funnel button plus a filter
+/// panel, keeping the count badge so the number was not dropped.
+///
+/// This is the half that shipped without a signal. The UI fix is real and there
+/// was nothing to catch it regressing: a later edit could reintroduce a select
+/// into that band and every test would stay green. The two-fix rule asks for the
+/// fix AND the thing that self-announces, and the spec for this change named
+/// exactly this check as the one worth adding.
+///
+/// It slices the BAND rather than the file, because the dashboard has a dozen
+/// legitimate `<select>` elements elsewhere (settings, library facets, proxy
+/// form) and a file-wide assertion would either be false or have to whitelist
+/// them, which is a list that rots.
+#[test]
+fn the_peek_toolbar_filter_is_a_button_and_not_a_select() {
+    let index = asset("index.html");
+    let lines: Vec<&str> = index.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains(r#"class="peek-toolbar""#))
+        .expect("the peek toolbar band is gone from index.html; did the class change?");
+    let end = lines[start..]
+        .iter()
+        .position(|l| l.contains("peek-find-wrap"))
+        .map(|offset| start + offset)
+        .expect("the find-wrap that closes the toolbar band is gone; re-anchor this test");
+    let band = lines[start..end].join("\n");
+
+    assert!(
+        !band.contains("<select"),
+        "a <select> is back in the peek toolbar band. It is the control this change removed, \
+         because at full width it leaves no room for up/down/find/menu/close:\n{band}"
+    );
+
+    // POSITIVE CONTROLS. Without these, deleting the whole band passes the
+    // assertion above, and so does a button that silently dropped the count.
+    // Matched as the full id ATTRIBUTE, not as a substring. `contains("peek-msg
+    // -count")` still matches `peek-msg-count-gone`, so a rename would have
+    // slipped through: caught by mutating exactly that and watching this cell
+    // stay green.
+    assert!(
+        band.contains(r#"id="peek-filter-btn""#),
+        "the filter BUTTON is missing from the toolbar band:\n{band}"
+    );
+    assert!(
+        band.contains(r#"id="peek-msg-count""#),
+        "the message count badge was dropped; the number the <select> used to show must survive:\n{band}"
+    );
+    // And the band must still hold the actions the select was crowding out.
+    for needle in ["peekMsgPrev", "peekMsgNext", "togglePeekFind", "closePeek"] {
+        assert!(
+            band.contains(needle),
+            "the toolbar lost `{needle}`, which is what the space was reclaimed FOR:\n{band}"
+        );
+    }
+}
+
+#[test]
+fn global_banners_never_outrank_the_peek_overlay() {
+    let html = asset("index.html");
+    // Every id in this list is a banner that renders in NORMAL DOCUMENT FLOW
+    // (not `position: fixed`) at the top of the page, in the same screen band
+    // as `.overlay` (z-index 100) and `#board-detail-overlay` (z-index 150) —
+    // exactly the AF-390 hazard. A banner added under a NEW id needs adding
+    // here too, or this test cannot see it.
+    let banner_ids =
+        ["no-apikey-banner", "org-banner", "org-invite-banner", "email-approvals-banner"];
+    for id in banner_ids {
+        let needle = format!("id=\"{id}\" style=\"");
+        let start = html.find(&needle).unwrap_or_else(|| panic!("banner #{id} not found in index.html — did it move or get renamed?"));
+        let tail = &html[start..];
+        let tag_end = tail.find('>').expect("unterminated div tag");
+        let style_attr = &tail[..tag_end];
+        let zi_key = "z-index:";
+        let zi_start = style_attr
+            .find(zi_key)
+            .unwrap_or_else(|| panic!("banner #{id} has no inline z-index at all — add one under 100, don't rely on the cascade default"))
+            + zi_key.len();
+        let zi_rest = &style_attr[zi_start..];
+        let zi_end = zi_rest.find(';').unwrap_or(zi_rest.len());
+        let z: i32 = zi_rest[..zi_end]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("banner #{id}'s z-index isn't a plain integer: {e}"));
+        assert!(
+            z < 100,
+            "banner #{id} has z-index:{z} -- AF-390's rule is nothing in normal flow may outrank \
+             the peek overlay (z-index:100); a tall-wrapped banner at {z} will paint over and \
+             swallow clicks on the overlay's own controls exactly like AF-390 did. Use 90, matching \
+             #email-approvals-banner."
+        );
+    }
+}
+
+#[test]
+fn workspace_invites_and_members_are_assigned_through_scoped_teams() {
+    let app = asset("app.js");
+    let html = asset("index.html");
+    for needle in [
+        "function openTeamEditor",
+        "fetch('/api/org/teams')",
+        "JSON.stringify({email, team_id})",
+        "JSON.stringify({team_id})",
+        "_workspaceTeamScope",
+    ] {
+        assert!(app.contains(needle), "workspace team UI lost `{needle}`");
+    }
+    for needle in ["Workspace access", "settings-teams-list", "+ Team", "+ Invite"] {
+        assert!(html.contains(needle), "workspace access shell lost `{needle}`");
+    }
+    assert!(
+        !app.contains("JSON.stringify({email, scope_level, scope_name})"),
+        "the invite UI regressed to copying a one-off scope onto the user instead of assigning a team"
+    );
+}
+
+/// Ethan, 2026-09-11 22:42, phone screenshot with the composer circled: the
+/// input on its own row and ⋮ + Send on a second row. The one-line rule
+/// shipped in acbad74e and was deleted nine minutes later by 241b92ac, so the
+/// phone went straight back. Two lanes disagreeing in CSS is settled here,
+/// where the next deletion turns CI red instead of a screenshot.
+#[test]
+fn the_phone_composer_keeps_input_and_actions_on_one_line() {
+    let css = asset("app.css");
+    assert!(
+        css.contains(".peek-cmd-row .ac-wrap { flex: 1 1 0; min-width: 0; }"),
+        "the phone composer input must flex beside ⋮ and Send (one line); \
+         this rule was removed once already (241b92ac) and Ethan asked for it back"
+    );
+    assert!(
+        !css.contains(".peek-composer-input { flex: 1 0 100%; }"),
+        "the full-row input rule is back: it puts ⋮ and Send on their own row, \
+         the layout Ethan circled on 2026-09-11"
+    );
+}
+
+/// The worker tab customizer is the grid glyph, like the one on the workers
+/// list. It shipped as ⊞ in 020df94b and came back as the word "Tabs ▾" in
+/// fe8cd4d4; Ethan asked for the glyph four separate times that day.
+#[test]
+fn the_worker_tab_customizer_is_the_grid_glyph() {
+    let html = asset("index.html");
+    let i = html.find("id=\"peek-tab-customize\"").expect("the peek tab customizer button exists");
+    let btn = &html[i..];
+    let end = btn.find("</button>").expect("the button closes");
+    let inner = &btn[..end];
+    assert!(
+        inner.ends_with("&#x229E;"),
+        "the peek tab customizer must show the ⊞ glyph, not a word: got {:?}",
+        &inner[inner.len().saturating_sub(24)..]
+    );
+    assert!(!inner.contains("Tabs"), "the label \"Tabs\" is back on the peek tab customizer");
+}
+
+/// A slow /send is not an offline /send. With a 10s client abort, every send
+/// the server took longer than 10s to accept fell into the outbox, replayed
+/// into the dedup gate, and after two minutes became a BLOCKED op with a red
+/// banner over a message the worker already had (2026-09-11, two workers).
+#[test]
+fn a_slow_send_has_a_bounded_outer_deadline() {
+    let js = asset("app.js");
+    let i = js.find("async function doSend(").expect("doSend exists");
+    let j = js[i..].find("async function doKeys(").expect("doKeys follows doSend");
+    let body = &js[i..i + j];
+    assert!(
+        !body.contains("AbortSignal.timeout(10000)"),
+        "doSend aborts at 10s again; on this host /send routinely exceeds that"
+    );
+    assert!(body.contains("AbortSignal.timeout(90000)"), "doSend keeps a 90s ceiling for a hung server");
+    // Uncertain delivery must retain the original durable intent. The executable
+    // dashboard-outage-recovery.mjs contract tests the real response path and
+    // checkmark state, including a negative control restoring the old drop.
+    // Receipt-only automatic retries are covered by e2e/outbox-acceptance-recovery.test.mjs.
+
+}
+
+/// A card-composer send must remove its sent attachments DURABLY (via
+/// _cancelUpload, which deletes the IndexedDB upload row), not just filter the
+/// in-memory array. A plain filter left the durable row behind and
+/// _attachmentRestore re-hydrated every sent file on the next reload, so card
+/// attachment chips piled up with green ticks despite having been delivered
+/// (Ethan, 2026-09-12). sendPeekCmd already did this; the card path had drifted.
+#[test]
+fn a_card_send_clears_its_attachments_durably() {
+    let js = asset("app.js");
+    let i = js.find("async function sendFromInput(").expect("sendFromInput exists");
+    let j = js[i..].find("\n}\n").map(|k| i + k).unwrap_or(js.len());
+    let body = &js[i..j.min(i + 4000)];
+    assert!(
+        body.contains("_cancelUpload(f)"),
+        "sendFromInput must call _cancelUpload on each sent attachment so the durable \
+         IndexedDB row is removed; a bare array filter leaks it and the chip returns on reload"
+    );
+}
+
+/// A session change must refresh the OPEN worker-details view, not just the
+/// list. The server pushes invalidate:['sessions'] and the client answers with
+/// fetchSessions (AMUX-3503); fetchSessions only re-rendered the list, so the
+/// open peek stayed stale until its own poll or a manual reload (Ethan,
+/// 2026-09-12: "there's a delay and i have to refresh page to see it"). Both the
+/// fetch path and the direct-payload SSE branch must route through the one
+/// helper so they cannot drift.
+#[test]
+fn a_session_update_refreshes_the_open_details_view() {
+    let js = asset("app.js");
+    assert!(
+        js.contains("function _refreshOpenPeekOnSessions"),
+        "the shared open-peek refresh helper must exist so list and details update from one event"
+    );
+    // The helper is CALLED from both the fetch path and the SSE branch (two
+    // call sites, `_refreshOpenPeekOnSessions();`), separate from its one
+    // definition (`function _refreshOpenPeekOnSessions()`). If either call site
+    // is dropped, a session change refreshes only one surface.
+    let calls = js.matches("_refreshOpenPeekOnSessions();").count();
+    assert!(
+        calls >= 2,
+        "expected the open-details refresh to be called from both the fetch path and the SSE \
+         branch (>=2 call sites); found {calls} — a status/queue change would update the list \
+         while the peek stays stale until a manual refresh"
+    );
+}
+
+/// Reconnecting must show the sync checklist draining item by item — the
+/// checkmark list (Ethan, 2026-09-12: "when reconnecting it should show that
+/// list of checkboxes and check marks of different synced things"). The
+/// mechanism (renderBanner's per-item ✔/✘/➤ states) already existed but was
+/// gated behind !quiet, and the reconnect drain ran quiet, so it never showed.
+#[test]
+fn reconnect_shows_the_sync_checklist() {
+    let js = asset("app.js");
+    // The reconnect edge (setOnline false->true) raises the banner non-quiet.
+    let so = js.find("function setOnline(").expect("setOnline exists");
+    let so_end = js[so..].find("\n}\n").map(|k| so + k).unwrap_or(js.len());
+    assert!(
+        js[so..so_end].contains("runSyncBanner(false)"),
+        "reconnect must raise the sync banner non-quiet so the checklist is visible"
+    );
+    // A multi-item batch shows even from a quiet caller. Uncertain sends are
+    // not counted toward the two (AMUX-4594): they stay in the replay list so
+    // they keep being re-checked, and counting them popped the checklist on
+    // every new send (Ethan, 2026-09-14: "this shouldn't be appearing when I
+    // send, too invasive").
+    assert!(
+        js.contains("const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;"),
+        "a 2+ item batch of non-uncertain items must show the checklist even when the caller is quiet"
+    );
+    // The per-item checkmark states must still exist.
+    assert!(
+        js.contains("i.status === 'done'") && js.contains("&#x2714;"),
+        "the checklist must mark each item done with a checkmark as it syncs"
+    );
+}
+
+/// The worker-LIST card composer has no "Attach file" button (Ethan,
+/// 2026-09-12: "remove the attach file button we don't need that from worker
+/// list page"). Attaching on a card still works by drag-and-drop and paste; the
+/// standalone 📎 button was the redundant surface. The peek composer keeps its
+/// own attach affordance — this guard is scoped to the card picker class.
+#[test]
+fn the_worker_list_card_has_no_attach_file_button() {
+    let js = asset("app.js");
+    assert!(
+        !js.contains("card-file-picker"),
+        "the card composer's standalone Attach-file button is back; Ethan removed it \
+         (drag-and-drop + paste still attach)"
+    );
+}
+
+/// The settings menu must ESCAPE the sticky .header-row (position:sticky;
+/// z-index:40) on mobile, or its absolutely-positioned dropdown paints behind
+/// #session-view and is invisible (Ethan, 2026-09-12: "when I press the
+/// settings button on mobile I don't see anything"). Only leaving that stacking
+/// context (position:fixed) works; raising z-index does not. Pin the mobile
+/// fixed override so a later refactor cannot silently re-trap it.
+#[test]
+fn the_mobile_settings_menu_escapes_the_sticky_header() {
+    let css = asset("app.css");
+    // Locate the actual selector and declarations. A character budget after
+    // a prose marker failed as soon as the rationale exceeded that budget.
+    let rule = regex::Regex::new(r"(?s)@media\s*\(max-width:\s*600px\)\s*\{\s*\.settings-menu\s*\{([^}]+)").unwrap();
+    let captures = rule.captures(&css).expect("the mobile settings-menu rule must be present");
+    let block = &captures[1];
+    assert!(
+        block.contains("position: fixed"),
+        "the mobile settings-menu override must use position:fixed to leave the header stacking context"
+    );
+}
+
+/// AMUX-4475: the interaction-feedback "Actions/Confirmed" hub (state/feedback.mjs
+/// appends it to .header-row) orphaned itself at the header's right edge and left
+/// the toolbar crammed in the corner. Ethan, 2026-09-12: "get rid of this and make
+/// the toolbar use the real estate we have." It is hidden in CSS (feedback still
+/// surfaces via toasts); pin that so a refactor cannot silently restore the clutter.
+#[test]
+fn the_interaction_feedback_hub_is_hidden_from_the_header() {
+    let css = asset("app.css");
+    let rule = regex::Regex::new(r"#interaction-feedback\s*\{[^}]*display:\s*none")
+        .unwrap();
+    assert!(
+        rule.is_match(&css),
+        "the interaction-feedback hub must be hidden (#interaction-feedback{{display:none}}) \
+         so it stops orphaning the header toolbar (AMUX-4475)"
+    );
+}
+
+/// AMUX-4475 "weird blue highlighting": .tab-bar is overflow-x:auto, which per the
+/// overflow spec forces overflow-y:auto, so a focused tab's focus ring gets its top
+/// and bottom clipped by the scroll box — leaving two stray blue vertical bars. The
+/// fix insets the ring (negative outline-offset) so it draws as a clean box and is
+/// never clipped. Pin the negative offset on the tab focus-visible rule.
+#[test]
+fn the_tab_focus_ring_is_inset_so_it_is_not_clipped_into_blue_bars() {
+    let css = asset("app.css");
+    let rule = regex::Regex::new(
+        r"(?s)\.tab-bar\s+button:focus-visible\s*\{([^}]*)\}",
+    )
+    .unwrap();
+    let block = rule
+        .captures(&css)
+        .expect("a .tab-bar button:focus-visible rule must exist (AMUX-4475)");
+    let decls = &block[1];
+    let off = regex::Regex::new(r"outline-offset:\s*(-?\d+)")
+        .unwrap()
+        .captures(decls)
+        .and_then(|c| c[1].parse::<i32>().ok())
+        .expect("the focus-visible rule must set outline-offset");
+    assert!(
+        off < 0,
+        "the tab focus ring must be INSET (negative outline-offset) so overflow-y:auto \
+         cannot clip it into stray blue vertical bars (AMUX-4475); got {off}"
+    );
+}
+
+/// AMUX-4476: clicking into a worker's Messages was slow because the surfaces
+/// fetched a 200-row first page, and /api/history is 12-120s under this host's
+/// read-pool contention (the wall-clock scales with row count). A small first
+/// page paints fast; "Load older" pages the rest. Pin the first-page ceiling so a
+/// later edit cannot quietly restore the 200-row wait.
+#[test]
+fn the_message_tabs_load_a_small_first_page() {
+    let js = asset("app.js");
+    for name in ["_PEEK_MSG_PAGE", "_MSGS_PAGE"] {
+        let re = regex::Regex::new(&format!(r"const\s+{name}\s*=\s*(\d+)")).unwrap();
+        let n = re
+            .captures(&js)
+            .and_then(|c| c[1].parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("{name} constant must exist (AMUX-4476)"));
+        assert!(
+            n <= 100,
+            "{name} is {n}; the message first page must stay small (<=100) so click-to-display \
+             is fast under read-pool contention (AMUX-4476)"
+        );
+    }
+}
+
+/// AMUX-4475: the toolbar controls must read as one consistent bordered set
+/// (Ethan, 2026-09-12: "borders around buttons too", "make the components all
+/// consistent", flat emoji throughout). The AF-750 header refinement had made
+/// the icon/count buttons borderless (border-color:transparent). Pin the boxed
+/// styling back so a later refactor cannot silently flatten them again.
+#[test]
+fn the_toolbar_buttons_are_boxed_not_borderless() {
+    let css = asset("app.css");
+    // The header override must NOT strip the border to transparent.
+    assert!(
+        !css.contains("border-color:transparent; background:transparent"),
+        "the header buttons are borderless again (border-color:transparent) — Ethan asked \
+         for borders around the toolbar buttons (AMUX-4475)"
+    );
+    // notif bell must carry a real border in the header.
+    let notif = regex::Regex::new(r"\.header-row #notif-btn \{[^}]*\}")
+        .unwrap()
+        .find(&css)
+        .map(|m| m.as_str().to_string())
+        .expect(".header-row #notif-btn rule must exist");
+    assert!(
+        notif.contains("border:1px solid var(--border)"),
+        "the notification bell must be a bordered box in the toolbar (AMUX-4475); got: {notif}"
+    );
+    // active + settings must be bordered boxes too.
+    let box_rule = regex::Regex::new(
+        r"\.header-row \.btn-active, \.header-row \.settings-btn \{[^}]*\}",
+    )
+    .unwrap()
+    .find(&css)
+    .map(|m| m.as_str().to_string())
+    .expect(".header-row .btn-active, .settings-btn rule must exist");
+    assert!(
+        box_rule.contains("border:1px solid var(--border)"),
+        "the active/settings toolbar buttons must be bordered boxes (AMUX-4475); got: {box_rule}"
+    );
+}
+
+/// AMUX-4475: flat emoji throughout the toolbar (Ethan's choice). The settings
+/// gear was a monochrome text glyph (U+2699) while the bell was a colour emoji;
+/// the gear now carries VARIATION SELECTOR-16 (U+FE0F) so it renders as an emoji
+/// to match. Also: the bell button must not re-add an inline border:none that
+/// would beat the stylesheet box.
+#[test]
+fn the_toolbar_icons_render_as_consistent_emoji() {
+    let html = asset("index.html");
+    let gear = regex::Regex::new(r#"id="settings-btn"[^>]*>([^<]*)</button>"#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("settings-btn must exist");
+    assert!(
+        gear.contains("&#x2699;&#xFE0F;") || gear.contains('\u{2699}'),
+        "the settings gear must render as an emoji (U+2699 + VS16) to match the bell (AMUX-4475); got: {gear:?}"
+    );
+    let notif = regex::Regex::new(r#"id="notif-btn"[^>]*style="([^"]*)""#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("notif-btn must exist");
+    assert!(
+        !notif.contains("border:none"),
+        "the bell must not carry an inline border:none — it beats the toolbar box border (AMUX-4475); got: {notif}"
+    );
+}
+
+/// AMUX-4477: the MDAI viewer built a file's absolute path by joining the list
+/// path onto _AMUX_HOME ($HOME). But the list returns paths relative to the
+/// `.mdai` SCAN ROOT, which a `mdai_root` pref can move into a sub-vault (e.g.
+/// ~/.amux/local). There, joining onto $HOME produced /Users/x/Foo.mdai for a
+/// file at /Users/x/.amux/local/Foo.mdai, so EVERY open hit "no such path". The
+/// fix serves the real root as window._AMUX_MDAI_ROOT and _mdaiAbs prefers it.
+/// Pin both halves so a refactor cannot silently reintroduce the $HOME-only join.
+#[test]
+fn the_mdai_viewer_resolves_paths_against_the_scan_root() {
+    let js = asset("app.js");
+    let abs = regex::Regex::new(r"(?s)function _mdaiAbs\([^)]*\)\s*\{(.*?)\n\}")
+        .unwrap()
+        .captures(&js)
+        .map(|c| c[1].to_string())
+        .expect("_mdaiAbs must exist");
+    assert!(
+        abs.contains("_AMUX_MDAI_ROOT"),
+        "_mdaiAbs must join list paths onto _AMUX_MDAI_ROOT (the scan root), not just \
+         _AMUX_HOME, or every open under a mdai_root sub-vault hits 'no such path' (AMUX-4477)"
+    );
+}
+
+/// AMUX-4801: the UI's closed-status set and the server's derivation are one
+/// fact, so they are compared rather than trusted.
+///
+/// This fact previously lived in NINE places in app.js in four spellings, all
+/// of them wrong in at least one way: every copy omitted `quarantined` (what
+/// `amux board fail` produces, parked for the OWNER, so it rendered as still
+/// open), two invented `cancelled` (not in TaskStatus at all, an arm that could
+/// never match), and one was `['done','verified']`, treating discarded cards as
+/// open. Consolidating without pinning would leave one copy that is merely
+/// wrong in one place instead of nine.
+///
+/// Compared against `claims_live_work` by COMPLEMENT: a status is closed here
+/// exactly when the server says a lane can no longer act on it. Deliberately
+/// NOT `is_terminal`, which excludes `done` because done still awaits
+/// verification; the two predicates disagree on `done` and `armed`, and sharing
+/// the word "terminal" is how a reader picks the wrong one.
+#[test]
+fn the_ui_closed_statuses_match_the_servers_derivation() {
+    let app = asset("app.js");
+    let line = app
+        .lines()
+        .find(|l| l.trim_start().starts_with("const _CLOSED_STATUSES"))
+        .expect("app.js must declare `const _CLOSED_STATUSES`");
+    let inner = line
+        .split_once('[')
+        .and_then(|(_, r)| r.split_once(']'))
+        .map(|(v, _)| v)
+        .expect("_CLOSED_STATUSES must be an array literal");
+    let mut from_js: Vec<String> = inner
+        .split(',')
+        .map(|p| p.trim().trim_matches('\'').trim_matches('"').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let mut from_server: Vec<String> = amux_core::board::TaskStatus::ALL
+        .iter()
+        .filter(|s| !s.claims_live_work())
+        .map(|s| {
+            // The DB spelling, which is what the API returns and what the UI
+            // compares against after `_statusCanon`.
+            format!("{s:?}").to_lowercase()
+        })
+        .collect();
+
+    from_js.sort();
+    from_server.sort();
+    assert_eq!(
+        from_js, from_server,
+        "app.js's _CLOSED_STATUSES has drifted from TaskStatus::claims_live_work's complement"
+    );
+    // The two the old literals got wrong, named so a regression says which.
+    assert!(from_js.contains(&"quarantined".to_string()), "{from_js:?}");
+    assert!(from_js.contains(&"armed".to_string()), "{from_js:?}");
+    assert!(!from_js.contains(&"cancelled".to_string()), "cancelled is not a status: {from_js:?}");
+    // And the count is not a coincidence of two short lists.
+    assert!(from_js.len() >= 5, "{from_js:?}");
 }

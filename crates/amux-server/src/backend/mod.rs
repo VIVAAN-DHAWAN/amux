@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod bootstrap;
 pub mod herdr;
 pub mod tmux;
+pub mod tmux_health;
 
 use amux_core::ids::WorkerId;
 use async_trait::async_trait;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSpec {
     pub worker: WorkerId,
-    /// e.g. `["claude", "--dangerously-skip-permissions"]` — the provider
+    /// e.g. `["claude"]` — the provider
     /// layer builds this; the backend never interprets it.
     pub command: Vec<String>,
     pub cwd: String,
@@ -166,6 +167,14 @@ pub trait SessionBackend: Send + Sync {
     /// could not read. The two must stay distinguishable, or a transient
     /// backend outage masquerades as a stopped fleet.
     async fn agent_states(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(std::collections::BTreeMap::new())
+    }
+    /// Confirmed terminal process exits, keyed by backend ref, in one census.
+    /// Absence is not proof of exit. Backends without this evidence return an
+    /// empty map; failed probes return Err and must not stop workers.
+    async fn process_exits(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, amux_core::protocol::ExitStatus>> {
         Ok(std::collections::BTreeMap::new())
     }
     /// Type literal text into the session's terminal and submit it.

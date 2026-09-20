@@ -17,7 +17,13 @@
 # reach curl, it fails loudly instead of quietly mutating a real board.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo pipefail
+
+# AF-562: every capture below is `if ...; then rc=0; else rc=$?; fi`, and NONE is
+# `|| true`. All of them feed check_rc, so the EXIT STATUS is the assertion —
+# tolerating it would pass every refusal cell silently. I tried `|| true` on the
+# first one, believing its assertion read only $out; cell (a) also reads $rc and
+# went from pass to fail. The before/after cell count is what caught it. pipefail
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
@@ -59,7 +65,7 @@ check_lacks() { # label needle haystack
 # (a) The exact specimen from the incident. Not a convenient one: this is the
 #     literal invocation that filed AEAB-10 with an empty body and wrong type.
 # ---------------------------------------------------------------------------
-out=$(run "cloud.amux.io is DOWN (502)" --type blocker --desc-file "$TMP/nope.md"); rc=$?
+if out=$(run "cloud.amux.io is DOWN (502)" --type blocker --desc-file "$TMP/nope.md"); then rc=0; else rc=$?; fi
 # --type IS accepted now, so the refusal must come from the unreadable --desc-file,
 # NOT from the flag being unknown. Asserting which failure it is matters: a parser
 # that refused *every* flag would also be wrong.
@@ -70,7 +76,7 @@ check_lacks "(a) did not create a card"       "→ todo" "$out"
 # ---------------------------------------------------------------------------
 # (b) A genuinely unknown flag must be REFUSED and must say so.
 # ---------------------------------------------------------------------------
-out=$(run "PROBE title" --totally-bogus-flag xyz); rc=$?
+if out=$(run "PROBE title" --totally-bogus-flag xyz); then rc=0; else rc=$?; fi
 check_rc   "(b) unknown flag refused"          1 "$rc"
 check_has  "(b) names the offending flag"      "--totally-bogus-flag" "$out"
 check_has  "(b) says it is unknown"            "unknown option" "$out"
@@ -81,7 +87,7 @@ check_lacks "(b) did not create a card"        "→ todo" "$out"
 # (c) --help prints help and files NOTHING. This is the case that polluted the
 #     board, so it is asserted on both halves: help text present, no card.
 # ---------------------------------------------------------------------------
-out=$(run --help); rc=$?
+if out=$(run --help); then rc=0; else rc=$?; fi
 check_rc   "(c) --help exits 0"                0 "$rc"
 check_has  "(c) --help prints usage"           "Usage: amux board add" "$out"
 check_has  "(c) --help documents --type"       "--type" "$out"
@@ -96,7 +102,7 @@ check_lacks "(c) --help created no card"       "→ todo" "$out"
 #     It has already earned that: it is the case that detected the AMUX_URL/AMUX_API
 #     isolation bug described above, which was writing to a live board.
 # ---------------------------------------------------------------------------
-out=$(run "an ordinary title with no flags"); rc=$?
+if out=$(run "an ordinary title with no flags"); then rc=0; else rc=$?; fi
 check_lacks "(d) plain title not treated as a bad flag" "unknown option" "$out"
 check_lacks "(d) plain title did not print usage"       "Usage: amux board add" "$out"
 # curl exit 7 = "failed to connect". Only reachable AFTER parsing succeeded and a
@@ -109,7 +115,7 @@ check_rc   "(d) plain title reached the network layer"  7 "$rc"
 #     code did `title="$*"`, so this case passed before AND after — it is here to
 #     prove the rewrite to a while-loop did not regress the ordinary path.
 # ---------------------------------------------------------------------------
-out=$(run three separate words); rc=$?
+if out=$(run three separate words); then rc=0; else rc=$?; fi
 check_lacks "(e) multi-word title accepted" "unknown option" "$out"
 check_lacks "(e) multi-word title no usage" "Usage: amux board add" "$out"
 
@@ -119,23 +125,23 @@ check_lacks "(e) multi-word title no usage" "Usage: amux board add" "$out"
 #     error message advertises has to actually work.
 # ---------------------------------------------------------------------------
 printf -- '--this is really the title--\n' > "$TMP/title.txt"
-out=$(run --file "$TMP/title.txt"); rc=$?
+if out=$(run --file "$TMP/title.txt"); then rc=0; else rc=$?; fi
 check_lacks "(f) --file title not refused as a flag" "unknown option" "$out"
 check_lacks "(f) --file title did not print usage"   "Usage: amux board add" "$out"
 
 # ---------------------------------------------------------------------------
 # (g) Missing values are refused rather than swallowing the next token.
 # ---------------------------------------------------------------------------
-out=$(run "t" --type); rc=$?
+if out=$(run "t" --type); then rc=0; else rc=$?; fi
 check_rc   "(g) --type with no value refused" 1 "$rc"
-out=$(run "t" --desc); rc=$?
+if out=$(run "t" --desc); then rc=0; else rc=$?; fi
 check_rc   "(g) --desc with no value refused" 1 "$rc"
 
 # ---------------------------------------------------------------------------
 # (h) retitle had the identical catch-all twenty lines away; fixed in the same
 #     change, so it is covered here rather than left as a known hole.
 # ---------------------------------------------------------------------------
-out=$(HOME="$TMP" "$AMUX_BIN" board retitle AEAB-1 "a title" --totally-bogus-flag 2>&1); rc=$?
+if out=$(HOME="$TMP" "$AMUX_BIN" board retitle AEAB-1 "a title" --totally-bogus-flag 2>&1); then rc=0; else rc=$?; fi
 check_rc  "(h) retitle refuses an unknown flag"      1 "$rc"
 check_has "(h) retitle names the offending flag"     "--totally-bogus-flag" "$out"
 
@@ -153,9 +159,12 @@ check_has "(h) retitle names the offending flag"     "--totally-bogus-flag" "$ou
 BODY="$TMP/body.json"
 # Job control off around the stub so bash does not print "Terminated" at exit.
 set +m
-python3 - "$BODY" >/dev/null 2>&1 <<'PYSTUB' &
+# AMUX-4651: port 0, published through a file, and stderr kept. A fixed port let
+# an unrelated local server answer these cells while this stub failed to bind.
+python3 - "$BODY" "$TMP/stub.port" >/dev/null 2>"$TMP/stub.err" <<'PYSTUB' &
 import json, sys, ssl, http.server
 out = sys.argv[1]
+portf = sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -182,21 +191,35 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b)
     def log_message(self, *a):  # keep the test output clean
         pass
-srv = http.server.HTTPServer(("127.0.0.1", 8899), H)
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(portf, "w").write(str(srv.server_address[1]))
 srv.serve_forever()
 PYSTUB
 STUB_PID=$!
 disown "$STUB_PID" 2>/dev/null || true
 trap 'kill "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null; rm -rf "$TMP"' EXIT
-# Wait for the port rather than sleeping a guessed interval.
+# Wait for THIS stub to publish its port. A curl probe was satisfied by any server
+# on the port, including one that was not this stub.
 for _ in $(seq 1 50); do
-  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:8899/api/board/contract" 2>/dev/null; then break; fi
+  [ -s "$TMP/stub.port" ] && break
   sleep 0.1
 done
+if [ ! -s "$TMP/stub.port" ]; then
+  echo "FAIL: the board stub never started, so cells (i) and (j) cannot run"
+  echo "  stub stderr: $(head -5 "$TMP/stub.err" 2>/dev/null)"
+  exit 1
+fi
+STUB_PORT=$(cat "$TMP/stub.port")
 
 printf 'a body written from a file\n' > "$TMP/desc.md"
 rm -f "$BODY"
-AMUX_API="http://127.0.0.1:8899" run "a real title" --type blocker --desc-file "$TMP/desc.md" >/dev/null 2>&1
+# AMUX-4651: this was a bare command with its output discarded, so under set -e a
+# failure here ended the whole script silently, before the (i) checks and the
+# summary. Capture it the AF-562 way so the exit code is asserted and the CLI
+# output is shown when it fails.
+if out=$(AMUX_API="http://127.0.0.1:$STUB_PORT" run "a real title" --type blocker --desc-file "$TMP/desc.md"); then rc=0; else rc=$?; fi
+check_rc "(i) board add against the stub exits 0" 0 "$rc"
+[ "$rc" = 0 ] || echo "  got: $(printf '%s' "$out" | head -5)"
 
 if [ -s "$BODY" ]; then
   PASS=$((PASS+1))
@@ -235,7 +258,7 @@ fi
 #   200 + no types    -> "contract shape changed", NOT "unreachable"
 helptypes() { AMUX_API="$1" HOME="$TMP" "$AMUX_BIN" board add --help 2>&1 | grep "^types:"; }
 
-got=$(helptypes "http://127.0.0.1:8899")
+got=$(helptypes "http://127.0.0.1:$STUB_PORT")
 check_has   "(j) 200 + real contract shape lists the types" "code blocker chore" "$got"
 check_lacks "(j) a healthy server is never called unreachable" "unreachable"     "$got"
 
@@ -245,8 +268,8 @@ check_has   "(j) transport failure names the http code"     "http=000"          
 check_lacks "(j) transport failure is not a shape complaint" "shape changed"     "$got"
 
 # A 200 carrying neither spelling of the list.
-python3 - >/dev/null 2>&1 <<'PYSTUB2' &
-import json, http.server
+python3 - "$TMP/stub2.port" >/dev/null 2>"$TMP/stub2.err" <<'PYSTUB2' &
+import json, sys, http.server
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         b = json.dumps({"gates": {}}).encode()
@@ -256,15 +279,22 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b)
     def log_message(self, *a):
         pass
-http.server.HTTPServer(("127.0.0.1", 8902), H).serve_forever()
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
 PYSTUB2
 STUB2_PID=$!
 disown "$STUB2_PID" 2>/dev/null || true
 for _ in $(seq 1 50); do
-  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:8902/api/board/contract" 2>/dev/null; then break; fi
+  [ -s "$TMP/stub2.port" ] && break
   sleep 0.1
 done
-got=$(helptypes "http://127.0.0.1:8902")
+if [ ! -s "$TMP/stub2.port" ]; then
+  echo "FAIL: the shape-changed stub never started, so the last (j) cell cannot run"
+  echo "  stub stderr: $(head -5 "$TMP/stub2.err" 2>/dev/null)"
+  exit 1
+fi
+got=$(helptypes "http://127.0.0.1:$(cat "$TMP/stub2.port")")
 kill "$STUB2_PID" 2>/dev/null; wait "$STUB2_PID" 2>/dev/null
 check_has   "(j) 200 without a type list blames the CONTRACT" "shape changed"    "$got"
 check_lacks "(j) 200 without a type list is not 'unreachable'" "unreachable"     "$got"

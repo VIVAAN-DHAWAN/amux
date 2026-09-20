@@ -52,8 +52,9 @@
 //!   shutil.which quietly fails there.
 
 use super::fs::{
-    expanduser, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found, parse_body,
-    parse_qs, pystr, qs_get,
+    expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found,
+    parse_body, parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates,
+    resolve_rel_descend,
 };
 use super::AppState;
 use crate::db::WriteOutcome;
@@ -200,6 +201,44 @@ fn qpath(qs: &[(String, String)]) -> Result<PathBuf, Box<Response>> {
     }
 }
 
+/// A READ-ONLY fallback for `qpath`'s naive result, used by `view()` only.
+/// `qpath` itself stays exactly as it was: a PUT must land at the literal
+/// target the caller named, never a fuzzy-matched existing file elsewhere,
+/// so `put_file` (and every other write path) keeps calling bare `qpath`
+/// unchanged.
+///
+/// A worker's own terminal output often prints a WEB-ROOT-relative asset
+/// reference WITH a leading slash (Next.js and most static-site frameworks:
+/// `/templates/foo.png` in source means `public/templates/foo.png` on disk)
+/// or a bare relative path from a scaffold directory one level above where
+/// the worker actually works. `qpath` reads the former as a literal
+/// filesystem-absolute path (never exists anywhere) and the latter with no
+/// fallback at all if the single naive join misses. AMUX-4682, live: Ethan's
+/// screenshots showed exactly the first shape — mixpeek-homepage-claude
+/// printed `/templates/ux-session-analysis/session.webp`, the literal path
+/// never existed, and the real file sat under cwd's `public/` the whole
+/// time. Reuses the SAME ancestor-then-descend search `/api/fs/resolve`
+/// already does (AMUX-3511 / AMUX-4661 / AMUX-4682), so both surfaces agree
+/// on what "findable from cwd" means, and returns the ORIGINAL naive path
+/// unchanged when nothing is found — the "file not found" error the caller
+/// sees still names the path it actually asked for, not a phantom one.
+fn resolve_viewable_fallback(fpath: &str, cwd: &str, naive: &Path) -> PathBuf {
+    if naive.exists() || cwd.is_empty() {
+        return naive.to_path_buf();
+    }
+    let allowed_exists = |p: &Path| is_path_allowed(p) && p.exists();
+    let (resolved, found, _tried) = resolve_rel_candidates(cwd, fpath, &allowed_exists);
+    if found {
+        return PathBuf::from(resolved);
+    }
+    let root = PathBuf::from(cwd.trim_end_matches('/'));
+    let rel_clean = fpath.trim().trim_start_matches('/').trim_start_matches("./");
+    if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs) {
+        return found;
+    }
+    naive.to_path_buf()
+}
+
 /// `_IMG_INLINE_MAX` (py:20623): inline an image as base64 up to this size,
 /// stream anything larger via /api/file/raw. Config, not a constant — the
 /// hard 5MB refusal it replaced is the AMUX-2344 incident.
@@ -229,12 +268,27 @@ async fn view(req: Request) -> Response {
         Ok(p) => p,
         Err(r) => return *r,
     };
+    // AMUX-4682: this is the read-only fallback (see resolve_viewable_fallback's
+    // own doc) -- everything else in this handler is unchanged, so a path that
+    // already resolves correctly today behaves identically.
+    let p = resolve_viewable_fallback(qs_get(&qs, "path").unwrap_or(""), qs_get(&qs, "cwd").unwrap_or(""), &p);
     if !is_path_allowed(&p) {
         return j(403, json!({"error": "access denied"}));
     }
     let meta = match std::fs::metadata(&p) {
         Ok(m) if m.is_file() => m,
-        _ => return j(404, json!({"error": "file not found"})),
+        _ => {
+            // Git fallback: the file may have been committed and pushed but
+            // the local checkout is behind origin/main (graft-push workflow).
+            let cwd_qs = qs_get(&qs, "cwd").unwrap_or("");
+            let fpath_qs = qs_get(&qs, "path").unwrap_or("");
+            if !cwd_qs.is_empty() && !fpath_qs.is_empty() {
+                if let Some(resp) = view_from_git(cwd_qs, fpath_qs).await {
+                    return resp;
+                }
+            }
+            return j(404, json!({"error": "file not found"}));
+        }
     };
     let ext = py_suffix(&p);
 
@@ -376,6 +430,64 @@ async fn view(req: Request) -> Response {
             "is_markdown": is_md, "is_csv": is_csv, "is_html": is_html,
         }),
     )
+}
+
+/// Serve a file's content from `origin/main` when it does not exist on disk.
+/// Handles text and image types (the common cases for worker-committed files
+/// that the local checkout has not received yet).
+async fn view_from_git(cwd: &str, fpath: &str) -> Option<Response> {
+    let (abs_path, content) = git_show_file(cwd, fpath).await?;
+    let git_path = Path::new(&abs_path);
+    if !is_path_allowed(git_path) {
+        return None;
+    }
+    let ext = py_suffix(git_path);
+
+    if let Some(mime) = mime_of(IMAGE_MIMES, &ext) {
+        let data_url = format!("data:{mime};base64,{}", B64.encode(&content));
+        return Some(j(
+            200,
+            json!({
+                "path": abs_path, "is_image": true, "mime": mime,
+                "size": content.len(), "data_url": data_url,
+                "source": "git",
+            }),
+        ));
+    }
+
+    if content[..content.len().min(8192)].contains(&0) {
+        return Some(j(
+            200,
+            json!({
+                "path": abs_path, "is_binary": true,
+                "size": content.len(), "ext": ext,
+                "source": "git",
+            }),
+        ));
+    }
+
+    let mut text = String::from_utf8_lossy(&content).into_owned();
+    let is_md = matches!(ext.as_str(), ".md" | ".markdown" | ".mdx");
+    let is_csv = matches!(ext.as_str(), ".csv" | ".tsv");
+    let is_html = matches!(ext.as_str(), ".html" | ".htm");
+    let limit: usize = if is_csv { 5_000_000 } else { 200_000 };
+    if text.chars().count() > limit {
+        let cut = text.char_indices().nth(limit).map(|(i, _)| i).unwrap_or(text.len());
+        text.truncate(cut);
+        text.push_str(if is_csv {
+            "\n... (truncated at 5MB)"
+        } else {
+            "\n\n... (truncated at 200KB)"
+        });
+    }
+    Some(j(
+        200,
+        json!({
+            "path": abs_path, "content": text,
+            "is_markdown": is_md, "is_csv": is_csv, "is_html": is_html,
+            "source": "git",
+        }),
+    ))
 }
 
 /// Python's writable-extension allowlist for PUT /api/file (py:67909-67918).
@@ -562,7 +674,7 @@ fn raw_mime(ext: &str) -> &'static str {
 /// Stream `length` bytes of `path` from `start` in 1MB chunks. Player aborts
 /// (seeks, quality probes, teardown) just end the stream quietly — python's
 /// `_stream_file_body` contract.
-fn stream_file(path: PathBuf, start: u64, length: u64) -> Body {
+pub(crate) fn stream_file(path: PathBuf, start: u64, length: u64) -> Body {
     struct St {
         path: PathBuf,
         start: u64,
@@ -591,7 +703,9 @@ fn stream_file(path: PathBuf, start: u64, length: u64) -> Body {
             }
         }
     });
-    Body::from_stream(stream)
+    // Compression may poll again after EOF while flushing its encoder. Unfold
+    // panics on that second poll unless fused (aborted gzip upload downloads).
+    Body::from_stream(futures::StreamExt::fuse(stream))
 }
 
 async fn raw(req: Request) -> Response {
@@ -716,7 +830,7 @@ async fn raw(req: Request) -> Response {
 /// Absolute candidates FIRST — launchd has no shell PATH, so a bare `which`
 /// lookup reports ffmpeg missing on the machine it is installed on — then a
 /// $PATH scan for everything else.
-fn find_bin(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_bin(name: &str) -> Option<PathBuf> {
     for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin"] {
         let c = Path::new(d).join(name);
         if c.is_file() {
@@ -1738,6 +1852,19 @@ fn lib_facets(books: &[Value]) -> Value {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn file_stream_can_be_polled_after_eof_by_compression() {
+        use futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evidence.txt");
+        std::fs::write(&path, b"complete evidence").unwrap();
+        let mut body = super::stream_file(path, 0, 17).into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.next().await { bytes.extend_from_slice(&frame.unwrap()); }
+        assert_eq!(bytes, b"complete evidence");
+        assert!(body.next().await.is_none(), "compression must be able to poll after EOF");
+    }
+
     use super::*;
     use axum::http::Request as HttpRequest;
     use std::sync::Mutex;
@@ -2037,6 +2164,48 @@ pub(crate) mod tests {
 
         // Directory → 404 file not found (python p.is_file()).
         let (status, v) = get(&app, &format!("/api/file?path={}", enc(dir.path().to_str().unwrap()))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        assert_eq!(v["error"], "file not found");
+    }
+
+    /// AMUX-4682, reproducing Ethan's screenshots exactly: a worker's terminal
+    /// prints a WEB-ROOT-relative asset reference with a leading slash
+    /// (Next.js/most static-site frameworks: `/templates/foo.png` in source
+    /// means `public/templates/foo.png` on disk). The naive `path=/x&cwd=Y`
+    /// join reads the leading slash as filesystem-absolute and never finds
+    /// it; the fallback must.
+    #[tokio::test]
+    async fn a_web_root_relative_terminal_reference_is_found_under_cwds_public_dir() {
+        let app = app();
+        let cwd = tempfile::tempdir().unwrap();
+        let asset_dir = cwd.path().join("public/templates/ux-session-analysis");
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        std::fs::write(asset_dir.join("session.webp"), b"webp-bytes-here").unwrap();
+
+        let (status, v) = get(
+            &app,
+            &format!(
+                "/api/file?path={}&cwd={}",
+                enc("/templates/ux-session-analysis/session.webp"),
+                enc(cwd.path().to_str().unwrap())
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["path"], asset_dir.join("session.webp").to_str().unwrap());
+
+        // CONTROL: a leading-slash path that genuinely does not exist
+        // anywhere (not literally, not under cwd) must still 404 honestly —
+        // the fallback finds real files, it does not manufacture success.
+        let (status, v) = get(
+            &app,
+            &format!(
+                "/api/file?path={}&cwd={}",
+                enc("/templates/nothing-here/missing.webp"),
+                enc(cwd.path().to_str().unwrap())
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
         assert_eq!(v["error"], "file not found");
     }

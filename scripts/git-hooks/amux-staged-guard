@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# guard-features: AMUX-2946 AF-342 AF-414
+# guard-features: AMUX-2946 AF-342 AF-414 MOS-33
 # (Drift token for install-hooks.sh — see append-only-push-guard's header for
 #  the mechanism. A vendored copy lacking a canonical token reads STALE.)
 # ============================================================================
@@ -33,7 +33,7 @@
 # Blocking commits on a server hiccup would be worse, so fail-open stays; what
 # changes is that a failure now SAYS SO, loudly, with the reason. A guard that
 # cannot report its own absence is indistinguishable from a guard that passed.
-import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
+import json, os, shlex, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
@@ -50,7 +50,20 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # `^`-anchored, because an unanchored match now finds the comment line first
 # (checked: it returned empty, which would have made `grep -L` match nothing and
 # report a clean fleet).
-GUARD_VERSION = 13
+GUARD_VERSION = 18
+
+# AF-929: the AC-297 severity upgrade below is structurally blind to
+# `git commit <pathspec>` (confirmed empirically, scratch repo, 2026-09-18) --
+# that form stages the pathspec's own current working-tree bytes into git's
+# throwaway commit-time index before this hook ever runs, so `git diff`
+# (unstaged) for that exact path is empty by construction, every time, with
+# nothing left to detect. STAGED_LARGE_LINES is the fallback signal that IS
+# reachable in that shape: the staged numstat itself. 200 is p75 of this
+# repo's own last 500 commits' total changed-line count (216, measured
+# 2026-09-18 via `git log --numstat`, rounded down) -- a commit this size is
+# already atypically large for ONE file when the repo's own norm is a whole
+# commit at ~100 lines across every file it touches.
+STAGED_LARGE_LINES = 200
 
 
 def amux_base_url():
@@ -291,6 +304,21 @@ DIVERGENCE_LOG = os.path.join(
     os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),
     "staged-guard-divergence.jsonl")
 
+# AMUX-3954: a mirror-notice names a session as a co-editor of a path, and
+# until this ledger existed nothing recorded that a claim was MADE, so nobody
+# could measure how often it was wrong — only individual recipients who
+# happened to check remembered (amux-frustrations' own 2-of-3 sample, logged
+# by hand). This is the cheap half named on that card: log the claim itself,
+# including the corroboration signals (`_never_wrote`, `_nothing_in_dispute`)
+# this file already computes before deciding to print or downgrade it. It does
+# NOT add a content hash and does NOT change any verdict — a notice fires or
+# downgrades exactly as it did before this ledger existed. The harder half
+# (comparing a claim against a content hash of the version actually staged, and
+# a way for the recipient to record what they found) is still open.
+MIRROR_NOTICE_LOG = os.path.join(
+    os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),
+    "staged-guard-mirror-notices.jsonl")
+
 
 def _git_lines(args):
     r = subprocess.run(["git"] + args, capture_output=True, text=True, timeout=10)
@@ -376,6 +404,37 @@ def _record_divergence(sess, paths, resolution):
         pass
 
 
+def _record_mirror_notice(sess, path, owner, mins, disposition, reason=None,
+                          co_signal=None, mine_provenance=None, their_provenance=None):
+    """One row per co-edit claim this guard EVALUATED, fired or not.
+
+    `disposition` is "fired" (the claim was printed and named `owner`) or
+    "downgraded" (AF-391 or MC-1561 found nothing to corroborate it, so it
+    printed as an uncorroborated NOTE instead). Both are worth keeping: a
+    downgrade is itself evidence the guard's own signals disagreed, which is
+    exactly the population needed to answer "how often is a fired claim
+    right" without waiting for a recipient to volunteer a correction.
+
+    `notice_id` exists so a future recipient-side verdict (still open, see
+    AMUX-3954) has something to attach to without a schema change here.
+    """
+    try:
+        import uuid
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        with open(MIRROR_NOTICE_LOG, "a") as fh:
+            fh.write(json.dumps({
+                "notice_id": uuid.uuid4().hex[:12],
+                "ts": time.time(), "session": sess, "path": path, "owner": owner,
+                "age_mins": mins, "disposition": disposition, "reason": reason,
+                "co_signal": co_signal, "mine_provenance": mine_provenance,
+                "their_provenance": their_provenance, "head_before": head,
+                "guard_version": GUARD_VERSION,
+            }) + "\n")
+    except Exception:
+        pass
+
+
 def _derive_session_from_tmux():
     """Fallback identity for MR-43: $AMUX_SESSION can be empty inside a lane
     that IS running in its amux-launched tmux pane (the var got lost somewhere
@@ -386,13 +445,35 @@ def _derive_session_from_tmux():
     prefix, or no tmux at all) still resolves to "" and takes the existing
     no-op path below — this only recovers a lane that lost its own identity,
     it never invents one for a human.
+
+    AND THE PREFIX IS NOT ENOUGH (AMUX-4602). `amux-` is a naming convention;
+    the env file under ~/.amux/sessions is what makes a lane. A server test that
+    reached start_session created a live `amux-client-left-fixture` on the
+    machine's real tmux server, the fleet adopted it, and this function named it
+    as the committer of a peer's work: ba203699 permanently carries
+    `Amux-Committer: client-left-fixture`, and the owner got a "Session
+    client-left-fixture is committing" notice for a session that was never a lane.
+
+    Measured 2026-09-16: 0 of 29 live amux- tmux sessions lack an env file, so
+    requiring one costs nothing today and refuses the next leaked fixture by
+    construction rather than by anyone remembering.
     """
     try:
         name = subprocess.run(["tmux", "display-message", "-p", "#S"],
                               capture_output=True, text=True, timeout=3).stdout.strip()
     except Exception:
         return ""
-    return name[len("amux-"):] if name.startswith("amux-") else ""
+    if not name.startswith("amux-"):
+        return ""
+    lane = name[len("amux-"):]
+    home = os.environ.get("AMUX_HOME") or os.path.join(os.path.expanduser("~"), ".amux")
+    if not os.path.isfile(os.path.join(home, "sessions", "%s.env" % lane)):
+        sys.stderr.write(
+            "amux staged-guard: tmux session %r has no env file under %s/sessions, "
+            "so it is NOT a lane and will not be named as a committer (AMUX-4602).\n"
+            % (name, home))
+        return ""
+    return lane
 
 
 def _orphan_deletions(staged):
@@ -794,6 +875,18 @@ def main():
         w("amux staged-guard: DISABLED on the server (AMUX_STAGED_GUARD=0) — "
           "cross-session sweep protection is OFF.\n")
 
+    # MOS-33: a changing mtime identifies activity during a command window,
+    # not the writer. Keep the uncertainty visible without assigning the
+    # observing session ownership or sending the committer to it for consent.
+    # Older servers omit this additive field and retain their normal output.
+    _observations = d.get("observations") or []
+    if _observations:
+        w("amux staged-guard: MTIME OBSERVATIONS — ownership unverified for %d "
+          "staged path(s); a moving mtime does not identify the writer:\n"
+          % len(_observations))
+        for _observation in _observations:
+            w("  %s\n" % _observation.get("path", "?"))
+
     # SHARED paths are not blocked — both sessions edited them, so the committer
     # has a legitimate claim and blocking would deadlock the file. But say it out
     # loud (AMUX-2332): in a single-file project this is the NORMAL case on the
@@ -803,11 +896,13 @@ def main():
     for f in (d.get("shared") or []):
         mins = int((f.get("age_secs") or 0) / 60)
         _n = ""
+        _staged_total = 0
         try:
             _ns = subprocess.run(
                 ["git", "diff", "--cached", "--numstat", "--", f.get("path") or ""],
                 capture_output=True, text=True, timeout=5).stdout.split()
             if len(_ns) >= 2 and _ns[0].isdigit():
+                _staged_total = int(_ns[0]) + (int(_ns[1]) if _ns[1].isdigit() else 0)
                 _n = " This commit stages %s insertions / %s deletions there — if that is " \
                      "MORE than you wrote, their work is in it." % (_ns[0], _ns[1])
         except Exception:
@@ -815,7 +910,21 @@ def main():
         # AC-297: upgrade from NOTE to WARNING when the file has unstaged changes
         # right now. That is the FACT — someone has uncommitted work in a file
         # you are about to commit whole.
-        _level = "WARNING" if f.get("has_unstaged_changes") else "NOTE"
+        # AF-929: OR when the staged diff itself is already large. A pathspec
+        # commit (`git commit <path>`) never has unstaged changes to find for
+        # that exact path by the time this hook runs, so `has_unstaged_changes`
+        # alone silently downgrades exactly the sweep this NOTE/WARNING split
+        # exists to catch. The staged size is reachable in both commit shapes,
+        # so it never goes blind the way the first check does.
+        _level = "WARNING" if (f.get("has_unstaged_changes")
+                                or _staged_total >= STAGED_LARGE_LINES) else "NOTE"
+        # An own-shell fallback permits the workflow without identifying its
+        # writer. A dirty file adds no authorship evidence, and there is no
+        # peer whose recorded write the legacy provenance prose can describe.
+        if not f.get("peer") and f.get("mine_provenance") == "observed":
+            w("amux staged-guard: %s — %s has uncommitted changes; ownership is "
+              "unverified (mtime observation only).\n" % (_level, f.get("path")))
+            continue
         # AF-391: DOWNGRADE, never suppress, when the attribution is mtime-derived
         # AND nothing is in dispute. Two conditions, both required.
         #
@@ -858,6 +967,12 @@ def main():
                          "trailer, so the record is activity in a shared cwd rather " \
                          "than authorship (MC-1561)" % (f.get("owner") or "that session")
         if _quiet:
+            if f.get("peer"):
+                _record_mirror_notice(sess, f.get("path"), f.get("owner"), mins,
+                                      "downgraded", reason=_quiet,
+                                      co_signal=f.get("co_signal"),
+                                      mine_provenance=f.get("mine_provenance"),
+                                      their_provenance=f.get("their_provenance"))
             w("amux staged-guard: NOTE — %s carries an UNCORROBORATED co-edit claim: %s. "
               "Not asking you to check anything.\n" % (f.get("path"), _quiet))
             continue
@@ -909,16 +1024,21 @@ def main():
         # line on every row is a line nobody reads. Absent on old servers, which
         # is why it is a .get with a default rather than an index.
         _mp, _tp = f.get("mine_provenance"), f.get("their_provenance")
-        if _mp and _tp and _mp != _tp:
-            if _mp == "observed":
+        if f.get("peer") and _mp and _tp and _mp != _tp:
+            if _mp == "observed" and _tp in ("transcript", "firsthand"):
                 w("  Provenance: THEIR claim is a recorded write; YOURS is an mtime your "
                   "own Bash command saw move, which on a shared checkout includes writes "
                   "you did not make. Before concluding they are a phantom co-editor, check "
                   "whether the phantom is yours (AMUX-3662).\n")
-            else:
+            elif _tp == "observed" and _mp in ("transcript", "firsthand"):
                 w("  Provenance: YOUR claim is a recorded write; THEIRS is an mtime their "
                   "Bash command saw move — possibly your own write, seen from their "
                   "window (AMUX-3662).\n")
+        if f.get("peer"):
+            _record_mirror_notice(sess, f.get("path"), f.get("owner"), mins, "fired",
+                                  co_signal=f.get("co_signal"),
+                                  mine_provenance=f.get("mine_provenance"),
+                                  their_provenance=f.get("their_provenance"))
     # PRE-COMMIT MISATTRIBUTES A PEER'S WRITE TO AN INNOCENT HOOK (AF-327).
     #
     # `pre_commit/commands/run.py` decides a hook changed something with
@@ -1090,13 +1210,15 @@ def main():
                           verdict_id=_m.get("verdict_id"), elapsed=_el)
             _clear_marker(sess, top)
         return 0
-    w("\namux staged-guard: COMMIT BLOCKED — staged files were edited by "
-      "OTHER amux sessions sharing this checkout:\n\n")
+    w("\namux staged-guard: COMMIT BLOCKED — staged paths need ownership review:\n\n")
     for f in foreign:
         mins = int((f.get("age_secs") or 0) / 60)
         _w = f.get("why")
-        w("  %s   (edited by session '%s' %dm ago)%s\n"
-          % (f.get("path"), f.get("owner"), mins,
+        _owner = (f.get("owner") or "").strip()
+        _claim = ("edited by session '%s' %dm ago" % (_owner, mins)
+                  if _owner else "ownership is unverified; no recorded writer identified")
+        w("  %s   (%s)%s\n"
+          % (f.get("path"), _claim,
              ("\n      %s" % _w) if _w else ""))
     # AF-365, technique found by `amux` on 2026-08-31 and it belongs FIRST because
     # it is the only remedy here that touches nothing the peer owns.
@@ -1116,11 +1238,11 @@ def main():
     # wired nothing. `git add -p`, which this hook recommends two screens down for
     # the partial-stage case, is the wrong tool for it: the problem is not which of
     # YOUR hunks to take, it is that THEIRS are already staged.
-    w("\nCOMMIT ONLY YOUR OWN PATHS — leaves their staged entries untouched:\n"
+    w("\nCOMMIT ONLY YOUR OWN PATHS — leaves other staged entries untouched:\n"
       "  git commit <your paths> -m ...   # a pathspec commit ignores the index for\n"
       "                                   # everything it does not name\n")
-    w("\nOr unstage theirs — but note this EDITS THE SHARED INDEX, which is their\n"
-      "state, not yours:   git restore --staged "
+    w("\nOr unstage theirs, if any — but this EDITS THE SHARED INDEX and may\n"
+      "change a peer's staged state:   git restore --staged "
       + " ".join(f.get("path", "") for f in foreign) + "\n")
     # AF-26. Two separate defects, both about an honest exit.
     #
@@ -1133,13 +1255,21 @@ def main():
     #    cross-session commit is intentional". Clearing a FALSE positive therefore
     #    required asserting the commit was cross-session when it was not — ethos
     #    rule 3. The honest case now has an honest name.
-    w("\nVERIFY BEFORE OVERRIDING — this verdict comes from edit records in a time\n"
-      "window, NOT from the staged diff, so check whether their work is actually in it:\n")
+    w("\nVERIFY BEFORE OVERRIDING — this verdict uses edit records and cotenant\n"
+      "visibility, not the candidate diff. A refused pathspec commit discards its\n"
+      "temporary index; your normal index can still be empty. For a pathspec retry,\n"
+      "review the working-tree changes that git commit <path> will stage:\n")
     for f in foreign:
-        w("  git diff --cached -- %s        # is any of this theirs?\n" % f.get("path", ""))
+        w("  git diff HEAD -- %s\n" % shlex.quote(f.get("path", "")))
+    w("For an ordinary staged commit, stage only your intended changes first, then review:\n")
+    for f in foreign:
+        w("  git diff --cached -- %s\n" % shlex.quote(f.get("path", "")))
+    w("Confirm the expected path and hunks are present and the comparison succeeded.\n"
+      "An empty diff is not ownership verification; a missing HEAD or command error\n"
+      "does not verify anything either. New files need staging before a cached diff.\n")
     w("\nThen take the exit that is TRUE:\n"
       "  AMUX_ALLOW_FOREIGN=1 git commit ...   # yes, their work is in it, and I mean to ship it\n"
-      "  AMUX_VERIFIED_SOLO=1 git commit ...   # I checked the staged diff: none of it is theirs\n\n")
+      "  AMUX_VERIFIED_SOLO=1 git commit ...   # I reviewed the actual candidate: none of it is theirs\n\n")
     # AF-127: anchor the episode. The marker carries THIS verdict's row id so
     # the eventual outcome attaches by id; on a retry-block the marker moves to
     # the newest verdict and the server closes the older row as superseded.

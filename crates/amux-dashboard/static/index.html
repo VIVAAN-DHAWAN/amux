@@ -106,8 +106,9 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <link id="hljs-theme" rel="stylesheet" crossorigin="anonymous" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/state/feedback.css">
 <!-- AMUX-BOOTSTRAP-BEGIN (see extraction note at top of file) -->
-<script>window._AMUX_S3_ICAL_URL="";window._AMUX_AUTH_TOKEN="";window._AMUX_HOME="";window._AMUX_POSTHOG_KEY="";window._AMUX_POSTHOG_HOST="https://us.i.posthog.com";window._AMUX_USER_EMAIL="";window._AMUX_USER_ID="";window._AMUX_UI_TOKEN="";window._AMUX_DEFAULT_MODEL="sonnet";</script>
+<script>window._AMUX_S3_ICAL_URL="";window._AMUX_AUTH_TOKEN="";window._AMUX_HOME="";window._AMUX_POSTHOG_KEY="";window._AMUX_POSTHOG_HOST="https://us.i.posthog.com";window._AMUX_USER_EMAIL="";window._AMUX_USER_ID="";window._AMUX_UI_TOKEN="";window._AMUX_DEFAULT_MODEL="sonnet";window._AMUX_AUTH_WITHHELD=false;</script>
 <!-- AMUX-BOOTSTRAP-END -->
 </head>
 <body>
@@ -121,7 +122,7 @@
 <script>
 setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style.display!=='none'){document.getElementById('js-fallback-retry').style.display='';}},8000);
 </script>
-<div id="no-apikey-banner" style="display:none;background:#7c2d12;color:#fed7aa;padding:8px 16px;text-align:center;font-size:0.82rem;z-index:200;position:relative;">
+<div id="no-apikey-banner" style="display:none;background:#7c2d12;color:#fed7aa;padding:8px 16px;text-align:center;font-size:0.82rem;z-index:90;position:relative;">
   No Anthropic API key set — Claude workers won't work. <a href="#" onclick="event.preventDefault();document.getElementById('no-apikey-banner').style.display='none';toggleSettings()" style="color:#fde68a;font-weight:600;text-decoration:underline;">Add key in Settings</a>
 </div>
 <!-- API key setup modal — shown on cloud when no user key is configured (dismissible) -->
@@ -157,11 +158,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div style="text-align:center;margin-top:8px;font-size:0.78rem;color:#b0b0b0;">You can change this later in Settings</div>
   </div>
 </div>
-<div id="org-banner" style="display:none;background:#312e81;border-bottom:1px solid #6366f1;color:#e0e7ff;padding:7px 16px;text-align:center;font-size:0.82rem;z-index:200;position:relative;display:none;">
+<div id="org-banner" style="display:none;background:#312e81;border-bottom:1px solid #6366f1;color:#e0e7ff;padding:7px 16px;text-align:center;font-size:0.82rem;z-index:90;position:relative;display:none;">
   <span id="org-banner-text"></span>
   <button onclick="_switchOrg('')" style="margin-left:12px;background:#4338ca;color:#e0e7ff;border:none;border-radius:4px;padding:2px 10px;font-size:0.78rem;cursor:pointer;">← My workspace</button>
 </div>
-<div id="org-invite-banner" style="display:none;background:#166534;border-bottom:1px solid #22c55e;color:#dcfce7;padding:7px 16px;font-size:0.82rem;z-index:200;position:relative;display:none;align-items:center;justify-content:center;gap:10px;">
+<div id="org-invite-banner" style="display:none;background:#166534;border-bottom:1px solid #22c55e;color:#dcfce7;padding:7px 16px;font-size:0.82rem;z-index:90;position:relative;display:none;align-items:center;justify-content:center;gap:10px;">
   <span id="org-invite-banner-text"></span>
   <button onclick="_dismissOrgBanner()" style="background:none;border:none;color:#bbf7d0;cursor:pointer;font-size:1rem;line-height:1;opacity:0.7;padding:0 2px;" title="Dismiss">&#x2715;</button>
 </div>
@@ -186,11 +187,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="chrome-tabs-bar" class="chrome-tabs-bar"></div>
 <div id="chrome-tab-frames" class="chrome-tab-frames"></div>
 <div class="header-row">
-  <div style="display:flex;gap:8px;align-items:center;">
-    <h1 id="brand-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;" onclick="openAbout()"><span id="brand-icon-header"></span><span id="brand-name-header">amux</span></h1>
-    <span id="conn-status" class="conn-status online" title="Connection status — click for disconnection history" onclick="showConnHistory()"></span>
+  <div class="header-brand" style="display:flex;gap:8px;align-items:center;">
+    <h1 role="button" tabindex="0" aria-label="About amux" title="About amux" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAbout()}" id="brand-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;" onclick="openAbout()"><span id="brand-icon-header"></span><span id="brand-name-header">amux</span></h1>
+    <span role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showConnHistory()}" id="conn-status" class="conn-status online" title="Connection status — click for disconnection history" onclick="showConnHistory()"></span>
     <div style="position:relative;">
-      <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="background:none;border:none;cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
+      <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications" aria-controls="notif-panel" aria-expanded="false">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
       <div id="notif-panel" class="notif-panel">
         <div class="notif-panel-header">
           <span>Notifications</span>
@@ -204,13 +205,26 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div id="notif-panel-list"></div>
       </div>
     </div>
+    <div style="position:relative;">
+      <button id="needsyou-btn" onclick="toggleNeedsYouPanel()" title="Needs You" style="cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Needs You" aria-controls="needsyou-panel" aria-expanded="false">&#x1F64B;<span id="needsyou-badge" class="notif-badge" style="display:none;">0</span></button>
+      <div id="needsyou-panel" class="notif-panel">
+        <div class="notif-panel-header">
+          <span>Needs You</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button onclick="_needsYouFetch(true)" style="background:none;border:1px solid var(--border);color:var(--accent);cursor:pointer;font-size:0.68rem;border-radius:5px;padding:3px 9px;" title="Refresh">Refresh</button>
+          </div>
+        </div>
+        <div id="needsyou-panel-list"></div>
+      </div>
+    </div>
   </div>
-  <div style="display:flex;gap:8px;align-items:center;">
+  <div class="header-actions" style="display:flex;gap:8px;align-items:center;">
     <div id="org-switcher-wrap" style="display:none;"></div>
     <button class="btn-rate-limit" id="rate-limit-pill" title="Continue all limited workers" onclick="event.stopPropagation();openBulkActions()">
       <span id="rate-limit-pill-text">0 limited</span>
+      <span id="rate-limit-pill-count" aria-hidden="true">0</span>
     </button>
-    <div class="active-wrap">
+    <div class="active-wrap" style="display:none;">
       <button class="btn-active" id="active-btn" onclick="event.stopPropagation();toggleActiveDropdown()">
         <span class="active-dot"></span>
         <span class="active-count" id="active-count">0</span>
@@ -218,7 +232,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="active-dropdown" id="active-dropdown"></div>
     </div>
     <div class="header-add-wrap">
-      <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()">+</button>
+      <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()" aria-label="Create or connect" title="Create or connect">+</button>
       <div class="header-add-menu" id="add-menu">
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openCreate()"><span class="mi">&#x2795;</span> New worker</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnect()"><span class="mi">&#x1F517;</span> Connect tmux</div>
@@ -229,7 +243,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <div class="settings-wrap">
-      <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()">&#x2699;</button>
+      <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()" aria-label="Settings" title="Settings">&#x2699;&#xFE0F;</button>
       <div class="settings-menu" id="settings-menu">
         <div class="settings-tabs" id="settings-tabs">
           <button class="settings-tab-btn active" data-stab="account" onclick="event.stopPropagation();_settingsTab('account')">Account</button>
@@ -240,20 +254,36 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div class="settings-tab-panel active" id="stab-account" data-stab="account">
         <div class="settings-section" id="settings-usage-section">
-          <div class="settings-section-label">Subscription usage</div>
+          <div class="settings-section-label">Subscription &amp; provider usage</div>
           <div id="settings-usage-body" style="font-size:0.82rem;color:var(--dim);">Loading…</div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" id="settings-team-section">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-            <div class="settings-section-label" style="margin:0;">Team</div>
-            <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamInvite()">+ Invite</button>
+            <div class="settings-section-label" style="margin:0;">Workspace access</div>
+            <div style="display:flex;gap:5px;">
+              <button class="btn" id="settings-team-create" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamEditor()">+ Team</button>
+              <button class="btn" id="settings-team-invite" style="font-size:0.7rem;padding:2px 8px;" onclick="openTeamInvite()">+ Invite</button>
+            </div>
           </div>
           <div id="settings-org-name-wrap" style="margin-bottom:6px;">
             <input id="settings-org-name" class="search-input" type="text" placeholder="Workspace name"
               style="width:100%;box-sizing:border-box;font-size:0.8rem;"
               onblur="saveOrgName(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
           </div>
+          <div id="settings-owner-link" style="display:none;margin-bottom:8px;">
+            <div style="font-size:0.68rem;color:var(--dim);margin-bottom:4px;">Owner access link</div>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <input id="settings-owner-link-url" type="text" readonly
+                style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.72rem;font-family:monospace;min-width:0;"
+                onclick="this.select()">
+              <button class="btn" style="font-size:0.7rem;padding:4px 10px;white-space:nowrap;" onclick="_copyOwnerLink()">Copy</button>
+            </div>
+            <div style="font-size:0.62rem;color:var(--dim);margin-top:3px;">Opens the dashboard with full access from any device on your network</div>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin:7px 0 3px;">Teams and access scopes</div>
+          <div id="settings-teams-list" style="font-size:0.78rem;color:var(--dim);display:flex;flex-direction:column;gap:4px;"></div>
+          <div style="font-size:0.68rem;color:var(--dim);margin:9px 0 3px;">People</div>
           <div id="settings-members-list" style="font-size:0.78rem;color:var(--dim);"></div>
         </div>
         <!-- Cloud trial/billing card — populated only when the gateway answers
@@ -287,14 +317,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-tab-panel" id="stab-workers" data-stab="workers">
         <div class="settings-section">
           <div class="settings-section-label">Automation</div>
-          <div class="settings-row" style="justify-content:space-between;align-items:center;">
-            <span style="font-size:0.85rem;">Auto-compact</span>
-            <label class="theme-toggle">
-              <input type="checkbox" id="auto-compact-checkbox" onchange="toggleAutoCompact(this.checked)" checked>
-              <span class="theme-track"><span class="theme-thumb"></span></span>
-            </label>
-          </div>
-          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Send /compact when context &lt; 15% remaining</div>
+          <div id="native-compaction-info" style="font-size:0.85rem;">Automatic context management</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Claude Code compacts context and continues the task automatically. Its auto-compact setting is managed in the worker’s /config menu.</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">YOLO by default for new workers</span>
             <label class="theme-toggle">
@@ -348,37 +372,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
-          <div class="settings-section-label">Default Model</div>
-          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Applied to new workers without an explicit model</div>
-          <select id="settings-default-model" onchange="saveDefaultModel(this.value)"
+          <div class="settings-section-label">Default Claude model</div>
+          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Applied to new Claude workers without an explicit model. Choose a known model or type a newer exact ID.</div>
+          <input id="settings-default-model" list="settings-default-model-options" onchange="saveDefaultModel(this.value)" autocomplete="off" autocorrect="off"
             style="width:100%;font-size:0.85rem;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--fg);">
-            <optgroup label="Claude">
-            <option value="sonnet">sonnet</option>
-            <option value="opus">opus</option>
-            <option value="haiku">haiku</option>
-            <option value="claude-opus-5">claude-opus-5</option>
-            <option value="claude-opus-5[1m]">claude-opus-5 [1M]</option>
-            <option value="claude-fable-5-1">claude-fable-5-1</option>
-            <option value="claude-fable-5">claude-fable-5</option>
-            <option value="claude-opus-4-8">claude-opus-4-8</option>
-            <option value="claude-opus-4-8[1m]">claude-opus-4-8 [1M]</option>
-            <option value="claude-opus-4-7">claude-opus-4-7</option>
-            <option value="claude-opus-4-7[1m]">claude-opus-4-7 [1M]</option>
-            <option value="claude-opus-4-6">claude-opus-4-6</option>
-            <option value="claude-opus-4-6[1m]">claude-opus-4-6 [1M]</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-sonnet-4-6[1m]">claude-sonnet-4-6 [1M]</option>
-            <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
-            </optgroup>
-            <optgroup label="Codex (OpenAI)">
-            <option value="gpt-5.5">gpt-5.5</option>
-            <option value="o3">o3</option>
-            <option value="o4-mini">o4-mini</option>
-            <option value="gpt-4o">gpt-4o</option>
-            <option value="gpt-4.1">gpt-4.1</option>
-            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
-            </optgroup>
-          </select>
+          <datalist id="settings-default-model-options"></datalist>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
@@ -387,14 +385,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <select id="settings-helper-model" onchange="saveHelperModel(this.value)"
             style="width:100%;font-size:0.85rem;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--fg);">
             <option value="">Default (cheapest Claude, haiku)</option>
-            <optgroup label="Claude">
-            <option value="haiku">haiku</option>
-            <option value="sonnet">sonnet</option>
-            <option value="opus">opus</option>
-            <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-            <option value="claude-opus-4-8">claude-opus-4-8</option>
-            </optgroup>
+            <optgroup id="settings-helper-model-claude" label="Claude"></optgroup>
             <optgroup id="settings-helper-model-ollama" label="Local (ollama)"></optgroup>
           </select>
         </div>
@@ -448,14 +439,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
               onclick="saveApiKey()">Save</button>
           </div>
           <div id="settings-apikey-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;"></div>
-        </div>
-        <div class="settings-sep"></div>
-        <div class="settings-section" id="settings-notes-section">
-          <div class="settings-section-label">Notes folder</div>
-          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Notes sync (read + write) with this folder — e.g. your Obsidian vault</div>
-          <div id="settings-notes-dir" style="font-family:monospace;font-size:0.74rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px;word-break:break-all;color:var(--text);">…</div>
-          <div id="settings-notes-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;"></div>
-
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" id="settings-connections-section">
@@ -536,10 +519,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="settings-device-name" type="text" autocomplete="off"
               onchange="saveDeviceName(this.value)">
           </div>
+          <div class="settings-row" id="settings-geo-row" style="margin-top:8px;">
+            <button class="btn" id="settings-geo-btn" onclick="_settingsToggleGeo()"
+              title="Attach this device's location to messages you send from it"></button>
+          </div>
+          <div id="settings-geo-status" style="font-size:0.72rem;color:var(--dim);margin-top:5px;"></div>
         </div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" style="text-align:center;display:flex;flex-direction:column;gap:8px;">
+          <button class="btn" id="style-guide-btn" onclick="openStyleGuide()">Style guide</button>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openAbout();closeSettings()">About amux &amp; token stats</span>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openDevtools();closeSettings()">&#x1F6E0; Developer tools</span>
           <span id="logout-btn" style="font-size:0.7rem;color:var(--dim);cursor:pointer;display:none;" onclick="window.location='/api/cloud-logout'">&#x2192; Sign out</span>
@@ -556,6 +545,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-calendar" onclick="switchView('calendar')"><span class="tab-ico">🗓</span><span class="tab-lbl">Calendar</span></button>
   <button id="tab-scheduler" onclick="switchView('scheduler')"><span class="tab-ico">⏱</span><span class="tab-lbl">Scheduler</span></button>
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
+  <button id="tab-record" onclick="switchView('record')"><span class="tab-ico">🎙</span><span class="tab-lbl">Record</span></button>
   <button id="tab-mdai" onclick="switchView('mdai')"><span class="tab-ico">&#x2726;</span><span class="tab-lbl">MDAI</span></button>
   <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
   <button id="tab-email" onclick="switchView('email')"><span class="tab-ico">📥</span><span class="tab-lbl">Email</span></button>
@@ -567,10 +557,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-sql" onclick="switchView('sql')"><span class="tab-ico">⛁</span><span class="tab-lbl">Database</span></button>
   <button id="tab-map" onclick="switchView('map')"><span class="tab-ico">◈</span><span class="tab-lbl">Map</span></button>
   <button id="tab-metrics" onclick="switchView('metrics')"><span class="tab-ico">↗</span><span class="tab-lbl">Metrics</span></button>
+  <button id="tab-disk" onclick="switchView('disk')"><span class="tab-ico">🖴</span><span class="tab-lbl">Disk</span></button>
   <button id="tab-cost" onclick="switchView('cost')"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
+  <button id="tab-orchestrations" onclick="switchView('orchestrations')"><span class="tab-ico">&#x2B53;</span><span class="tab-lbl">Orchestrations</span></button>
 </div>
 <div class="tab-customize-wrap">
   <button class="tab-customize-btn" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show/hide tabs">&#x229E;</button>
@@ -600,6 +592,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="active-filters" class="active-filters"></div>
 <div id="tag-filters" class="tag-filters"></div>
 <div id="grp-scope-strip"></div>
+<div id="session-read-notice"></div>
 <div id="offline-banner" class="offline-banner">
   <div class="offline-banner-header">
     <span id="offline-banner-title">&#x26A0; Offline</span>
@@ -609,12 +602,48 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="pinned-notes-home" class="pinned-notes-home"></div>
 <div id="cards" class="cards"></div>
+<div id="paused-section"></div>
+<div id="expired-section"></div>
 <div id="archived-section"></div>
 </div>
 <div id="groups-view" style="display:none;">
   <div id="groups-container"></div>
 </div>
 <div id="board-view" style="display:none;">
+  <div class="board-page-heading"><div><h1>Board</h1><p>Turn work into outcomes</p></div><button class="btn primary" onclick="openBoardAdd('todo')" aria-label="Create board task">+</button></div>
+  <div class="board-quick-filters" aria-label="Quick board filters"><button onclick="_boardQuick('')">All</button><button onclick="_boardQuick('owner:human is:open')">My tasks</button><button onclick="_boardQuick('status:doing')">In progress</button><button onclick="_boardQuick('is:needsyou')">Needs you</button><button onclick="_boardQuick('status:review')">Review</button></div>
+  <!-- Launch bar: type priorities, auto-fan-out to ephemeral workers -->
+  <div class="board-launch-bar" id="board-launch-bar">
+    <div class="launch-header" onclick="_toggleLaunchBar()">
+      <span class="launch-ico">&#x1F680;</span>
+      <span class="launch-title">Launch priorities</span>
+      <span class="launch-caret" id="launch-caret">&#x25B6;</span>
+    </div>
+    <div class="launch-body" id="launch-body" style="display:none;">
+      <textarea id="launch-input" class="input launch-textarea" oninput="_launchInputChanged()" placeholder="Type priorities, one per line:&#10;1. Consolidate GKE clusters to zero budget&#10;2. Search parity with browser validation&#10;3. Single Docker image of full platform" rows="4" spellcheck="false"></textarea>
+      <label class="launch-workspace">Workspace from<select id="launch-session" class="input" onchange="_saveLaunchDraft()"><option value="">Choose a worker workspace…</option></select></label>
+      <div class="launch-roles">
+        <fieldset class="launch-role"><legend>Orchestrator</legend><p>One coordinating worker owns the epic, answers questions, and checks the combined outcome.</p>
+          <div class="launch-profile-fields">
+            <label>Provider<select id="launch-orchestrator-provider" class="input" onchange="_launchProviderChanged('orchestrator')"><option value="claude">Claude</option><option value="codex">Codex</option><option value="gemini">Gemini</option><option value="ollama">Ollama</option><option value="muse">Muse</option></select></label>
+            <label>Model<input id="launch-orchestrator-model" class="input" value="opus" list="launch-orchestrator-models" placeholder="Provider default" oninput="_saveLaunchDraft()" autocomplete="off" spellcheck="false"><datalist id="launch-orchestrator-models"></datalist></label>
+          </div>
+        </fieldset>
+        <fieldset class="launch-role"><legend>Fan-out workers</legend><p>Each worker owns its board and worktree, and reports to the orchestrator.</p>
+          <div class="launch-profile-fields">
+            <label>Provider<select id="launch-worker-provider" class="input" onchange="_launchProviderChanged('worker')"><option value="claude">Claude</option><option value="codex">Codex</option><option value="gemini">Gemini</option><option value="ollama">Ollama</option><option value="muse">Muse</option></select></label>
+            <label>Model<input id="launch-worker-model" class="input" value="haiku" list="launch-worker-models" placeholder="Provider default" oninput="_saveLaunchDraft()" autocomplete="off" spellcheck="false"><datalist id="launch-worker-models"></datalist></label>
+          </div>
+        </fieldset>
+      </div>
+      <details id="launch-overrides"><summary>Customize individual workers</summary><div id="launch-worker-profiles"></div></details>
+      <div class="launch-controls">
+        <button class="btn primary" id="launch-btn" onclick="_launchFanOut()">Launch orchestration</button>
+        <button class="btn" id="launch-new" onclick="_resetLaunchRequest()" hidden>New priorities</button>
+      </div>
+      <div class="launch-status" id="launch-status" style="display:none;"></div>
+    </div>
+  </div>
   <div class="board-toolbar">
     <div id="bf-chips" style="display:none;flex-basis:100%;order:3;flex-wrap:wrap;gap:6px;padding-top:6px;"></div>
     <!-- #bf-add is the FIRST flex child of the wrap (AMUX-2569): as a later
@@ -636,6 +665,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button id="bv-list" class="bv-btn" onclick="setBoardView('list')" title="Dense list grouped by status">&#x2630;</button>
         <button id="bv-session" class="bv-btn" onclick="setBoardView('worker')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
+      <button id="bv-smart" class="bv-btn" onclick="setBoardView('smart')" title="Smart board: derived status from durable facts">&#x2728;</button>
     </div>
     <!-- Export the CURRENT view. Reuses .board-view-toggle so it inherits the
          group styling and the 44px mobile touch targets already tuned for it,
@@ -703,6 +733,42 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </summary>
     <div id="scheduler-audit"></div>
   </details>
+</div>
+
+<!-- Record view (AMUX-4625): tap to record on this device; each second is
+     saved locally as it arrives and the recording syncs to the configured
+     folder when amux is reachable. -->
+<div id="record-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
+  <div class="recorder-wrap">
+    <div class="recorder-hero">
+      <button id="recorder-btn" class="recorder-btn" type="button" onclick="_recorderToggle()" aria-pressed="false" aria-label="Start recording">
+        <span class="recorder-btn-dot" aria-hidden="true"></span>
+      </button>
+      <div class="recorder-readout">
+        <div id="recorder-elapsed" class="recorder-elapsed">0:00</div>
+        <div class="recorder-level" aria-hidden="true"><div id="recorder-level-fill" class="recorder-level-fill"></div></div>
+        <div id="recorder-status" class="recorder-status" role="status" aria-live="polite">Tap to record. Each second is saved on this device as it records.</div>
+      </div>
+    </div>
+    <div class="recorder-sync-row">
+      <span id="recorder-sync-summary" class="recorder-sync-summary"></span>
+      <button class="btn" type="button" onclick="_recorderSync(true)">Sync now</button>
+    </div>
+    <div id="recorder-list" class="recorder-list"></div>
+    <details class="recorder-settings">
+      <summary>Settings</summary>
+      <div class="ui-field">
+        <label for="recorder-dir">Recordings folder on the amux machine</label>
+        <div class="recorder-dir-row">
+          <input id="recorder-dir" class="input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="~/Recordings">
+          <button class="btn primary" type="button" onclick="_recorderSaveDir()">Save</button>
+        </div>
+        <div id="recorder-dir-help" class="ui-help"></div>
+      </div>
+      <label class="recorder-check"><input id="recorder-location" type="checkbox" onchange="_recorderSetLocation(this.checked)"> Save my location with each recording</label>
+      <div id="recorder-transcriber" class="ui-help"></div>
+    </details>
+  </div>
 </div>
 
 <div id="files-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
@@ -1185,11 +1251,22 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="metrics-expand-btn" onclick="_metricsToggleSidebar()" title="Show workers list"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
     <div class="metrics-modebar">
       <button class="metrics-modebtn active" id="metricsmode-system" onclick="_metricsSetMode('system')">System</button>
-      <button class="metrics-modebtn" id="metricsmode-disk" onclick="_metricsSetMode('disk')">Disk Cleanup</button>
+      <button class="metrics-modebtn" id="metricsmode-host" onclick="_metricsSetMode('host')">Host</button>
+      <button class="metrics-modebtn" id="metricsmode-disk" onclick="switchView('disk')">Disk Cleanup</button>
     </div>
     <div id="metrics-content"><div style="color:var(--dim);font-size:0.85rem;padding:40px;text-align:center;">Loading metrics&hellip;</div></div>
-    <div id="reclaim-content" style="display:none;"></div>
+    <div id="host-content" style="display:none;"></div>
   </div>
+</div>
+
+<!-- Disk view: promoted out of Metrics ▸ Disk Cleanup (AMUX system-tab request,
+     2026-09-11) into its own top-level tab so disk cleanup is one click, not
+     three (Metrics → sidebar collapse → Disk Cleanup submode). The submode
+     button/cards still exist for muscle memory and now just call
+     switchView('disk'); #reclaim-content itself and every _reclaim* function
+     are unchanged. -->
+<div id="disk-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
+  <div id="reclaim-content" style="display:flex;flex-direction:column;flex:1;min-height:0;"></div>
 </div>
 
 <!-- Torrents view -->
@@ -1357,6 +1434,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div style="display:flex;gap:6px;margin-bottom:10px;flex-shrink:0;">
     <button class="msg-mode-btn active" id="msgmode-messages" onclick="_msgSetMode('messages')">Messages</button>
     <button class="msg-mode-btn" id="msgmode-trends" onclick="_msgSetMode('trends')">&#x1F4C8; Trends</button>
+    <!-- AMUX-4664: Trends can only answer what its theme list already names.
+         Ask is the open-ended half: any question, over these same messages. -->
+    <button class="msg-mode-btn" id="msgmode-ask" onclick="_msgSetMode('ask')">&#x1F4AC; Ask</button>
     <select id="trends-days" onchange="_trendsLoad()" style="display:none;font-size:0.8rem;padding:4px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);margin-left:auto;">
       <option value="7">Last 7 days</option>
       <option value="14">Last 14 days</option>
@@ -1378,13 +1458,29 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="btn" onclick="_msgsAllSessions=null;_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
   </div>
   <div id="msgs-list" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
+  <div id="ask-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+      <input class="input" id="ask-q" type="text" placeholder="Ask anything about these messages…"
+        onkeydown="if(event.key==='Enter')_askRun()" style="flex:1;min-width:200px;">
+      <select id="ask-days" class="input" style="max-width:140px;">
+        <option value="7">Last 7 days</option>
+        <option value="14" selected>Last 14 days</option>
+        <option value="30">Last 30 days</option>
+        <option value="90">Last 90 days</option>
+      </select>
+      <button class="btn primary" id="ask-go" onclick="_askRun()">Ask</button>
+      <button class="btn" id="ask-new" onclick="_askNewThread(false)" title="Start a new thread: follow-ups will not see the earlier questions">New</button>
+    </div>
+    <div id="ask-suggestions" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
+    <div id="ask-meta" style="font-size:0.72rem;color:var(--dim);margin-bottom:8px;"></div>
+    <div id="ask-answer" style="font-size:0.88rem;line-height:1.55;white-space:pre-wrap;word-break:break-word;"></div>
+  </div>
   <div id="trends-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
     <div id="trends-totals" class="review-totals"></div>
     <div id="trends-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
   </div>
-  <div style="flex-shrink:0;padding-top:8px;text-align:center;">
-    <button class="btn" id="msgs-more-btn" style="display:none;font-size:0.78rem;" onclick="_messagesLoad(false)">Load older</button>
-  </div>
+  <!-- AMUX-4666: pages, not an endless "Load older". -->
+  <div id="msgs-pager" style="flex-shrink:0;padding-top:8px;display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;"></div>
 </div>
 
 <div id="terminal-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
@@ -1487,10 +1583,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </style>
   <!-- Nav row -->
   <div class="bw-row" style="padding-top:8px;">
-    <select id="bw-backend" class="bw-in" style="min-width:104px;display:none;" onchange="_bwOnBackend()" title="How to run the browser — Playwright profiles, or your own Chrome over CDP">
-      <option value="">Playwright</option>
-      <option value="live">My Chrome</option>
+    <select id="bw-backend" class="bw-in" style="min-width:104px;max-width:100%;" onchange="_bwOnBackend()" aria-label="Browser operating system and device" title="Browser on the server machine">
+      <option value="">Desktop Chrome</option>
     </select>
+    <button id="bw-ios-stop" class="bw-btn" style="display:none;" onclick="_bwStopIos()">Stop Safari</button>
     <select id="bw-profile" class="bw-in" style="min-width:120px;" title="Profile — 'Auto' matches the URL to a logged-in profile">
       <option value="">Auto profile</option>
     </select>
@@ -1499,9 +1595,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn primary" onclick="_bwGo()">Go</button>
     <button id="bw-live-btn" class="bw-btn" onclick="_bwToggleLive()" title="Live auto-refresh">&#9658; Live</button>
     <button class="bw-btn" onclick="_bwScreenshot()" title="Snapshot">&#128247;</button>
-    <button class="bw-btn" onclick="_bwIdentify()" title="AF-496 — amux opens a SECOND Chrome beside your own and they look identical. This raises the amux one and draws a blue bar across it naming its profile.">&#128269; Which window?</button>
-    <button class="bw-btn" onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
-    <button class="bw-btn" onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwIdentify()" title="AF-496 — amux opens a SECOND Chrome beside your own and they look identical. This raises the amux one and draws a blue bar across it naming its profile.">&#128269; Which window?</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwImportProfile()" title="Import cookies from Chrome, Firefox, etc.">&#8615; Import</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
   </div>
   <!-- Status / logged-in indicator -->
   <div class="bw-row" style="padding-bottom:4px;">
@@ -1519,10 +1616,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn" onclick="_bwScroll(-1)" title="Scroll up">&#9650;</button>
     <button class="bw-btn" onclick="_bwScroll(1)" title="Scroll down">&#9660;</button>
     <button id="bw-el-btn" class="bw-btn" onclick="_bwToggleElements()" title="Show clickable elements">&#9776; Elements</button>
-    <button id="bw-inspect-btn" class="bw-btn" onclick="_bwToggleInspect()" title="Console, network &amp; JS errors">&#128269; Inspect</button>
+    <button id="bw-inspect-btn" data-bw-chrome class="bw-btn" onclick="_bwToggleInspect()" title="Console, network &amp; JS errors">&#128269; Inspect</button>
   </div>
   <!-- Agent task row -->
-  <div class="bw-row">
+  <div class="bw-row" data-bw-chrome>
     <input id="bw-task" type="text" placeholder="Give the browser agent a task (autonomous, vision)&hellip;" class="bw-in" style="flex:1;min-width:180px;" onkeydown="if(event.key==='Enter')_bwAgentRun()">
     <button class="bw-btn primary" onclick="_bwAgentRun()">&#9658; Run agent</button>
     <button id="bw-agent-stop" class="bw-btn" style="display:none;" onclick="_bwAgentStop()">Stop</button>
@@ -1548,8 +1645,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="bw-btn bw-itab active" data-itab="console" onclick="_bwInspTab('console')" style="padding:3px 8px;">Console <span id="bw-ic-console" style="opacity:0.6;"></span></button>
         <button class="bw-btn bw-itab" data-itab="network" onclick="_bwInspTab('network')" style="padding:3px 8px;">Network <span id="bw-ic-network" style="opacity:0.6;"></span></button>
         <button class="bw-btn bw-itab" data-itab="errors" onclick="_bwInspTab('errors')" style="padding:3px 8px;">Errors <span id="bw-ic-errors" style="opacity:0.6;"></span></button>
+        <button class="bw-btn bw-itab" data-itab="trail" onclick="_bwInspTab('trail')" style="padding:3px 8px;" title="Durable redacted browser actions for this worker">Trail <span id="bw-ic-trail" style="opacity:0.6;"></span></button>
         <span style="flex:1;"></span>
-        <button class="bw-btn" style="padding:2px 6px;" onclick="_bwLoadInspect()" title="Refresh">&#x21bb;</button>
+        <button class="bw-btn" style="padding:2px 6px;" onclick="_bwRefreshInspect()" title="Refresh">&#x21bb;</button>
         <button class="bw-btn" style="padding:2px 6px;" onclick="_bwClearInspect()" title="Clear buffers">&#128465;</button>
       </div>
       <div id="bw-inspect-list" style="flex:1;overflow:auto;font-family:monospace;font-size:0.72rem;line-height:1.4;"></div>
@@ -1557,6 +1655,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
 </div>
 
+<div id="orchestrations-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow:hidden;">
+  <div style="padding:12px 14px 8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+    <h2 style="font-size:1rem;font-weight:600;margin:0;">Orchestrations</h2>
+    <div id="orch-filters" class="orch-filters"></div>
+    <span style="flex:1;"></span>
+    <button class="btn primary" onclick="switchView('board');_toggleLaunchBar()" style="font-size:.8rem;">+ Launch</button>
+  </div>
+  <div id="orch-list" style="flex:1;min-height:0;overflow-x:auto;overflow-y:auto;padding:0 14px 14px;"></div>
+</div>
 <div id="graph-view" style="display:none;flex-direction:row;overflow:hidden;">
   <!-- Graph sidebar -->
   <div class="graph-sidebar" id="graph-sidebar">
@@ -1652,7 +1759,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <!-- Video player overlay -->
 <div id="video-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9999;flex-direction:column;align-items:center;justify-content:center;" onclick="if(event.target===this)_closeVideo()">
   <div id="vp-container" style="position:relative;width:90vw;max-width:1200px;">
-    <div id="vp-title" style="color:#fff;font-size:0.85rem;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+    <div class="vp-heading"><div id="vp-title"></div><button onclick="_closeVideo()" aria-label="Close video" title="Close video">&#x2715;</button></div>
     <div style="position:relative;background:#000;border-radius:8px;overflow:hidden;">
       <video id="video-player" playsinline webkit-playsinline x-webkit-airplay="allow" airplay="allow" preload="metadata" style="width:100%;max-height:75vh;display:block;"></video>
       <!-- Loading/error overlay -->
@@ -1677,7 +1784,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="vp-volume" type="range" min="0" max="1" step="0.05" value="1" oninput="_vpSetVolume(this.value)" style="width:70px;accent-color:var(--accent);cursor:pointer;">
           </div>
           <button onclick="_vpFullscreen()" style="background:none;border:none;color:#fff;font-size:0.9rem;cursor:pointer;padding:0;" title="Fullscreen">&#x26F6;</button>
-          <button onclick="_closeVideo()" style="background:none;border:none;color:rgba(255,255,255,0.6);font-size:1rem;cursor:pointer;padding:0;" title="Close">&#x2716;</button>
+
         </div>
       </div>
     </div>
@@ -1829,6 +1936,27 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <!-- The hidden sched-watch / sched-watch-timeout carriers were here.
            They existed only to keep two dead columns in the save payload. -->
+      <!-- Execution mode toggles -->
+      <div id="sched-exec-modes" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.78rem;color:var(--text);margin-bottom:6px;" title="Treat the command as fan-out priorities: each line becomes a child worker via /api/board/launch">
+          <input type="checkbox" id="sched-fan-out" style="width:auto;accent-color:var(--accent);" onchange="updateSchedFanOutUI()">
+          <span>Fan-out orchestration</span>
+          <span style="font-size:0.66rem;color:var(--dim);">(each line = one worker)</span>
+        </label>
+        <div id="sched-fan-out-model-group" style="display:none;margin-left:24px;margin-bottom:6px;">
+          <label class="field-label" style="font-size:0.68rem;">Model for child workers</label>
+          <select id="sched-fan-out-model" style="font-size:0.76rem;padding:4px 8px;">
+            <option value="haiku">haiku (fast/cheap)</option>
+            <option value="sonnet">sonnet</option>
+            <option value="opus">opus</option>
+          </select>
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.78rem;color:var(--text);" title="Create an ephemeral worktree for each firing, commit/push results, then tear down">
+          <input type="checkbox" id="sched-worktree" style="width:auto;accent-color:var(--accent);">
+          <span>Worktree isolation</span>
+          <span style="font-size:0.66rem;color:var(--dim);">(ephemeral per firing)</span>
+        </label>
+      </div>
     </div><!-- /schedule panels (scrollable) -->
     <!-- Action row — PINNED, and a SIBLING of the scrolling panel region
          rather than its last child. As a child it scrolled out of view: at
@@ -1903,14 +2031,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button id="bd-delete" class="btn" onclick="boardDetailDelete()" style="display:none;color:var(--red);border-color:rgba(248,81,73,0.3);">Delete</button>
   </div>
   <div class="board-detail-body">
-    <textarea id="bd-title" class="board-detail-title-input" placeholder="Untitled" autocomplete="off" autocorrect="on" spellcheck="true" rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
-    <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-status-row" id="bd-status-row"></div>
+    <textarea id="bd-title" class="board-detail-title-input" placeholder="Untitled" autocomplete="off" autocorrect="on" spellcheck="true" rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+    <div id="bd-record-summary"></div>
     <div class="board-detail-tabs">
       <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Details</button>
+      <button class="board-detail-tab" id="bd-tab-subtasks" onclick="boardDetailTab('subtasks')">Subtasks <span id="bd-count-subtasks">0</span></button>
+      <button class="board-detail-tab" id="bd-tab-files" onclick="boardDetailTab('files')">Files <span id="bd-count-files">0</span></button>
+      <button class="board-detail-tab" id="bd-tab-related" onclick="boardDetailTab('related')">Related <span id="bd-count-related">0</span></button>
       <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">Worker actions<span id="bd-hist-n" class="bd-hist-n"></span></button>
       <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
     </div>
+    <details id="bd-description-card" class="bd-card-section" open><summary><span class="bd-section-icon" aria-hidden="true">≡</span><h4>Description</h4></summary><div id="bd-preview" class="board-detail-preview md-content bd-section-body"></div></details>
+    <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-meta" id="bd-meta"></div>
     <div id="bd-edit-fields" style="display:none;">
       <div class="board-detail-row" id="bd-session-row">
@@ -1945,7 +2078,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
     <div id="bd-log" class="board-detail-log" style="display:none"></div>
-    <div id="bd-preview" class="board-detail-preview md-content" style="display:none;"></div>
   </div>
   <div id="bd-edit-footer" class="board-detail-footer" style="display:none;">
     <span id="bd-save-status" style="font-size:0.78rem;color:var(--dim);"></span>
@@ -1957,8 +2089,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
      routes it to the right workers → review → send. -->
 <div id="orch-overlay" class="edit-overlay" onclick="if(event.target===this)_orchClose()">
   <div class="edit-box orch-box">
-    <h3 style="display:flex;align-items:center;gap:8px;">&#x1F399;&#xFE0F; Orchestrate the fleet
-      <span style="font-size:0.68rem;font-weight:400;color:var(--dim);">speak or paste, then approve before it sends</span></h3>
+    <div class="orch-heading">
+      <h3>Orchestrate the fleet</h3>
+      <button class="btn" onclick="_orchClose()" aria-label="Close orchestrator">&#x2715;</button>
+    </div>
+    <p class="orch-subtitle">Speak or paste, then review before sending.</p>
 
     <!-- Step 1: record -->
     <div id="orch-step-record" class="orch-step">
@@ -2026,11 +2161,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')">Gemini</button>
         <button type="button" id="create-provider-grok" class="btn provider-btn" onclick="_selectProvider('grok')">Grok</button>
         <button type="button" id="create-provider-ollama" class="btn provider-btn" onclick="_selectProvider('ollama')">Ollama</button>
+        <button type="button" id="create-provider-muse" class="btn provider-btn" onclick="_selectProvider('muse')">Muse Code</button>
       </div>
     </div>
-    <div class="field-group" id="create-ollama-model-field" style="display:none;">
-      <label class="field-label">Local model</label>
-      <select id="create-ollama-model" style="width:100%;min-height:44px;"><option value="">Loading local models…</option></select>
+    <div class="field-group" id="create-model-field">
+      <label class="field-label">Model <span class="field-optional">(optional)</span></label>
+      <select id="create-model" onchange="_createModelChanged()" style="width:100%;min-height:44px;"><option value="">Loading models…</option></select>
+      <input id="create-model-custom" type="text" placeholder="Exact model ID" autocomplete="off" autocorrect="off" style="display:none;margin-top:6px;">
     </div>
     <div class="field-group">
       <label class="field-label">Working directory</label>
@@ -2137,15 +2274,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 
 <!-- Peek overlay -->
-<div id="subagents-overlay" class="overlay" onclick="if(event.target===this)closeSubagents()">
-      <div class="overlay-card" style="max-width:640px;">
-        <div class="overlay-head">
-          <span id="subagents-title">Subagents</span>
-          <button class="btn" onclick="closeSubagents()">&#x2715;</button>
-        </div>
-        <div id="subagents-list" style="max-height:60vh;overflow:auto;padding:4px 2px;"></div>
-      </div>
-    </div>
 <div id="peek-overlay" class="overlay">
   <div class="overlay-header" style="flex-direction:column;gap:4px;padding-bottom:6px;">
     <div id="peek-title-row" style="display:flex;align-items:center;justify-content:center;gap:8px;min-width:0;width:100%;overflow:hidden;">
@@ -2172,28 +2300,56 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div id="peek-task-row" style="display:none;align-items:center;justify-content:center;gap:6px;min-width:0;max-width:100%;">
       <span style="font-size:0.72rem;color:var(--dim);flex-shrink:0;">Task:</span>
-      <span id="peek-task-label" style="font-size:0.82rem;font-weight:600;color:var(--text);white-space:nowrap;overflow-x:auto;overflow-y:hidden;flex:0 1 auto;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none;touch-action:pan-x;overscroll-behavior-x:contain;cursor:pointer;" onclick="editField(peekSession,'task',this.textContent.trim())" title="Click to edit task label"></span>
+      <span id="peek-task-label" style="font-size:0.82rem;font-weight:600;color:var(--text);white-space:nowrap;overflow-x:auto;overflow-y:hidden;flex:0 1 auto;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none;touch-action:pan-x;overscroll-behavior-x:contain;cursor:pointer;"></span>
     </div>
-    <div style="display:flex;gap:6px;align-items:center;">
-      <div class="peek-find-wrap" id="peek-search-wrap">
-        <input class="search-input" id="peek-search" type="text" placeholder="Find..." autocomplete="off" autocorrect="off"
-          oninput="peekSearchQuery=this.value;document.getElementById('peek-search-wrap').classList.toggle('has-value',!!this.value);applyPeekSearch()"
-          onkeydown="if(event.key==='Enter'){event.preventDefault();event.shiftKey?peekSearchPrev():peekSearchNext();}">
-        <span class="peek-find-count" id="peek-search-count"></span>
-        <button class="peek-nav-btn" onclick="peekSearchPrev()" title="Previous match (Shift+Enter)">&#x2191;</button>
-        <button class="peek-nav-btn" onclick="peekSearchNext()" title="Next match (Enter)">&#x2193;</button>
-        <button class="search-clear" onclick="event.stopPropagation();clearPeekSearch()">&#x2715;</button>
+    <div class="peek-toolbar">
+      <div class="peek-msg-nav" id="peek-msg-nav" role="group" aria-label="Terminal navigation">
+        <div class="peek-msg-filter">
+          <button type="button" id="peek-filter-btn" class="peek-filter-btn" onclick="togglePeekFilters()" aria-label="Filter messages" aria-describedby="peek-filter-summary" aria-haspopup="dialog" aria-expanded="false" aria-controls="peek-filter-panel">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6 7v6l-4 2v-8z"/></svg>
+            <span class="peek-filter-caption"><span id="peek-nav-label">Filters</span><span id="peek-filter-summary">All messages</span></span>
+            <span class="peek-msg-count" id="peek-msg-count" role="status" aria-live="polite">0</span>
+          </button>
+          <div id="peek-filter-panel" class="peek-filter-panel" role="dialog" aria-label="Filter worker messages" hidden>
+            <div class="peek-filter-heading"><strong>Filter messages</strong><button type="button" class="btn" id="peek-filter-reset" onclick="_peekFiltersReset()">Reset</button></div>
+            <fieldset><legend>From</legend><div class="peek-filter-options">
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="all" onchange="_peekMsgNavSelect(this.value)"><span>Everyone</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="human" onchange="_peekMsgNavSelect(this.value)"><span>Human</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="session" onchange="_peekMsgNavSelect(this.value)"><span>Workers</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="schedule" onchange="_peekMsgNavSelect(this.value)"><span>Scheduled</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="amux" onchange="_peekMsgNavSelect(this.value)"><span>Harness</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="unstamped" onchange="_peekMsgNavSelect(this.value)"><span>Unstamped</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-source" value="unknown" onchange="_peekMsgNavSelect(this.value)"><span>Unclassified</span></label>
+            </div></fieldset>
+            <fieldset><legend>Contains</legend><div class="peek-filter-options">
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="any" onchange="_peekFilterContentSelect(this.value)"><span>Any message</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="board" onchange="_peekFilterContentSelect(this.value)"><span>Board references</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="files" onchange="_peekFilterContentSelect(this.value)"><span>Files</span></label>
+              <label class="peek-filter-option"><input type="radio" name="peek-filter-content" value="links" onchange="_peekFilterContentSelect(this.value)"><span>Links</span></label>
+            </div></fieldset>
+            <div class="peek-filter-footer"><span>Applies to Find and ↑ ↓ in loaded output.</span><button type="button" class="btn" onclick="_closePeekFilters(true)">Done</button></div>
+          </div>
+        </div>
+        <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgPrev(event)" title="Previous message" aria-label="Previous message">&#x2191;</button>
+        <button class="peek-nav-btn" onpointerdown="_peekMsgNavArm(event)" onclick="peekMsgNext(event)" title="Next message" aria-label="Next message">&#x2193;</button>
       </div>
-      <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate messages (click counter to change kind)">
-        <button class="peek-nav-btn" onclick="peekMsgPrev()" title="Previous message">&#x2191;</button>
-        <span class="peek-msg-count" id="peek-msg-count" onclick="_peekMsgNavCycle()" style="cursor:pointer;" title="Click to cycle: Human / Session / Scheduled / amux / All">❯</span>
-        <button class="peek-nav-btn" onclick="peekMsgNext()" title="Next message">&#x2193;</button>
-      </div>
+      <button class="btn peek-toolbar-btn" id="peek-find-toggle" onclick="togglePeekFind()" title="Find in terminal" aria-label="Find in terminal" aria-expanded="false" aria-controls="peek-search-wrap">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
+      </button>
       <div class="peek-more-wrap">
-        <button class="btn" onclick="togglePeekMoreMenu()" id="peek-worker-menu-btn" title="Worker actions">&#x22EE;</button>
+        <button class="btn peek-toolbar-btn" onclick="togglePeekMoreMenu()" id="peek-worker-menu-btn" title="Worker actions" aria-label="Worker actions" aria-haspopup="menu" aria-expanded="false">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+        </button>
         <div class="peek-more-dropdown" id="peek-more-dropdown" role="menu"></div>
       </div>
-      <button class="btn" id="peek-close-btn" onclick="closePeek()" title="Close" style="font-size:1.1rem;line-height:1;padding:4px 8px;">&#x2715;</button>
+      <button class="btn peek-toolbar-btn" id="peek-close-btn" onclick="closePeek()" title="Close worker" aria-label="Close worker">&#x2715;</button>
+    </div>
+    <div class="peek-find-wrap" id="peek-search-wrap" hidden>
+      <input class="search-input" id="peek-search" type="search" placeholder="Find in terminal…" aria-label="Find in terminal" autocomplete="off" autocorrect="off"
+        oninput="peekSearchQuery=this.value;document.getElementById('peek-search-wrap').classList.toggle('has-value',!!this.value);applyPeekSearch()"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();event.shiftKey?peekSearchPrev():peekSearchNext();}else if(event.key==='Escape'){event.preventDefault();event.stopPropagation();togglePeekFind(false);}">
+      <span class="peek-find-count" id="peek-search-count" aria-live="polite"></span>
+      <button class="search-clear" onclick="clearPeekSearch();document.getElementById('peek-search').focus()" title="Clear search" aria-label="Clear terminal search">&#x2715;</button>
     </div>
   </div>
   <!-- Focus mode minimal bar (visible only in focus mode) -->
@@ -2219,7 +2375,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
-    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
+    <button class="peek-tab" id="peek-tab-fanout" onclick="setPeekTab('fanout')" title="Ephemeral fan-out workers spawned by this session" style="display:none;"><span class="tab-ico">&#x1F680;</span><span class="tab-lbl">Fan-out</span><span class="peek-tab-count" id="peek-tab-fanout-count"></span></button>
+    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show, hide or reorder worker tabs" aria-label="Customize worker tabs" aria-expanded="false" style="flex:0 0 auto;">&#x229E;</button>
     <!-- The menu itself is NOT here on purpose — it is a direct child of the
          document body, at the end of this file. `.peek-tabs` is a ~44px
          horizontal scroller (overflow-x:auto; overflow-y:hidden;
@@ -2231,8 +2388,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <span style="flex-shrink:0;opacity:0.6;">&#x1F4C1;</span>
     <span id="peek-dir-text" onclick="peekSession&&_browseWorkerFiles(peekSession,'peek-directory')" title="Browse directory" style="cursor:pointer;text-decoration:underline;text-decoration-color:var(--dim);text-underline-offset:2px;"></span>
     <span id="peek-dir-branch" class="peek-dir-branch" style="display:none;"></span>
-    <span class="card-dir-edit" onclick="peekSessionDir&&_copyFileDeeplink(peekSessionDir)" title="Copy link to this directory" style="opacity:0.6;font-size:0.85rem;">&#x1F517;</span>
-    <span class="card-dir-edit" id="peek-dir-edit" onclick="editField(peekSession,'dir',peekSessionDir)" title="Change directory">&#x270E;</span>
   </div>
   <!-- Split wrap: terminal + optional file browser side-by-side -->
   <div id="peek-split-wrap" class="peek-split-wrap">
@@ -2247,31 +2402,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </button>
       <div class="peek-plan-list" id="peek-plan-list" style="display:none;"></div>
     </div>
-    <div style="position:relative;flex:1;min-height:0;">
-      <div id="peek-body" class="overlay-body" style="position:absolute;inset:0;"></div>
+    <div class="peek-output-wrap">
+      <div class="peek-output-controls">
       <button class="peek-copy-btn" id="peek-copy-btn" onclick="copyPeekContent()" title="Copy all">&#x2398; Copy</button>
-      <!-- Subagent switcher — appears only when the pane shows Claude's agents panel -->
-      <!-- The pane-driven subagent switcher (⌂/▲/▼, agentNav) was DELETED
-           (ARE-7): it keyed on a "⏺ main" panel row Claude Code no longer
-           renders — measured 0 of 50 sessions, always display:none. Its
-           replacement is #peek-subagents-nav below (AMUX-2635), which reads
-           durable transcripts (50 of 50) and needs no visibility gate.
-           Resurrection, if the TUI ever ships a panel again: git log -S agentNav. -->
-      <!-- Subagent SCROLLER (Ethan 2026-08-13: "make sure i can scroll thru sub
-           agents in the terminal … i dont like the list subagents button").
-           Claude Code renders its agents panel again (● main / ○ general-purpose,
-           opened with ←), so this drives it directly: ← opens the panel, ▲/▼
-           move through the subagents in the pane. It sends raw keys via /keys
-           (peekQuickKeys) and lets Claude's native panel do the navigating —
-           NOT the server-side multi-step key choreography the old agentNav used
-           (ARE-7), which broke the moment the TUI's panel changed. The durable
-           transcript list (openSubagents / GET .../subagents) still exists in the
-           code if it's wanted elsewhere; the button here is the live scroller. -->
-      <div class="peek-agent-nav" id="peek-subagents-nav">
-        <button onclick="peekQuickKeys('Left')" title="Open Claude's agents panel (sends ←)">&#x2190;</button>
-        <button onclick="peekQuickKeys('Up')" title="Previous subagent (sends ↑)">&#x25B2;</button>
-        <button onclick="peekQuickKeys('Down')" title="Next subagent (sends ↓)">&#x25BC;</button>
+      <nav class="peek-agent-nav" id="peek-agent-nav" aria-label="Worker and subagent output" hidden>
+        <span id="peek-agent-label" aria-live="polite"></span>
+        <button type="button" onclick="_peekAgentStep(-1)" aria-label="Previous agent" title="Previous agent">&#x2191;</button>
+        <button type="button" onclick="_peekAgentStep(1)" aria-label="Next agent" title="Next agent">&#x2193;</button>
+      </nav>
       </div>
+      <div id="peek-body" class="overlay-body"></div>
     </div>
     <div id="peek-status" class="overlay-status" onclick="_peekGeoDebug()" title="Tap for layout debug"></div>
     <div class="peek-cmd-bar">
@@ -2283,8 +2423,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <!-- Attachment chips -->
         <div class="peek-attach-bar" id="peek-attach-bar"></div>
         <!-- Input row -->
-        <div class="ac-wrap" style="flex:1;min-width:0;position:relative;">
-          <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Type a message or drop a file..."
+        <div class="ac-wrap peek-composer-input">
+          <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Message…" aria-label="Message the worker"
             autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true"
             enterkeyhint="enter" style="width:100%;"
             oninput="autoGrow(this);slashAcUpdate();cmdHistoryReset();_draftSaveDebounced(peekSession,this.value)" onkeydown="slashAcKeydown(event)"
@@ -2305,6 +2445,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
             <button type="button" onclick="_peekMoreClose();_readLatestMessage(peekSession)" title="Read the worker's most recent full message aloud">&#x1F50A; Read aloud latest</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('readalouds')">&#x1F50A; Read-aloud history</button>
+            <button type="button" onclick="_peekMoreClose();_peekFanOut()" title="Fan out priorities to ephemeral workers via this session">&#x1F680; Fan out</button>
             <!-- Last, and separated: the only DESTRUCTIVE entry in this menu.
                  Everything above opens something; this throws work away, so it
                  does not sit where a thumb lands by accident reaching for
@@ -2458,6 +2599,26 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
       <input type="date" id="peek-msgs-date-jump" class="amux-dp" onchange="_peekMsgsJumpToDate(this.value)" title="Jump to a date" style="font-size:0.8rem;padding:5px 7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);color-scheme:dark;">
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
+      <button class="btn" id="peek-ask-toggle" onclick="_peekAskToggle()" title="Ask a question about this worker's messages"
+        style="font-size:0.78rem;padding:4px 10px;flex:0 0 auto;">&#x1F4AC; Ask</button>
+    </div>
+    <!-- AMUX-4664: same question box as the global Messages tab, scoped to this worker. -->
+    <div id="peek-ask-panel" style="display:none;padding:0 10px 8px;">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+        <input class="input" id="peek-ask-q" type="text" placeholder="Ask anything about this worker’s messages…"
+          onkeydown="if(event.key==='Enter')_askRun(true)" style="flex:1;min-width:160px;">
+        <select id="peek-ask-days" class="input" style="max-width:130px;">
+          <option value="7">7 days</option>
+          <option value="14" selected>14 days</option>
+          <option value="30">30 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <button class="btn primary" onclick="_askRun(true)">Ask</button>
+        <button class="btn" onclick="_askNewThread(true)" title="Start a new thread: follow-ups will not see the earlier questions">New</button>
+      </div>
+      <div id="peek-ask-suggestions" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;"></div>
+      <div id="peek-ask-meta" style="font-size:0.7rem;color:var(--dim);margin-top:8px;"></div>
+      <div id="peek-ask-answer" style="font-size:0.84rem;line-height:1.5;white-space:pre-wrap;word-break:break-word;margin-top:6px;"></div>
     </div>
     <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;"></div>
     <div id="pm-selbar" style="display:none;"></div>
@@ -2623,6 +2784,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div class="peek-tasks-list" id="peek-logs-list" style="padding:0;"></div>
   </div>
+  <!-- Fan-out panel: shows ephemeral children of the peeked session -->
+  <div id="peek-fanout-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
+    <div style="padding:8px 12px 6px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0;">
+      <span style="font-weight:600;font-size:0.85rem;">Fan-out Workers</span>
+      <span id="peek-fanout-stats" style="font-size:0.68rem;color:var(--dim);flex:1;"></span>
+      <button class="btn" title="Refresh" onclick="_peekFanoutLoad()" style="font-size:0.7rem;padding:2px 6px;">&#x21BB;</button>
+    </div>
+    <div class="peek-tasks-list" id="peek-fanout-list" style="padding:8px 12px;"></div>
+  </div>
   <!-- Notes panel -->
 </div>
 
@@ -2638,23 +2808,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div id="edit-ac-list" class="ac-list"></div>
     </div>
     <select id="edit-select" style="display:none;" onchange="_editSelectChanged()">
-      <option value="" id="model-default-opt">Default</option>
-      <option value="opus">opus</option>
-      <option value="sonnet">sonnet</option>
-      <option value="haiku">haiku</option>
-      <option value="claude-opus-5">claude-opus-5</option>
-      <option value="claude-opus-5[1m]">claude-opus-5 [1M]</option>
-      <option value="claude-fable-5-1">claude-fable-5-1</option>
-      <option value="claude-fable-5">claude-fable-5</option>
-      <option value="claude-opus-4-8">claude-opus-4-8</option>
-      <option value="claude-opus-4-8[1m]">claude-opus-4-8 [1M]</option>
-      <option value="claude-opus-4-7">claude-opus-4-7</option>
-      <option value="claude-opus-4-7[1m]">claude-opus-4-7 [1M]</option>
-      <option value="claude-opus-4-6">claude-opus-4-6</option>
-      <option value="claude-opus-4-6[1m]">claude-opus-4-6 [1M]</option>
-      <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-      <option value="claude-sonnet-4-6[1m]">claude-sonnet-4-6 [1M]</option>
-      <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
+      <option value="" id="model-default-opt">Loading models…</option>
     </select>
     <select id="edit-group-picker" class="edit-select" style="display:none;margin-bottom:6px;" onchange="_editAddGroup(this)"></select>
     <div id="edit-effort-wrap" style="display:none;margin-top:12px;">
@@ -2699,7 +2853,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div style="color:var(--dim);font-size:0.7rem;font-family:monospace;margin-top:2px;"><script>document.write(location.host)</script></div>
       <div id="about-version" style="margin:8px 0 4px;font-size:0.95rem;font-weight:600;cursor:pointer;" onclick="forceUpdate()" title="Tap to force update">&#x21BB;</div>
       <div id="update-status" style="color:var(--dim);font-size:0.75rem;min-height:1.2em;"></div>
-      <button id="pull-btn" class="btn" onclick="pullFromRemote(this)" style="margin-top:6px;font-size:0.72rem;padding:4px 12px;">&#x2B07; Pull from remote</button>
+      <div style="display:flex;gap:6px;justify-content:center;margin-top:6px;">
+        <button id="pull-btn" class="btn" onclick="pullFromRemote(this)" style="font-size:0.72rem;padding:4px 12px;">&#x2B07; Pull from remote</button>
+        <button class="btn" style="font-size:0.72rem;padding:4px 12px;" onclick="location.href='/api/_clear_sw'" title="Unregister service workers, clear caches, and reload">&#x1F5D1; Clear cache</button>
+      </div>
       <div id="pull-status" style="color:var(--dim);font-size:0.7rem;font-family:monospace;margin-top:4px;min-height:1.2em;white-space:pre-wrap;max-height:60px;overflow-y:auto;"></div>
       <script>if(window._cloudEmail){var _pb=document.getElementById('pull-btn');if(_pb)_pb.style.display='none';}</script>
     </div>
@@ -2756,7 +2913,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div id="debug-panel" style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
         <div style="font-size:0.78rem;font-weight:600;">Connection</div>
-        <button class="btn" style="font-size:0.65rem;padding:2px 8px;" onclick="pingServer()">Ping</button>
+        <div style="display:flex;gap:4px;">
+          <button class="btn" style="font-size:0.65rem;padding:2px 8px;" onclick="pingServer()">Ping</button>
+          <button class="btn" style="font-size:0.65rem;padding:2px 8px;" onclick="location.href='/api/_clear_sw'" title="Unregister service workers, clear caches, and reload">Clear cache</button>
+        </div>
       </div>
       <div id="debug-info" style="font-size:0.7rem;font-family:monospace;color:var(--dim);line-height:1.6;"></div>
     </div>
@@ -2811,6 +2971,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </select>
     </div>
     <div id="cmd-history-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;padding-bottom:10px;align-items:center;scrollbar-width:none;"></div>
+    <!-- AMUX-4695. EMPTY AND ZERO-HEIGHT until the server reports a facet, so a
+         fleet where no message carries context sees no control at all rather
+         than a row of buttons that select nothing. -->
+    <div id="cmd-history-ctx-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;align-items:center;scrollbar-width:none;"></div>
     <div id="cmd-history-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>
   </div>
 </div>
@@ -2966,21 +3130,21 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <h2 id="file-title">file</h2>
       <div id="file-subpath" class="file-subpath"></div>
     </div>
-    <button class="file-menu-btn" id="file-menu-btn" onclick="_toggleFileMenu(event)" title="Actions" aria-label="Actions">&#x22EE;</button>
-    <div class="file-actions" id="file-actions">
     <div class="file-view-tabs" id="file-view-tabs" style="display:none;">
       <button class="file-view-tab active" id="file-tab-preview" onclick="setFileViewMode('preview')">Preview</button>
-      <button class="file-view-tab" id="file-tab-edit" onclick="setFileViewMode('edit')" style="display:none;">Edit</button>
       <button class="file-view-tab" id="file-tab-raw" onclick="setFileViewMode('raw')">Raw</button>
+    </div>
+    <button id="file-save-btn" onclick="_fileSave()" style="display:none;">Save</button>
+    <button class="file-menu-btn" id="file-menu-btn" onclick="_toggleFileMenu(event)" title="More actions" aria-label="More actions">&#x22EF;</button>
+    <div class="file-actions" id="file-actions">
+      <button class="file-view-tab" id="file-tab-edit" onclick="setFileViewMode('edit')" style="display:none;">Edit</button>
       <button class="file-view-tab" id="file-tab-teleprompter" onclick="_filesOpenTeleprompter()" title="Teleprompter mode" style="display:none;">&#x25B6; Teleprompter</button>
       <button class="file-view-tab" id="file-tab-search" onclick="_mdSearchToggle()" title="Find in markdown" style="display:none;">&#x1F50D; Find</button>
       <button class="file-view-tab" id="file-tab-readaloud" onclick="_ttsSpeak(_mdToSpeech(_fileData&&_fileData.content),this)" title="Read aloud" style="display:none;">&#x1F50A; Read Aloud</button>
       <button class="file-view-tab" id="file-tab-copy" onclick="copyFileContent()" title="Copy to clipboard">Copy</button>
       <button class="file-view-tab" id="file-tab-copypath" onclick="_copyFilePath(_fileData&&_fileData.path||'')" title="Copy relative path">Path</button>
       <button class="file-view-tab" id="file-tab-link" onclick="_copyFileDeeplink(_fileData&&_fileData.path||'')" title="Copy deep link">Link</button>
-    </div>
-    <button id="file-save-btn" onclick="_fileSave()" style="display:none;">Save</button>
-    <button id="file-download-btn" onclick="_fileDownload()" style="display:none;font-size:0.72rem;padding:3px 10px;border:1px solid var(--border);border-radius:6px;color:var(--accent);background:transparent;cursor:pointer;white-space:nowrap;flex-shrink:0;">&#x2B07; Download</button>
+      <button class="file-view-tab" id="file-download-btn" onclick="_fileDownload()" style="display:none;">&#x2B07; Download</button>
     </div><!-- /file-actions -->
     <button class="btn" onclick="closeFilePreview()" style="flex-shrink:0;">&#x2715;</button>
   </div>
@@ -3032,6 +3196,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="explore-body" class="file-overlay-body" style="padding:0;overflow-y:auto;"></div>
 </div>
 
+<script src="/state/kernel.js"></script>
 <script src="/app.js"></script>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>

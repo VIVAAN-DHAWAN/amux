@@ -885,6 +885,33 @@ impl GmailClient {
         Some(tf)
     }
 
+    /// Write a token file so a reader never sees a half-written one (AF-117).
+    ///
+    /// `fs::write` opens O_TRUNC and writes in place, so an interrupted write
+    /// leaves the file short — and this file is the only copy of the refresh
+    /// token. Same reasoning as `scripts/atomic-replace.sh` for the shared CLI:
+    /// write a sibling temp file, then `rename(2)`, which is atomic within a
+    /// directory. A reader gets either the old bytes or the new ones.
+    ///
+    /// The temp file is created IN THE DESTINATION'S DIRECTORY on purpose: a
+    /// rename across filesystems fails, and /tmp is routinely a different one.
+    fn write_token_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(
+            ".{}.tmp",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("token")
+        ));
+        std::fs::write(&tmp, contents)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
     /// Current access token; `force_refresh` bypasses cache + stored token
     /// (the 401-retry path). Persists the refreshed token in Python's exact
     /// file shape so both servers keep working off one file.
@@ -924,16 +951,53 @@ impl GmailClient {
             .ok_or_else(|| format!("token refresh response missing access_token: {body}"))?
             .to_string();
         self.token_cache.lock().expect("token cache").insert(account.into(), access.clone());
-        // Best-effort persist, Python's exact shape (a failed write must not
-        // fail the send).
+        // AF-117. GOOGLE MAY ROTATE THE REFRESH TOKEN, and this used to persist
+        // the one it had just SENT rather than the one it got back. When the
+        // token endpoint returns a `refresh_token`, the one you presented is
+        // invalidated — so writing the old one back means the NEXT refresh
+        // presents a dead credential and fails `invalid_grant`. The account goes
+        // `needs_reauth`, every /api/email/* call for it 502s, and the only
+        // remedy is a human in a browser.
+        //
+        // That is not hypothetical: it is exactly the failure recorded on
+        // hello@amux.io — `token refresh failed (400): {"error":"invalid_grant"}`
+        // on both /api/email/inbox and /api/email/reply. Rotation is silent, so
+        // the account works right up until the access token expires, then dies
+        // permanently, which is why it reads as "the token just went bad".
+        //
+        // Absence means KEEP THE OLD ONE: Google omits `refresh_token` from most
+        // refresh responses, and treating absent as empty would delete a working
+        // credential on every single refresh.
+        let rotated = body
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(new_rt) = rotated {
+            if new_rt != refresh {
+                tracing::warn!(
+                    account = %account,
+                    "[gmail] refresh token ROTATED by the token endpoint — persisting the new \
+                     one; keeping the old would fail the next refresh with invalid_grant (AF-117)"
+                );
+            }
+        }
         let persisted = json!({
             "token": access,
-            "refresh_token": refresh,
+            "refresh_token": rotated.unwrap_or(refresh.as_str()),
             "token_uri": tf.token_uri,
             "client_id": tf.client_id,
             "client_secret": tf.client_secret,
         });
-        let _ = std::fs::write(self.token_path(account), persisted.to_string());
+        // ATOMIC, not a truncating write. This file is the ONLY copy of the
+        // refresh token and both servers read it. A plain `fs::write` opens with
+        // O_TRUNC, so a crash or a builder restart mid-write leaves a truncated
+        // or empty file — and on this box the auto-builder restarts the server
+        // on every landed commit. A torn token file is unrecoverable without a
+        // human in a browser, which is the same cost as the bug above.
+        //
+        // Still best-effort: a failed write must not fail the send, since the
+        // access token in hand is good for the call being made.
+        let _ = Self::write_token_file_atomically(&self.token_path(account), &persisted.to_string());
         Ok(access)
     }
 
@@ -967,7 +1031,17 @@ impl GmailClient {
             // message from the response. Three short backoffs (250/500/1000ms)
             // absorb a transient limit; a sustained one still errors, loudly,
             // at the caller's WARN.
-            if (status == 429 || status == 503) && attempt < 3 {
+            // 403 IS HOW GMAIL SAYS "RATE LIMIT" (AMUX-4833). The retry above
+            // was written for quota pushback and only matched 429/503, but the
+            // Gmail API answers `rateLimitExceeded` / `userRateLimitExceeded`
+            // with HTTP 403 and puts the reason in the body. So the backoff
+            // that exists to absorb a transient limit never fired on the form
+            // the API actually uses, and the call failed on the first try.
+            //
+            // Observed 2026-09-19T04:38Z: 403 with
+            // details[].reason=RATE_LIMIT_EXCEEDED, quota_metric
+            // gmail.googleapis.com/default, quota_limit_value 15000 per minute.
+            if Self::should_retry_upstream(status, &v, attempt) {
                 tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
                 last = Some((status, v));
                 continue;
@@ -979,6 +1053,67 @@ impl GmailClient {
         }
         let (status, v) = last.unwrap_or((0, Value::Null));
         Err(format!("gmail api {status} after retries: {v}"))
+    }
+
+    /// The retry decision, as a function so a test can drive it (AMUX-4833).
+    ///
+    /// Inline this was a condition inside an async HTTP loop that no test could
+    /// reach without standing up a Gmail server, which is how the 403 case went
+    /// unnoticed: the loop LOOKED like it handled quota pushback, and the one
+    /// shape Gmail actually sends fell straight through it.
+    fn should_retry_upstream(status: u16, body: &Value, attempt: u32) -> bool {
+        // Three short backoffs absorb a transient limit; a sustained one still
+        // errors, loudly, at the caller's WARN (AMUX-3495's rule, unchanged).
+        if attempt >= 3 {
+            return false;
+        }
+        status == 429 || status == 503 || Self::gmail_rate_limited(status, body)
+    }
+
+    /// Is this Gmail response a QUOTA REFUSAL rather than a fault? (AMUX-4833)
+    ///
+    /// ONE DEFINITION, TWO CALLERS. The retry loop below uses it to back off,
+    /// and `api::email` uses it to answer 429 instead of 502. This file already
+    /// learned that lesson from the OAuth refusal list: its comment says two
+    /// spellings of "which codes are refusals" would drift, so there is exactly
+    /// one here.
+    ///
+    /// STRUCTURE, NOT SUBSTRING. A genuine upstream fault whose body merely
+    /// MENTIONS a quota string must stay a fault, which is the same reasoning
+    /// `oauth_refusal_code` gives for parsing rather than searching. The
+    /// discriminators are the ones Google actually sets:
+    /// `error.details[].reason` and `error.errors[].domain`.
+    pub(crate) fn gmail_rate_limited(status: u16, body: &Value) -> bool {
+        if status != 403 && status != 429 {
+            return false;
+        }
+        let err = match body.get("error") {
+            Some(e) => e,
+            None => return false,
+        };
+        let reason_hits = err
+            .get("details")
+            .and_then(Value::as_array)
+            .map(|ds| {
+                ds.iter().any(|d| {
+                    matches!(
+                        d.get("reason").and_then(Value::as_str),
+                        Some("RATE_LIMIT_EXCEEDED")
+                            | Some("rateLimitExceeded")
+                            | Some("userRateLimitExceeded")
+                    )
+                })
+            })
+            .unwrap_or(false);
+        let domain_hits = err
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|es| {
+                es.iter()
+                    .any(|e| e.get("domain").and_then(Value::as_str) == Some("usageLimits"))
+            })
+            .unwrap_or(false);
+        reason_hits || domain_hits
     }
 
     fn metadata_url(&self, id: &str, headers: &[&str]) -> String {
@@ -1473,12 +1608,21 @@ impl GmailClient {
     /// shape with the RFC822 Message-ID as `message_id` so it round-trips
     /// into /reply. `days` is AUTHORITATIVE when set (an `after:` filter,
     /// AMUX-1886); `truncated` distinguishes a real 0 from a capped slice.
+    ///
+    /// AF-704: `resume_from` is Gmail's own opaque `nextPageToken`, not a
+    /// date or offset — there is nothing else to hand a caller, since Gmail
+    /// never exposes the underlying cursor as a timestamp. Pass `None` for a
+    /// fresh window; pass back the `next_page_token` a prior call returned to
+    /// continue past a `truncated: true` slice IN THE SAME ACCOUNT. A token
+    /// is meaningless against a different account or a different query and
+    /// the caller is trusted not to mix them, same as Gmail's own contract.
     pub async fn inbox_messages(
         &self,
         account: &str,
         count: usize,
         q: &str,
         days: f64,
+        resume_from: Option<&str>,
     ) -> Result<Value, String> {
         let want = count.max(1);
         let mut query = q.to_string();
@@ -1490,7 +1634,7 @@ impl GmailClient {
             }
         }
         let mut ids: Vec<Value> = Vec::new();
-        let mut page_token: Option<String> = None;
+        let mut page_token: Option<String> = resume_from.map(str::to_string);
         loop {
             if ids.len() >= want {
                 break;
@@ -1584,7 +1728,12 @@ impl GmailClient {
                 "body": full.get("snippet").cloned().unwrap_or(json!("")),
             }));
         }
-        Ok(json!({ "messages": out, "truncated": truncated }))
+        // AF-704: `page_token` here is whatever the loop's LAST list_ids call
+        // returned — None once Gmail has no more pages, Some(...) exactly
+        // when `truncated` is also true. Publishing it beside `truncated`
+        // gives a caller the one thing needed to walk a window in slices
+        // instead of hitting the same 500-cap on every retry.
+        Ok(json!({ "messages": out, "truncated": truncated, "next_page_token": page_token }))
     }
 
     /// Python `_gmail_latest_matching`: resolve "the latest message
@@ -1794,6 +1943,47 @@ pub fn email_log(home: &Path, mut record: Value) {
 /// Read the ledger (GET /api/email/log): `days` window, `limit` cap,
 /// optional session filter (`unattributed` matches records sent without the
 /// header). Response shape identical to Python.
+/// Did this row's email actually DEPART? (AF-538)
+///
+/// The ledger records an attempt and a departure in the same stream, and until
+/// now the ONLY thing separating them was the ABSENCE of a `blocked` key. That
+/// is the one shape a defensive reader never probes: `row.get("blocked")` on a
+/// departed row returns None, correctly, and `row.get("delivered")` returned
+/// None on BOTH, so nobody reached for it. Four consumers across three lanes got
+/// it wrong independently, and one of them recorded a lead as contacted who had
+/// received nothing.
+///
+/// DERIVED AT READ TIME, deliberately, and this is the whole design. A field
+/// stamped at write time would be absent on every historical row, and absent is
+/// falsy, so the entire backlog would read as NOT delivered — the exact
+/// inversion, silently, on the population nobody checks (gtm-ticker's point, and
+/// it is the difference between the fix and the same bug one layer down).
+///
+/// Measured over the live store, 500 rows / 90 days, the four arms partition it
+/// exactly: 382 departed, 18 approved-then-departed, 63 parked, 37 rejected, and
+/// ZERO carrying none of the discriminators. The `unknown` arm has never fired;
+/// it exists so that if it ever does, the count in the envelope says so rather
+/// than the row quietly reading as not-delivered.
+pub fn row_delivered(rec: &Value) -> (bool, &'static str) {
+    // A refusal writes `via: "refused"` AND `refused: true`, so it has a `via`
+    // and must be checked BEFORE the via arm or it reads as a departure.
+    if rec.get("refused").and_then(Value::as_bool) == Some(true)
+        || rec.get("via").and_then(Value::as_str) == Some("refused")
+    {
+        return (false, "refused");
+    }
+    if rec.get("rejected").and_then(Value::as_bool) == Some(true) {
+        return (false, "rejected");
+    }
+    if rec.get("blocked").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+        return (false, "parked");
+    }
+    match rec.get("via").and_then(Value::as_str) {
+        Some(v) if !v.trim().is_empty() => (true, "departed"),
+        _ => (false, "unknown"),
+    }
+}
+
 pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str) -> Value {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -1816,8 +2006,40 @@ pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str
             out.push(rec);
         }
     }
-    let keep: Vec<Value> = out.iter().rev().take(limit).cloned().collect();
-    json!({ "count": keep.len(), "days": days, "log": keep })
+    let total = out.len();
+    let mut keep: Vec<Value> = out.iter().rev().take(limit).cloned().collect();
+    // Every row carries the verdict, on BOTH shapes, so a naive read is right by
+    // default and a wrong one is a missing key rather than a silent None.
+    let mut undetermined = 0usize;
+    let mut departed = 0usize;
+    for rec in &mut keep {
+        let (ok, why) = row_delivered(rec);
+        if why == "unknown" {
+            undetermined += 1;
+        }
+        if ok {
+            departed += 1;
+        }
+        rec["delivered"] = json!(ok);
+        rec["delivered_reason"] = json!(why);
+    }
+    json!({
+        "count": keep.len(),
+        "days": days,
+        // AF-538 constraint 7: 500 is a HARD CAP, not a default, and `count`
+        // agreed with the truncation — so the number confirmed the wrong answer
+        // and the only way to find the ceiling was to ask twice and notice it
+        // stopped moving. In the BODY, not a header: every consumer of this
+        // endpoint pipes the body into python, where a header cannot reach them.
+        "total": total,
+        "truncated": total > keep.len(),
+        "delivered_count": departed,
+        // Has never been non-zero. If it is, the derivation has met a row shape
+        // it cannot classify, and that must be visible beside the answer rather
+        // than collapsing into `delivered: false`.
+        "undetermined": undetermined,
+        "log": keep,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1827,6 +2049,106 @@ pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AF-538. The four arms measured over the live store, 500 rows / 90 days:
+    /// 382 departed, 18 approved-then-departed, 63 parked, 37 rejected, ZERO
+    /// with no discriminator. Each arm is asserted, because a rule that only
+    /// ever sees one shape is not a rule.
+    #[test]
+    fn every_ledger_row_shape_gets_a_delivery_verdict() {
+        // Departure: the 310-row shape.
+        let dep = json!({"via":"gmail","thread_id":"t","body_chars":42,"endpoint":"send"});
+        assert_eq!(row_delivered(&dep), (true, "departed"));
+
+        // Approved, then departed: carries approval_id AND via. Must NOT be
+        // read as a park just because an approval was involved.
+        let app = json!({"via":"gmail","approved":true,"approval_id":"apr_1","thread_id":"t"});
+        assert_eq!(row_delivered(&app), (true, "departed"));
+
+        // Park: the shape that four consumers read as a send.
+        let park = json!({"blocked":"approval_required","approval_id":"apr_1","endpoint":"send"});
+        assert_eq!(row_delivered(&park), (false, "parked"));
+
+        // Rejected by a human: no via, no blocked.
+        let rej = json!({"rejected":true,"rejected_by":"dashboard","approval_id":"apr_1"});
+        assert_eq!(row_delivered(&rej), (false, "rejected"));
+    }
+
+    /// A refusal carries `via: "refused"` AND `refused: true`, so it HAS a via
+    /// and reads as a departure if the via arm runs first. Ordering, asserted.
+    #[test]
+    fn a_refusal_is_not_a_departure_even_though_it_carries_a_via() {
+        let by_flag = json!({"via":"refused","refused":true,"endpoint":"send"});
+        assert_eq!(row_delivered(&by_flag), (false, "refused"));
+        // Either marker alone is enough; neither is load-bearing on the other.
+        assert_eq!(row_delivered(&json!({"via":"refused"})), (false, "refused"));
+        assert_eq!(
+            row_delivered(&json!({"refused":true,"via":"gmail"})),
+            (false, "refused"),
+            "the explicit flag must win over a via that says otherwise"
+        );
+    }
+
+    /// The arm that has never fired. It must NOT collapse into a plain
+    /// `delivered: false`, because that is indistinguishable from a real park
+    /// and is the direction that loses information silently (ethos rule 4).
+    #[test]
+    fn a_row_with_no_discriminator_is_unknown_and_not_quietly_undelivered() {
+        let (ok, why) = row_delivered(&json!({"endpoint":"send","ts":"2026-01-01"}));
+        assert!(!ok);
+        assert_eq!(why, "unknown", "an unclassifiable row must say so, not read as parked");
+        // An empty via is not a departure either.
+        assert_eq!(row_delivered(&json!({"via":"  "})), (false, "unknown"));
+        // ...and a blank `blocked` is not a park.
+        assert_eq!(row_delivered(&json!({"blocked":"","via":"gmail"})), (true, "departed"));
+    }
+
+    /// The envelope must disclose its own truncation. 500 is a HARD CAP and
+    /// `count` agreed with it, so the number confirmed the wrong answer.
+    #[test]
+    fn the_envelope_says_when_it_truncated_and_how_many_it_had() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let mut lines = String::new();
+        // A MIX, deliberately. A fixture of departures only lets `delivered = true`
+        // and `reason = "departed"` be hardcoded and still pass — measured: both
+        // mutations survived until this fixture stopped being uniform.
+        for i in 0..7 {
+            lines.push_str(&format!(
+                "{}
+",
+                json!({"ts": now, "via":"gmail", "session":"s", "id": i})
+            ));
+        }
+        for i in 7..10 {
+            lines.push_str(&format!(
+                "{}
+",
+                json!({"ts": now, "blocked":"approval_required", "session":"s", "id": i})
+            ));
+        }
+        std::fs::write(email_log_path(dir.path()), lines).unwrap();
+
+        let all = read_email_log(dir.path(), 7, 100, "");
+        assert_eq!(all["total"], json!(10));
+        assert_eq!(all["truncated"], json!(false), "not truncated when the limit is not reached");
+        assert_eq!(all["delivered_count"], json!(7), "3 of the 10 are parks, not sends");
+        let parked = all["log"].as_array().unwrap().iter()
+            .filter(|r| r["delivered"] == json!(false)).count();
+        assert_eq!(parked, 3, "each park carries its OWN delivered:false, not just a count");
+        assert_eq!(all["undetermined"], json!(0));
+
+        let cut = read_email_log(dir.path(), 7, 3, "");
+        assert_eq!(cut["count"], json!(3));
+        assert_eq!(cut["total"], json!(10), "total must survive the limit, or truncation is invisible");
+        assert_eq!(cut["truncated"], json!(true));
+        // And every returned row carries the verdict, not just the envelope.
+        for r in cut["log"].as_array().unwrap() {
+            assert_eq!(r["delivered"], json!(false), "newest-first, so a limit of 3 returns the parks");
+            assert_eq!(r["delivered_reason"], json!("parked"));
+        }
+    }
 
     /// AMUX-3203 / amux-cloud 2026-08-16: the alert email picked the FIRST-
     /// ALPHABETICAL account, whose refresh_token was dead, while a fresh account
@@ -2359,6 +2681,110 @@ mod tests {
         dir
     }
 
+    /// AF-117. Google MAY return a new `refresh_token` on a refresh, and doing
+    /// so invalidates the one you presented. Persisting the old one means the
+    /// NEXT refresh presents a dead credential, fails `invalid_grant`, and the
+    /// account needs a human in a browser. That is the recorded failure on
+    /// hello@amux.io: every /api/email/* call for it 502ing on exactly that
+    /// error.
+    #[tokio::test]
+    async fn a_rotated_refresh_token_is_persisted_instead_of_the_one_we_sent() {
+        let home = temp_home_with_token("acct@example.com", false);
+        let http = MockHttp::new(vec![
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                200,
+                json!({ "access_token": "FRESH", "refresh_token": "ROTATED_RT", "expires_in": 3599 }),
+            ),
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+        ]);
+        let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+        let _ = client.get_signature("acct@example.com").await;
+
+        // We must have PRESENTED the stored one...
+        let calls = http.calls.lock().unwrap();
+        let form = calls[0].2.as_ref().unwrap();
+        assert_eq!(form["refresh_token"], json!("PLACEHOLDER_REFRESH"));
+        drop(calls);
+
+        // ...and PERSISTED the rotated one. Writing back what we sent is the bug.
+        let persisted: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.path().join("gmail-tokens").join("acct@example.com.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["refresh_token"],
+            json!("ROTATED_RT"),
+            "the rotated token must survive, or the next refresh presents a dead one: {persisted}"
+        );
+        assert_eq!(persisted["token"], json!("FRESH"));
+    }
+
+    /// The other direction, and it is the one a careless fix breaks: Google
+    /// OMITS `refresh_token` from most refresh responses. Treating absent as
+    /// empty would delete a working credential on every single refresh — a
+    /// worse bug than the one being fixed, and it would look like the account
+    /// spontaneously disconnecting.
+    #[tokio::test]
+    async fn an_absent_refresh_token_keeps_the_stored_one_rather_than_clearing_it() {
+        for resp in [
+            json!({ "access_token": "FRESH", "expires_in": 3599 }),
+            json!({ "access_token": "FRESH", "refresh_token": "", "expires_in": 3599 }),
+            json!({ "access_token": "FRESH", "refresh_token": "   ", "expires_in": 3599 }),
+        ] {
+            let home = temp_home_with_token("acct@example.com", false);
+            let http = MockHttp::new(vec![
+                ("FORM", "oauth2.googleapis.com/token", 200, resp.clone()),
+                ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ]);
+            let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+            let _ = client.get_signature("acct@example.com").await;
+            let persisted: Value = serde_json::from_str(
+                &std::fs::read_to_string(
+                    home.path().join("gmail-tokens").join("acct@example.com.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted["refresh_token"],
+                json!("PLACEHOLDER_REFRESH"),
+                "absent/blank must KEEP the stored credential, not clear it. response={resp}"
+            );
+        }
+    }
+
+    /// The token file is the only copy of the refresh token and both servers
+    /// read it. `fs::write` opens O_TRUNC, so an interrupted write leaves it
+    /// short — and this box's auto-builder restarts the server on every landed
+    /// commit. `rename(2)` means a reader sees the old bytes or the new ones.
+    #[test]
+    fn the_token_file_is_replaced_atomically_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("acct@example.com.json");
+
+        // Creates the directory it needs.
+        GmailClient::write_token_file_atomically(&path, r#"{"token":"one"}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"token":"one"}"#);
+
+        // Replaces without leaving the sibling temp file behind — a stray
+        // `.acct@example.com.json.tmp` holding a refresh token would be a
+        // credential copy nobody knows about.
+        GmailClient::write_token_file_atomically(&path, r#"{"token":"two"}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"token":"two"}"#);
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
     #[tokio::test]
     async fn token_refresh_posts_correct_form_and_persists() {
         let home = temp_home_with_token("acct@example.com", false);
@@ -2556,9 +2982,12 @@ mod tests {
             ("GET", "/messages/g2", 200, meta("g2", "<m2@x>")),
         ]);
         let client = GmailClient::new(http.clone(), home.path().to_path_buf());
-        let res = client.inbox_messages("acct@example.com", 2, "", 3.0).await.unwrap();
+        let res = client.inbox_messages("acct@example.com", 2, "", 3.0, None).await.unwrap();
         // Window held more than the cap: a caller can tell 0 from capped.
         assert_eq!(res["truncated"], json!(true));
+        // AF-704: the cursor to resume past the cap rides beside `truncated`,
+        // not just a bare boolean saying more exists with no way to get it.
+        assert_eq!(res["next_page_token"], json!("more"));
         let msgs = res["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["message_id"], json!("<m1@x>"));
@@ -2569,6 +2998,45 @@ mod tests {
         let calls = http.calls.lock().unwrap();
         let url = &calls.iter().find(|(m, u, _)| m == "GET" && u.contains("/messages?q=")).unwrap().1;
         assert!(url.contains(&urlencode("in:inbox after:")[..20]), "{url}");
+    }
+
+    /// AF-704: `resume_from` must reach Gmail's own `pageToken` param, and the
+    /// NEW cursor Gmail hands back for the page after that must come back out
+    /// — this is the whole mechanism a caller needs to walk a window in
+    /// slices instead of re-hitting the same capped page on every retry.
+    #[tokio::test]
+    async fn inbox_messages_resumes_from_a_prior_page_token_and_reports_the_next_one() {
+        let home = temp_home_with_token("acct@example.com", true);
+        let meta = |mid: &str, msgid: &str| {
+            json!({
+                "id": mid, "threadId": "T", "snippet": "snip", "labelIds": ["INBOX"],
+                "payload": { "headers": [
+                    { "name": "From", "value": "a@ext.com" },
+                    { "name": "To", "value": "acct@example.com" },
+                    { "name": "Subject", "value": "s" },
+                    { "name": "Date", "value": "Sun, 09 Aug 2026 10:00:00 -0400" },
+                    { "name": "Message-ID", "value": msgid },
+                ]},
+            })
+        };
+        let http = MockHttp::new(vec![
+            // Matched on the pageToken alone: proves resume_from reached the
+            // real request rather than a fresh, tokenless one.
+            ("GET", "pageToken=resume-tok-1", 200, json!({
+                "messages": [{ "id": "g3" }],
+                "nextPageToken": "resume-tok-2",
+            })),
+            ("GET", "/messages/g3", 200, meta("g3", "<m3@x>")),
+        ]);
+        let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+        let res = client
+            .inbox_messages("acct@example.com", 1, "in:inbox", 0.0, Some("resume-tok-1"))
+            .await
+            .unwrap();
+        assert_eq!(res["next_page_token"], json!("resume-tok-2"), "{res}");
+        let msgs = res["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["message_id"], json!("<m3@x>"));
     }
 
     /// AMUX-3495 — a 429 must RETRY, not silently drop the message. The
@@ -2595,7 +3063,7 @@ mod tests {
             ("GET", "/messages/g1", 200, meta),
         ]);
         let client = GmailClient::new(http.clone(), home.path().to_path_buf());
-        let res = client.inbox_messages("acct@example.com", 1, "", 3.0).await.unwrap();
+        let res = client.inbox_messages("acct@example.com", 1, "", 3.0, None).await.unwrap();
         let msgs = res["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1, "the 429'd message must be retried into the response");
         assert_eq!(msgs[0]["message_id"], json!("<m1@x>"));
@@ -2656,7 +3124,7 @@ mod tests {
             ("GET", "/messages/g7", 200, meta7),
         ]);
         let client = GmailClient::new(http.clone(), home.path().to_path_buf());
-        let res = client.inbox_messages("acct@example.com", n, "", 3.0).await.unwrap();
+        let res = client.inbox_messages("acct@example.com", n, "", 3.0, None).await.unwrap();
         let msgs = res["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), n, "batch + hole-fallback must deliver every message");
         assert_eq!(msgs[7]["message_id"], json!("<m7@x>"), "the hole came via fallback, in place");
@@ -2685,7 +3153,7 @@ mod tests {
             ("GET", "/messages/g2", 200, meta),
         ]);
         let client = GmailClient::new(http.clone(), home.path().to_path_buf());
-        let res = client.inbox_messages("acct@example.com", 2, "", 3.0).await.unwrap();
+        let res = client.inbox_messages("acct@example.com", 2, "", 3.0, None).await.unwrap();
         let msgs = res["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1, "g2 must survive g1's sustained quota failure");
         assert_eq!(msgs[0]["message_id"], json!("<m2@x>"));
@@ -2767,5 +3235,86 @@ mod tests {
         std::fs::write(tokens.join("notes.txt"), "").unwrap();
         assert_eq!(connected_accounts_in(dir.path()), vec!["a@x.com", "b@x.com"]);
         assert!(connected_accounts_in(&dir.path().join("missing")).is_empty());
+    }
+}
+
+/// AMUX-4833: the quota backoff must fire on the shape Gmail actually sends.
+#[cfg(test)]
+mod gmail_rate_limit_tests {
+    use super::*;
+
+    fn real_body() -> Value {
+        serde_json::json!({"error":{"code":403,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"googleapis.com","metadata":{"quota_limit":"defaultPerMinutePerUser","quota_limit_value":"15000","quota_metric":"gmail.googleapis.com/default"},"reason":"RATE_LIMIT_EXCEEDED"}],"errors":[{"domain":"usageLimits","message":"Quota exceeded for quota metric 'Queries'"}]}})
+    }
+
+    /// THE DEFECT THIS FIXES. The retry loop was written for quota pushback and
+    /// matched only 429/503, but Gmail answers rate limiting with HTTP 403 and
+    /// puts the reason in the body. So the backoff that exists to absorb a
+    /// transient limit never fired on the form the API actually uses.
+    #[test]
+    fn gmails_403_rate_limit_is_recognised() {
+        assert!(GmailClient::gmail_rate_limited(403, &real_body()));
+    }
+
+    /// Both spellings Google uses, and the lowerCamel variants from the older
+    /// error format.
+    #[test]
+    fn every_spelling_google_uses_counts() {
+        for reason in ["RATE_LIMIT_EXCEEDED", "rateLimitExceeded", "userRateLimitExceeded"] {
+            let b = serde_json::json!({"error":{"details":[{"reason":reason}]}});
+            assert!(GmailClient::gmail_rate_limited(403, &b), "reason {reason} must count");
+        }
+        // The legacy shape carries no `details`, only `errors[].domain`.
+        let legacy = serde_json::json!({"error":{"errors":[{"domain":"usageLimits","message":"Quota exceeded"}]}});
+        assert!(GmailClient::gmail_rate_limited(403, &legacy));
+    }
+
+    /// STRUCTURE, NOT SUBSTRING. A genuine fault whose text merely mentions a
+    /// quota must not be retried as one; that is the same reasoning
+    /// `oauth_refusal_code` gives for parsing instead of searching.
+    #[test]
+    fn a_fault_that_merely_mentions_a_quota_is_not_a_quota_refusal() {
+        let b = serde_json::json!({"error":{"code":500,"message":"RATE_LIMIT_EXCEEDED usageLimits appeared in a log line"}});
+        assert!(!GmailClient::gmail_rate_limited(500, &b));
+        assert!(!GmailClient::gmail_rate_limited(403, &b), "403 alone is not a rate limit");
+    }
+
+    /// A 403 is ALSO how Gmail says "forbidden". Permission failures must keep
+    /// failing fast instead of burning three backoffs on something that will
+    /// never succeed.
+    #[test]
+    fn an_ordinary_403_is_not_retried() {
+        let forbidden = serde_json::json!({"error":{"code":403,"errors":[{"domain":"global","reason":"forbidden"}],"message":"Insufficient Permission"}});
+        assert!(
+            !GmailClient::gmail_rate_limited(403, &forbidden),
+            "a permission failure is permanent; retrying it wastes the caller's time"
+        );
+    }
+
+    /// The status gate: a 200 carrying quota-shaped JSON is not a refusal.
+    #[test]
+    fn only_403_and_429_can_be_rate_limits() {
+        assert!(!GmailClient::gmail_rate_limited(200, &real_body()));
+        assert!(!GmailClient::gmail_rate_limited(500, &real_body()));
+        assert!(GmailClient::gmail_rate_limited(429, &real_body()));
+    }
+
+    /// THE SHIPPED RETRY DECISION, driven directly. The `api()` loop calls this
+    /// exact function, so dropping the 403 arm reddens here. A predicate-only
+    /// test could not: it never touches the call site where the defect lived.
+    #[test]
+    fn the_retry_decision_covers_gmails_403_and_still_gives_up() {
+        let quota = real_body();
+        assert!(GmailClient::should_retry_upstream(403, &quota, 0), "the original defect");
+        assert!(GmailClient::should_retry_upstream(429, &quota, 0));
+        assert!(GmailClient::should_retry_upstream(503, &serde_json::Value::Null, 0));
+        // A sustained limit must still stop: three backoffs, then error.
+        assert!(
+            !GmailClient::should_retry_upstream(403, &quota, 3),
+            "attempt 3 is the last; retrying forever would hide a sustained quota"
+        );
+        // And a permission 403 fails fast rather than burning the backoffs.
+        let forbidden = serde_json::json!({"error":{"code":403,"errors":[{"domain":"global","reason":"forbidden"}]}});
+        assert!(!GmailClient::should_retry_upstream(403, &forbidden, 0));
     }
 }

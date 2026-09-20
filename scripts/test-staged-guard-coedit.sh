@@ -16,7 +16,7 @@
 # hollowed out, which is the failure this whole file family exists to prevent.
 #
 # Runs the SHIPPED loop body against a real git fixture, not a paraphrase.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${STAGED_GUARD_HOOK:-$(pwd)/scripts/git-hooks/amux-staged-guard}"
 PASS=0; FAIL=0
@@ -27,6 +27,12 @@ TMP="$(mktemp -d)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0=main
+
+# AMUX-3954: same path `run_case` points MIRROR_NOTICE_LOG at. Cleared up
+# front so the LAST line after any one run_case call is that call's own row,
+# with nothing to clean up between cells.
+LEDGER="${TMPDIR:-/tmp}/test-mirror-notices.jsonl"
+rm -f "$LEDGER"
 
 echo "== staged-guard co-edit corroboration cells =="
 
@@ -39,9 +45,9 @@ git init -q "$TMP/r"
   git add settled.txt dirty.txt; git commit -qm base
   printf 'uncommitted edit\n' >> dirty.txt ) >/dev/null 2>&1
 
-run_case() { # $1 = python dict for one shared-file entry
-  python3 - "$HOOK" "$TMP/r" "$1" <<'PY' 2>&1
-import io, os, subprocess, sys, ast
+run_case() { # $1 = python dict for one shared-file entry, $2 = STAGED_LARGE_LINES (optional)
+  python3 - "$HOOK" "$TMP/r" "$1" "${2:-200}" <<'PY' 2>&1
+import io, json, os, subprocess, sys, time, ast
 src = open(sys.argv[1]).read()
 os.chdir(sys.argv[2])
 # Take the SHIPPED helper and the SHIPPED loop body, never a retyped copy.
@@ -51,12 +57,30 @@ os.chdir(sys.argv[2])
 h0 = src.index("def _never_wrote(path, session):")
 h1 = src.index("\n\n", src.index("        return None, \"the check errored\""))
 helper = src[h0:h1]
+# AMUX-3954: same rule applies to the ledger call the loop body now makes.
+# Extracted rather than stubbed, so a change to its signature breaks THIS test
+# instead of silently exec'ing a paraphrase.
+n0 = src.index("def _record_mirror_notice(")
+n1 = src.index("\ndef _derive_session_from_tmux")
+notice_helper = src[n0:n1]
 b0 = src.index('    for f in (d.get("shared") or []):')
 b1 = src.index("    # PRE-COMMIT MISATTRIBUTES A PEER'S WRITE TO AN INNOCENT HOOK")
 body = "\n".join(l[4:] if l.startswith("    ") else l for l in src[b0:b1].splitlines())
 buf = io.StringIO()
-g = {"subprocess": subprocess, "w": buf.write, "d": {"shared": [ast.literal_eval(sys.argv[3])]}}
+g = {
+    "subprocess": subprocess, "json": json, "time": time, "w": buf.write,
+    "d": {"shared": [ast.literal_eval(sys.argv[3])]},
+    # `sess` is a `main()` local the loop body closes over; the extraction
+    # runs at module scope, so it needs a stand-in like the others below.
+    "sess": "test-session",
+    # Real names the extracted call site reads as globals, kept out of the
+    # asserted output by pointing the ledger at a path this test owns.
+    "MIRROR_NOTICE_LOG": os.path.join(os.environ.get("TMPDIR", "/tmp"), "test-mirror-notices.jsonl"),
+    "GUARD_VERSION": 0,
+    "STAGED_LARGE_LINES": int(sys.argv[4]) if len(sys.argv) > 4 else 200,
+}
 exec(helper, g)
+exec(notice_helper, g)
 exec(body, g)
 sys.stdout.write(buf.getvalue())
 PY
@@ -70,6 +94,13 @@ if printf '%s' "$out" | grep -q "settled.txt"; then ok "(a) the file is still NA
 else bad "(a) the downgraded line must still name the file" "$out"; fi
 if printf '%s' "$out" | grep -q "git apply --cached"; then bad "(a) the eight-line remedy must not print for a dispute that does not exist" "$out"
 else ok "(a) the remedy block is gone, which is the cost being removed"; fi
+# AMUX-3954: the downgrade is LOGGED, not just printed — that is the whole
+# point of the ledger (measuring how often a fired claim would have been
+# right requires keeping the downgraded ones too).
+row=$(tail -1 "$LEDGER" 2>/dev/null || true)
+if printf '%s' "$row" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['disposition']=='downgraded' and d['path']=='settled.txt' and d['owner']=='peer'" 2>/dev/null
+then ok "(a) the downgrade is recorded in the mirror-notice ledger"
+else bad "(a) expected a downgraded ledger row for settled.txt/peer" "$row"; fi
 
 # (b) CONTROL, the one that stops this being a hollowing-out: REAL uncommitted
 #     content still prints the full warning even though the claim is mtime-derived.
@@ -79,16 +110,72 @@ else bad "(b) the full warning must survive when content IS in dispute" "$out"; 
 if printf '%s' "$out" | grep -q "UNCORROBORATED co-edit claim"; then bad "(b) must not downgrade a file that has uncommitted content" "$out"
 else ok "(b) no downgrade when there is something to dispute"; fi
 
+# -- AF-929: `has_unstaged_changes` is empty for a pathspec commit -----------
+#
+# `git commit <path>` stages the pathspec's own current working-tree bytes
+# into git's throwaway commit-time index before this hook ever runs, so
+# `git diff` (unstaged) for that exact path is empty by construction --
+# confirmed empirically in a scratch repo, 2026-09-18. The two cells below
+# use a false `has_unstaged_changes` throughout (the value that field would
+# actually carry for a real pathspec-commit sweep) and vary only the STAGED
+# size, which is reachable in both commit shapes.
+( cd "$TMP/r"
+  printf 'base\n' > big.txt; printf 'base\n' > small.txt
+  git add big.txt small.txt; git commit -qm base2
+  seq 1 250 > big.txt; git add big.txt
+  printf 'base\nedit\n' > small.txt; git add small.txt ) >/dev/null 2>&1
+
+# (f) THE FIX: a large staged sweep on a shared path escalates to WARNING even
+#     though `has_unstaged_changes` is false, using the STAGED_LARGE_LINES=200
+#     default -- 250 new lines against a 1-line base clears it comfortably.
+out=$(run_case "{'path':'big.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}")
+if printf '%s' "$out" | grep -q "amux staged-guard: WARNING"; then ok "(f) a large pathspec-commit sweep escalates to WARNING via staged size alone"
+else bad "(f) expected WARNING from the staged-size fallback" "$out"; fi
+
+# (g) CONTROL: the fallback has a real threshold. A small, ordinary staged
+#     edit on a shared path must stay NOTE, or (f) would just mean "shared
+#     always warns" and the size check would be theater.
+out=$(run_case "{'path':'small.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}")
+if printf '%s' "$out" | grep -q "amux staged-guard: NOTE"; then ok "(g) an ordinary small staged edit stays NOTE, not WARNING"
+else bad "(g) the staged-size fallback must not fire below its threshold" "$out"; fi
+
+# (h) DISCRIMINATING MUTATION CONTROL: the same large sweep against a
+#     threshold ABOVE its own staged size must NOT fire. This is the cell that
+#     proves (f) is testing the boundary and not just "shared is always
+#     WARNING" -- big.txt's real numstat is 250 insertions / 1 deletion = 251
+#     (measured directly with `git diff --cached --numstat`), so 300 must miss.
+out=$(run_case "{'path':'big.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}" 300)
+if printf '%s' "$out" | grep -q "amux staged-guard: NOTE"; then ok "(h) raising the threshold above the fixture's own size reverts it to NOTE"
+else bad "(h) the threshold must be a real comparison, not always-true" "$out"; fi
+
 # (c) CONTROL: a transcript-backed claim on BOTH sides is not the weak claim and
 #     must never be downgraded, even on settled content.
 out=$(run_case "{'path':'settled.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript','their_provenance':'transcript'}")
 if printf '%s' "$out" | grep -q "UNCORROBORATED co-edit claim"; then bad "(c) a two-sided transcript claim is not mtime-derived and must stand" "$out"
 else ok "(c) only an mtime-derived claim is eligible for downgrade"; fi
+# AMUX-3954: a claim that FIRED (named a peer in full) is logged too, with the
+# opposite disposition from (a) — the ledger has to carry both to be useful.
+row=$(tail -1 "$LEDGER" 2>/dev/null || true)
+if printf '%s' "$row" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['disposition']=='fired' and d['path']=='settled.txt' and d['owner']=='peer'" 2>/dev/null
+then ok "(c) a fired claim is recorded in the mirror-notice ledger too"
+else bad "(c) expected a fired ledger row for settled.txt/peer" "$row"; fi
 
 # (d) An unknown path: the check cannot run, and that must not read as settled.
 out=$(run_case "{'path':'no-such-file.txt','owner':'peer','peer':True,'age_secs':600,'has_unstaged_changes':True,'mine_provenance':'observed','their_provenance':'transcript'}")
 if printf '%s' "$out" | grep -q "UNCORROBORATED co-edit claim"; then bad "(d) an unrunnable check must not be reported as 'nothing in dispute'" "$out"
 else ok "(d) a check that could not run leaves the warning standing"; fi
+
+# (e) NO PEER NAMED: this is YOUR OWN dirty file, not a co-edit claim. Must
+# print the solo form and must NOT add a mirror-notice row — there is no
+# co-editor to have a claim about. Distinguishes the ledger from "log every
+# shared-loop iteration", which would make it noise instead of a claim record.
+before=$(tail -1 "$LEDGER" 2>/dev/null || true)
+out=$(run_case "{'path':'settled.txt','owner':None,'peer':False,'age_secs':600,'has_unstaged_changes':False,'mine_provenance':'transcript'}")
+if printf '%s' "$out" | grep -q "is yours and has uncommitted changes"; then ok "(e) a solo dirty file prints the no-peer form"
+else bad "(e) expected the solo form with no peer named" "$out"; fi
+after=$(tail -1 "$LEDGER" 2>/dev/null || true)
+if [ "$before" = "$after" ]; then ok "(e) a solo entry with no peer adds nothing to the mirror-notice ledger"
+else bad "(e) a claim naming no co-editor must not become a ledger row" "$after"; fi
 
 # -- (t) READER vs WRITER: trailer history settles it (MC-1561) ---------------
 #

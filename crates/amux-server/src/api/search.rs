@@ -192,6 +192,40 @@ fn render_snippet(raw: &str) -> String {
         .replace(HL_CLOSE, "</mark>")
 }
 
+/// The entity types the index actually holds, ascending. Read from the DATA,
+/// not restated from the six INSERT sites below, so a newly-indexed family
+/// cannot make this list quietly wrong.
+///
+/// AF-547. `types=` filters `d.entity_type IN (...)`, so a value the index does
+/// not hold returns a clean 200 with zero hits — indistinguishable from "your
+/// query matched nothing". A caller filtering on a name they carried from
+/// another endpoint gets a confident empty answer, which on the approval-
+/// verification path reads as "no approval exists".
+///
+/// Phrased as NOT PRESENT rather than INVALID on purpose: a family with no rows
+/// yet (no journals written, say) is absent without the caller being wrong, and
+/// this cannot tell those apart. It reports what it can prove.
+fn types_in_index(conn: &Connection) -> Vec<String> {
+    conn.prepare("SELECT DISTINCT entity_type FROM search_docs ORDER BY 1")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0)).map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Which of `requested` the index does not hold. Extracted so the TEST CALLS
+/// THE SHIPPED CODE instead of recomputing the same expression beside it.
+///
+/// The first version of that test did recompute it, and a mutation that made
+/// the handler's filter never fire left the suite GREEN — the test could not
+/// see a change to the thing it was testing. ts-gke had described that exact
+/// shape an hour earlier, about the bug this card came from: "my control shared
+/// the defect with the measurement ... a control built from the same mistaken
+/// assumption as the measurement cannot fail."
+fn types_missing_from(requested: &[String], have: &[String]) -> Vec<String> {
+    requested.iter().filter(|t| !have.contains(t)).cloned().collect()
+}
+
 fn parse_types(raw: &Option<String>) -> Vec<String> {
     raw.as_deref()
         .map(|s| {
@@ -235,6 +269,24 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
         Ok(c) => c,
         Err(e) => return internal(e),
     };
+    // Only paid for when the caller actually filtered — a search with no
+    // `types=` cannot have an unknown one, and charging every request a DISTINCT
+    // for a question nobody asked is the arithmetic ethos rule 2 forbids.
+    let (available, not_in_index): (Vec<String>, Vec<String>) = if types.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let have = types_in_index(&conn);
+        let missing = types_missing_from(&types, &have);
+        (have, missing)
+    };
+    if !not_in_index.is_empty() {
+        tracing::warn!(
+            target: "amux::search",
+            requested = ?types, not_in_index = ?not_in_index, available = ?available,
+            "search filtered on entity type(s) the index does not hold — the zero is the filter, not the data"
+        );
+    }
+
     match run_search(&conn, &match_expr, &types, limit, offset) {
         Ok((hits, total, total_capped)) => {
             // A ZERO MUST SAY WHETHER THE MEASUREMENT RAN (TG-3303, ethos rule 4).
@@ -288,6 +340,13 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
                 // nothing to look through". Null means the count itself could
                 // not be taken, which is a third answer and not a zero.
                 "index_docs": indexed,
+                // AF-547: named BESIDE the answer, so a zero caused by the
+                // FILTER is distinguishable from a zero caused by the DATA.
+                // Empty on every ordinary query; non-empty only when the caller
+                // asked for a family the index does not hold, which is the one
+                // case where the count means nothing.
+                "types_not_in_index": not_in_index,
+                "types_available": available,
             }))
             .into_response()
         }
@@ -513,7 +572,13 @@ pub const BACKFILL_SQL: &[(&str, &str)] = &[
                 substr(replace(text, char(10), ' '), 1, 80), text,
                 session, card_id, session, '#history/'||id,
                 json_object('session', session, 'origin', origin, 'card_id', card_id),
-                ts
+                -- ts/1000: cmd_history.ts is MILLISECONDS and every other
+                -- family here contributes seconds (AMUX-4548). Without the
+                -- divide this column holds two units at once, and 0056 put
+                -- 1,910 such rows in it. Must stay in step with the
+                -- `search_prompt_ai` trigger in migration 0077, or a reindex
+                -- and a live insert disagree about the same document.
+                ts/1000
          FROM cmd_history WHERE type = 'user'",
     ),
     (
@@ -584,6 +649,200 @@ async fn reindex(State(st): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0077's REPAIR CLAUSE CONVERTS THE ROWS 0056 ALREADY WROTE, AND ONLY ONCE
+    /// (AMUX-4548).
+    ///
+    /// Written because the obvious coverage does not reach it. Every other cell
+    /// here runs against `test_memdb`, a fresh schema where no millisecond row
+    /// has ever existed, so deleting the repair entirely leaves them all green:
+    /// the clause is untestable from a fixture that has nothing to repair.
+    /// Measured, not assumed — mutating the UPDATE to `SELECT 1` passed 2 of 2
+    /// before this cell existed.
+    ///
+    /// So the fixture writes the damage first, straight into `search_docs` and
+    /// past the trigger, which is the shape the live database was actually in:
+    /// 1,910 millisecond rows among 21,465.
+    ///
+    /// The SQL comes from the migration file itself rather than a copy, so this
+    /// pins the bytes that ship.
+    #[test]
+    fn the_migration_repairs_already_written_millisecond_rows_and_is_idempotent() {
+        let conn = crate::db::migrate::test_memdb();
+        let ms: i64 = 1_789_559_556_000;
+        // Past the trigger deliberately: this is a row 0056 left behind, not
+        // one a fixed writer could produce.
+        conn.execute(
+            "INSERT INTO search_docs (doc_id, entity_type, entity_id, title, body, scope, \
+             task_id, worker_id, link, meta, updated_at) \
+             VALUES ('prompt:legacy', 'prompt', 'legacy', 't', 'b', 'amux', NULL, 'amux', \
+             '#history/legacy', '{}', ?1)",
+            [ms],
+        )
+        .expect("seed the damage");
+        // A seconds row of the same vintage, as the control: the repair must
+        // leave it alone, or it would divide the other six families too.
+        conn.execute(
+            "INSERT INTO search_docs (doc_id, entity_type, entity_id, title, body, scope, \
+             task_id, worker_id, link, meta, updated_at) \
+             VALUES ('task:control', 'task', 'control', 't', 'b', 'amux', 'control', NULL, \
+             '#board/control', '{}', ?1)",
+            [ms / 1000],
+        )
+        .unwrap();
+
+        let sql = include_str!("../../migrations/0077_search_docs_prompt_seconds.sql");
+        conn.execute_batch(sql).expect("0077 applies");
+        let after: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, ms / 1000, "the legacy millisecond row must be converted");
+
+        // IDEMPOTENT. The guard is on magnitude, so a second run must not
+        // divide again — a migration that re-runs on a repaired database would
+        // put these rows in 1970.
+        conn.execute_batch(sql).expect("0077 re-applies");
+        let twice: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(twice, after, "a second run must be a no-op, not a second division");
+
+        let control: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='task:control'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(control, ms / 1000, "a seconds row of another family must be untouched");
+    }
+
+    /// `search_docs.updated_at` HOLDS ONE UNIT, AND BOTH PROMPT WRITERS AGREE
+    /// (AMUX-4548).
+    ///
+    /// `cmd_history.ts` is milliseconds; every other source column feeding this
+    /// table is seconds. 0056 wired the prompt family straight through, so the
+    /// column held two units at once: measured on the live DB 2026-09-16, 1,910
+    /// of 21,465 rows were millisecond-shaped and `schema.timestamp_units_
+    /// declared` reported the column's MAX as 496,602,776 hours in the past.
+    ///
+    /// TWO WRITERS, ONE ASSERTION. The trigger is the live path and
+    /// `BACKFILL_SQL` is the reindex path, and nothing but a comment keeps them
+    /// in step. If they diverge, the same prompt has two different timestamps
+    /// depending on whether the index was rebuilt, which is worse than the
+    /// original bug and would show up as a puzzling inconsistency rather than
+    /// as an obviously wrong number. So this runs BOTH and requires them equal.
+    ///
+    /// Against the real migration chain, not a hand-made schema: the trigger
+    /// under test is created by a migration, and a fixture that builds its own
+    /// tables would not have it.
+    #[test]
+    fn a_prompt_is_indexed_in_seconds_by_the_trigger_and_by_the_backfill() {
+        let conn = crate::db::migrate::test_memdb();
+        let ms: i64 = 1_789_559_556_000;
+        let want: i64 = ms / 1000;
+        conn.execute(
+            "INSERT INTO cmd_history (id, text, type, session, ts, origin, card_id) \
+             VALUES (1, 'find the hubspot thread', 'user', 'amux', ?1, '', NULL)",
+            [ms],
+        )
+        .expect("insert a human prompt");
+
+        // 1. The TRIGGER path, which is what runs in production.
+        let via_trigger: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'", [], |r| r.get(0))
+            .expect("the trigger indexed it");
+        assert_eq!(
+            via_trigger, want,
+            "the trigger must store SECONDS; {via_trigger} is the raw millisecond value and puts \
+             this prompt tens of thousands of years from now"
+        );
+
+        // 2. The REINDEX path, over the same row.
+        conn.execute("DELETE FROM search_docs WHERE doc_id='prompt:1'", []).unwrap();
+        let sql = BACKFILL_SQL
+            .iter()
+            .find(|(etype, _)| *etype == "prompt")
+            .map(|(_, sql)| *sql)
+            .expect("the prompt family is in BACKFILL_SQL");
+        conn.execute(sql, []).expect("backfill runs");
+        let via_backfill: i64 = conn
+            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'", [], |r| r.get(0))
+            .expect("the backfill indexed it");
+        assert_eq!(
+            via_backfill, via_trigger,
+            "a reindex and a live insert must agree about the same document"
+        );
+
+        // 3. The column-level property the invariant actually checks: nothing
+        //    in it is millisecond-shaped. Asserted over the whole table rather
+        //    than the one row, because the defect was one family among seven.
+        let ms_shaped: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_docs WHERE updated_at > 100000000000", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ms_shaped, 0, "no row in search_docs.updated_at may be millisecond-shaped");
+    }
+
+    /// AF-547. A `types=` value the index does not hold returns a clean 200 with
+    /// zero hits, indistinguishable from "your query matched nothing". On the
+    /// approval-verification path that reads as "no approval exists".
+    ///
+    /// Built from a REAL index rather than a hand-made list, because the bug this
+    /// came from was a control that shared its defect with the measurement:
+    /// ts-gke counted `kind` values to prove `kind` held no prompts, when the
+    /// real question was whether `kind` EXISTED. A control that assumes what it
+    /// is testing cannot fail.
+    #[test]
+    fn a_type_the_index_does_not_hold_is_named_beside_the_zero() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE search_docs (doc_id TEXT, entity_type TEXT, entity_id TEXT,
+                 title TEXT, body TEXT, scope TEXT, task_id TEXT, worker_id TEXT,
+                 link TEXT, meta TEXT, updated_at INTEGER);
+             INSERT INTO search_docs (doc_id, entity_type) VALUES
+                 ('task:A-1','task'), ('prompt:1','prompt'), ('prompt:2','prompt');",
+        )
+        .expect("seed");
+
+        let have = types_in_index(&conn);
+        assert_eq!(have, vec!["prompt".to_string(), "task".to_string()], "read from the DATA, sorted");
+
+        // The reported shape: a family name carried from another endpoint.
+        let requested = vec!["kind".to_string()];
+        let missing = types_missing_from(&requested, &have);
+        assert_eq!(missing, vec!["kind".to_string()], "an absent family must be NAMED, not silently empty");
+
+        // CONTROL 1: a real family must NOT be reported missing. Without this the
+        // rule is satisfiable by flagging everything, which would put a false
+        // "not in index" on every correct query.
+        let ok = types_missing_from(&["prompt".to_string()], &have);
+        assert!(ok.is_empty(), "a family the index holds is not missing: {ok:?}");
+
+        // CONTROL 2: mixed — the real one passes, only the bogus one is named.
+        let req: Vec<String> = ["prompt", "kind", "task"].iter().map(|s| s.to_string()).collect();
+        let mixed = types_missing_from(&req, &have);
+        assert_eq!(mixed, vec!["kind".to_string()], "only the absent one: {mixed:?}");
+    }
+
+    /// An EMPTY index must report an empty vocabulary rather than crashing or
+    /// inventing one — and then every requested type reads as missing, which is
+    /// correct and is what the 503 zero-hit path above is for.
+    #[test]
+    fn an_empty_index_has_an_empty_vocabulary() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE search_docs (doc_id TEXT, entity_type TEXT);",
+        ).expect("seed");
+        assert!(types_in_index(&conn).is_empty());
+        // And a missing TABLE must not panic — the helper is called on every
+        // filtered search and an unreadable index is not a crash.
+        let bare = Connection::open_in_memory().expect("mem db");
+        assert!(types_in_index(&bare).is_empty(), "no table -> empty, not a panic");
+    }
 
     #[test]
     fn match_expr_quotes_everything_and_prefixes_the_last_term() {

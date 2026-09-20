@@ -60,6 +60,15 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/approve/{id}", post(approve))
         .route("/reject/{id}", post(reject))
         .route("/approvals", get(list_approvals))
+        // AF-540: the READ-ONLY half. `fate()` has always said the right thing —
+        // including "this approval EXPIRED unreleased (1h TTL)" — and was
+        // reachable ONLY as the error body of POST /approve/{id}, a mutation a
+        // worker is forbidden to make (creator-cannot-approve). So the one
+        // caller that needs the diagnosis could not ask for it without
+        // attempting something it is not allowed to do, and gtm/engine ended up
+        // reconstructing the answer from /approvals + /search?mailbox=sent
+        // (c06b5b8f91) — duplicating logic amux already had correct.
+        .route("/approval/{id}", get(approval_fate))
         // AMUX-3998: the ranked inbox + owner themes, nested here so they get the
         // same EmailCtx rather than opening a second client.
         .merge(super::email_intel::nested_routes())
@@ -128,6 +137,44 @@ fn email_err_with(e: &str, extra: Value) -> Response {
                             hard-expire after 7 — publish the OAuth app to Production (AMUX-3747).",
                 })),
             );
+        }
+    }
+    // A QUOTA REFUSAL IS UPSTREAM DECLINING, NOT AMUX FAILING (AMUX-4833).
+    // Exactly the AMUX-3809 reasoning one step over: that card changed a dead
+    // credential from 502 to 403 because "nothing in amux is broken". Nothing
+    // is broken here either — Gmail applied a per-minute quota and said so.
+    //
+    // The 502 was not only wrong to the caller, it was wrong to the 5xx
+    // detector, which is how this arrived as an automated fault card at all.
+    // 429 is the status that says "come back", and Retry-After says when: the
+    // exceeded quota is per MINUTE (quota_limit defaultPerMinutePerUser,
+    // window_start_time in the body), so the window turns over within 60s.
+    //
+    // REUSES integrations::email's predicate rather than restating it. This
+    // file's own OAuth comment says two spellings of "which codes are refusals"
+    // would drift, and that warning applies to quota codes identically.
+    if let Some(start) = e.find('{') {
+        if let Ok(body) = serde_json::from_str::<Value>(&e[start..]) {
+            let status = if e.contains("gmail api 429") { 429 } else { 403 };
+            if crate::integrations::email::GmailClient::gmail_rate_limited(status, &body) {
+                let mut r = err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    merge(json!({
+                        "error": e,
+                        "rate_limited": true,
+                        "fix": "Gmail applied a per-minute quota to this project, so the call \
+                                was declined rather than failing. Retry after the window turns \
+                                over. If it is sustained, the caller is issuing too many \
+                                Gmail requests per minute: check for a batch fallback expanding \
+                                one call into many single fetches (AMUX-4780).",
+                    })),
+                );
+                r.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("60"),
+                );
+                return r;
+            }
         }
     }
     err(StatusCode::BAD_GATEWAY, merge(json!({ "error": e })))
@@ -553,7 +600,8 @@ pub async fn send(
                     }),
                 );
                 Json(json!({
-                    "ok": true, "to": to, "subject": subject, "from": from_acct,
+                    "ok": true, "delivered": true, "delivered_reason": "departed",
+                    "to": to, "subject": subject, "from": from_acct,
                     "cc": if cc.is_empty() { Value::Null } else { json!(cc) },
                     "via": "gmail",
                     "id": res.get("id").cloned().unwrap_or(Value::Null),
@@ -626,7 +674,8 @@ pub async fn reply(
     }
     if dry_run {
         return Json(json!({
-            "ok": true, "dry_run": true, "would_reply_to": message_id,
+            "ok": true, "delivered": false, "delivered_reason": "dry_run",
+            "dry_run": true, "would_reply_to": message_id,
             "resolved": resolved,
             "note": "no email sent — repeat without dry_run to send",
         }))
@@ -732,7 +781,8 @@ pub async fn reply(
                     }),
                 );
                 Json(json!({
-                    "ok": true, "message_id": message_id, "reply_all": reply_all,
+                    "ok": true, "delivered": true, "delivered_reason": "departed",
+                    "message_id": message_id, "reply_all": reply_all,
                     "to": res.get("to").cloned().unwrap_or(Value::Null),
                     "subject": res.get("subject").cloned().unwrap_or(Value::Null),
                     "from": gmail_from, "via": "gmail",
@@ -758,6 +808,13 @@ fn approval_required_response(id: &str, preview: Value) -> Response {
         StatusCode::FORBIDDEN,
         Json(json!({
             "ok": false,
+            // AF-538. This shape carried `blocked`/`code` and NO `error`, so
+            // `if d.get("error")` waved a PARKED send through as a send —
+            // that is exactly how a parked founder email was appended to a
+            // SENT ledger. `delivered` is present on BOTH shapes so the naive
+            // read is right by default rather than reading an absent key.
+            "delivered": false,
+            "delivered_reason": "parked",
             "code": "approval_required",
             "approval_id": id,
             "preview": preview,
@@ -835,7 +892,8 @@ pub async fn reject(
             );
             (
                 StatusCode::OK,
-                Json(json!({ "ok": true, "rejected": true, "approval_id": id,
+                Json(json!({ "ok": true, "delivered": false,
+                    "delivered_reason": "rejected", "rejected": true, "approval_id": id,
                              "was_for_session": session })),
             )
                 .into_response()
@@ -1065,7 +1123,8 @@ pub async fn approve(
                 }),
             );
             Json(json!({
-                "ok": true, "approved": true, "approval_id": id,
+                "ok": true, "delivered": true, "delivered_reason": "departed",
+                "approved": true, "approval_id": id,
                 "sent_for_session": session,
                 "id": res.get("id").cloned().unwrap_or(Value::Null),
                 "thread_id": res.get("thread_id").cloned().unwrap_or(Value::Null),
@@ -1101,11 +1160,28 @@ pub async fn inbox(
         qs.get("envelope").map(String::as_str),
         Some("1") | Some("true") | Some("yes")
     );
-    let reply_shape = |msgs: Vec<Value>, truncated: bool| -> Response {
+    // AF-704: opaque Gmail cursor, only meaningful against the SAME account
+    // and query that produced it (see inbox_messages' own doc comment) — so
+    // it only makes sense paired with `account`, never against the unified,
+    // multi-account fan-out below.
+    let page_token = qs.get("page_token").cloned().filter(|s| !s.is_empty());
+    if page_token.is_some() && account_filter.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "page_token requires account",
+                "why": "the token is a single Gmail account's opaque cursor; the unified \
+                        inbox merges and re-sorts multiple accounts per call, so there is \
+                        no single cursor a combined page could resume from.",
+            }),
+        );
+    }
+    let reply_shape = |msgs: Vec<Value>, truncated: bool, next_page_token: Option<String>| -> Response {
         if envelope {
             Json(json!({
                 "messages": msgs, "returned": msgs.len(),
                 "truncated": truncated, "window_days": lookback_days,
+                "next_page_token": next_page_token,
             }))
             .into_response()
         } else {
@@ -1114,13 +1190,17 @@ pub async fn inbox(
     };
     let connected = ctx.client.connected_accounts();
     if !account_filter.is_empty() && connected.contains(&account_filter) {
-        let res = ctx.client.inbox_messages(&account_filter, count, "", lookback_days).await;
+        let res = ctx
+            .client
+            .inbox_messages(&account_filter, count, "", lookback_days, page_token.as_deref())
+            .await;
         report_outcome(&ctx.registry, &res.as_ref().map(|_| ()).map_err(Clone::clone));
         return match res {
             Err(e) => email_err(&e),
             Ok(v) => reply_shape(
                 v.get("messages").and_then(Value::as_array).cloned().unwrap_or_default(),
                 v.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+                v.get("next_page_token").and_then(Value::as_str).map(String::from),
             ),
         };
     }
@@ -1133,7 +1213,7 @@ pub async fn inbox(
             async move {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(20),
-                    client.inbox_messages(&a, count, "", lookback_days),
+                    client.inbox_messages(&a, count, "", lookback_days, None),
                 )
                 .await
                 .ok()
@@ -1162,7 +1242,7 @@ pub async fn inbox(
             any_trunc = true;
         }
         msgs.truncate(count);
-        return reply_shape(msgs, any_trunc);
+        return reply_shape(msgs, any_trunc, None);
     }
     applescript_not_ported(&account_filter)
 }
@@ -1360,7 +1440,7 @@ pub async fn search(
 
     let connected = ctx.client.connected_accounts();
     if !account.is_empty() && connected.contains(&account) {
-        let res = ctx.client.inbox_messages(&account, limit, &gq, 0.0).await;
+        let res = ctx.client.inbox_messages(&account, limit, &gq, 0.0, None).await;
         report_outcome(&ctx.registry, &res.as_ref().map(|_| ()).map_err(Clone::clone));
         return match res {
             Err(e) => email_err(&e),
@@ -1371,7 +1451,7 @@ pub async fn search(
         let futs = connected.iter().map(|a| {
             let client = ctx.client.clone();
             let (a, gq) = (a.clone(), gq.clone());
-            async move { client.inbox_messages(&a, limit, &gq, 0.0).await.ok() }
+            async move { client.inbox_messages(&a, limit, &gq, 0.0, None).await.ok() }
         });
         let results = futures::future::join_all(futs).await;
         let mut merged: Vec<Value> = Vec::new();
@@ -1388,6 +1468,70 @@ pub async fn search(
     }
     applescript_not_ported(&account)
 }
+
+/// GET /api/email/approval/{id} — what became of this approval (AF-540).
+///
+/// A pure read. It answers for a PENDING id, an approved one, a rejected one,
+/// an expired one, and an id nothing has ever heard of — because the caller
+/// asking is usually a scheduled one that woke up to find its draft gone, and
+/// "expired" and "never existed" are the two answers it most needs told apart.
+///
+/// `fate()` is the same function POST /approve/{id} answers a miss with, so the
+/// two cannot drift into telling different stories about one id.
+pub async fn approval_fate(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    Path(id): Path<String>,
+) -> Response {
+    let home = ctx.client.home();
+    // A pending id has no terminal file yet, so `fate()` would give the
+    // non-committal answer for the one state the caller can still act on.
+    let pending = crate::api::email_approval::list_pending(home)
+        .into_iter()
+        // `create_approval` writes the id under "id"; `list_pending` passes the
+        // doc through untouched apart from age fields. Matching on the wrong key
+        // here made a PENDING approval read as "unknown", which is the exact blur
+        // this route exists to remove — caught by the pending arm of its own test.
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id.as_str()));
+    if let Some(p) = pending {
+        return Json(json!({
+            "ok": true,
+            "approval_id": id,
+            "state": "pending",
+            "fate": "this approval is PENDING and has not been released yet",
+            "age_s": p.get("age_s").cloned().unwrap_or(json!(null)),
+            "expires_in_s": p.get("expires_in_s").cloned().unwrap_or(json!(null)),
+            // Present on EVERY arm, or a caller reading `retry_is_safe` gets a
+            // silent None on the one state where re-asking would duplicate a
+            // live draft — the same absent-key defect AF-538 just fixed next
+            // door in this file.
+            "retry_is_safe": false,
+        }))
+        .into_response();
+    }
+    let fate = crate::api::email_approval::fate(home, &id);
+    // The state is DERIVED FROM THE SAME SENTENCE the human reads, so a reader
+    // matching on `state` and a reader quoting `fate` can never disagree.
+    let state = if fate.contains("EXPIRED") {
+        "expired"
+    } else if fate.contains("DISCARDED") {
+        "rejected"
+    } else if fate.contains("no approval with that id") {
+        "unknown"
+    } else {
+        "released"
+    };
+    Json(json!({
+        "ok": true,
+        "approval_id": id,
+        "state": state,
+        "fate": fate,
+        // The one an unattended caller needs, and the reason this route exists:
+        // expiring is not the same as never having been asked for.
+        "retry_is_safe": state == "expired" || state == "rejected",
+    }))
+    .into_response()
+}
+
 
 // ---- GET /api/email/log ---------------------------------------------------
 
@@ -1610,6 +1754,72 @@ mod tests {
         (router, dir, registry)
     }
 
+    /// AF-540. gtm-engine measured every approval ever created: 60 total, and
+    /// ALL THREE real expirations are the unattended caller — one scheduled tick's
+    /// welcome email at 04:07 and 12:07 against a 1h TTL. That caller wakes to
+    /// find its draft gone and needs to tell "expired" from "never existed",
+    /// which are the two states a 404 used to blur.
+    ///
+    /// Every arm, because the point of the route is the DISTINCTION, and a route
+    /// tested on one state cannot make one.
+    #[tokio::test]
+    async fn the_fate_of_an_approval_is_readable_without_attempting_to_approve_it() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::api::email_approval::approvals_dir(home.path())).unwrap();
+        let (app, _d, _r) = app_with(MockHttp::new(vec![]), home.path());
+
+        // 1. an id nothing has ever heard of
+        let (st, v) = send_req(&app, "GET", "/api/email/approval/apr_0000000000000000", None, &[]).await;
+        assert_eq!(st, StatusCode::OK, "a read must not 404: the answer IS the payload");
+        assert_eq!(v["state"], json!("unknown"));
+        assert_eq!(v["retry_is_safe"], json!(false), "we cannot say a retry is safe for an id we never saw");
+
+        // 2. pending — the one state the caller can still act on, and the one
+        //    fate() alone answers non-committally because no terminal file exists.
+        let id = crate::api::email_approval::create_approval(
+            home.path(), "gtm-ticker", "send",
+            json!({"to": "x@example.invalid"}), json!({"subject": "s"}),
+        ).unwrap();
+        let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{id}"), None, &[]).await;
+        assert_eq!(v["state"], json!("pending"), "{v}");
+        assert!(v["expires_in_s"].as_i64().unwrap() > 0, "a pending approval must say how long is left: {v}");
+        assert_eq!(v["retry_is_safe"], json!(false), "re-asking while one is still pending would duplicate it");
+
+        // 3. rejected
+        let rid = crate::api::email_approval::create_approval(
+            home.path(), "gtm-ticker", "send", json!({}), json!({}),
+        ).unwrap();
+        crate::api::email_approval::discard(home.path(), &rid, "dashboard");
+        let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{rid}"), None, &[]).await;
+        assert_eq!(v["state"], json!("rejected"), "{v}");
+        assert_eq!(v["retry_is_safe"], json!(true));
+
+        // 4. EXPIRED — the shape every real expiration in the store has, and the
+        //    reason this route exists. Aged past the TTL, then swept by the
+        //    lister exactly as it is in production.
+        let eid = crate::api::email_approval::create_approval(
+            home.path(), "gtm-ticker", "send", json!({}), json!({}),
+        ).unwrap();
+        let dir = crate::api::email_approval::approvals_dir(home.path());
+        let f = dir.join(format!("{eid}.json"));
+        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        doc["created"] = json!(doc["created"].as_f64().unwrap()
+            - crate::api::email_approval::APPROVAL_TTL_S - 5.0);
+        std::fs::write(&f, doc.to_string()).unwrap();
+        let _ = crate::api::email_approval::list_pending(home.path()); // sweeps it to .expired.json
+        let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{eid}"), None, &[]).await;
+        assert_eq!(v["state"], json!("expired"), "{v}");
+        assert!(v["fate"].as_str().unwrap().contains("EXPIRED"), "{v}");
+        assert_eq!(v["retry_is_safe"], json!(true), "the whole point: the caller may ask again");
+
+        // 5. THE CONTROL. expired and unknown must not collapse into each other —
+        //    that blur is the defect, and a test that only checked `ok` would pass
+        //    with both answering the same string.
+        let (_, unk) = send_req(&app, "GET", "/api/email/approval/apr_1111111111111111", None, &[]).await;
+        assert_ne!(unk["state"], v["state"], "expired and never-existed must stay distinguishable");
+        assert_ne!(unk["fate"], v["fate"]);
+    }
+
     async fn send_req(
         app: &axum::Router,
         method: &str,
@@ -1634,6 +1844,20 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
+    }
+
+    /// AF-704: a page_token is a single Gmail account's opaque cursor, and
+    /// the unified inbox merges + re-sorts several accounts per call, so
+    /// there is no combined cursor a resumed fan-out could mean. Refused
+    /// rather than silently ignored, which would have looked like paging
+    /// worked while quietly re-running the same unified page every time.
+    #[tokio::test]
+    async fn page_token_without_account_is_refused_not_silently_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let (app, _d, _r) = app_with(MockHttp::new(vec![]), home.path());
+        let (st, v) = send_req(&app, "GET", "/api/email/inbox?page_token=abc", None, &[]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], json!("page_token requires account"));
     }
 
     /// AMUX-3809: a dead credential is a REFUSAL (403), a real upstream fault is
@@ -2575,5 +2799,72 @@ mod tests {
             http.calls.lock().unwrap().iter().all(|(m, u, _)| !(m == "POST" && u.contains("/send"))),
             "the reply must be held, not sent"
         );
+    }
+}
+
+/// AMUX-4833: a Gmail quota refusal is 429, not 502.
+#[cfg(test)]
+mod rate_limit_status_tests {
+    use super::*;
+
+    /// The VERBATIM body from the filed card, trimmed only of the parts the
+    /// detector truncated. Using the real shape is the point: a fixture I
+    /// invented would have agreed with whatever predicate I wrote.
+    fn real_429_body() -> String {
+        r#"gmail api 403: {"error":{"code":403,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"googleapis.com","metadata":{"consumer":"projects/492989726165","quota_limit":"defaultPerMinutePerUser","quota_limit_value":"15000","quota_metric":"gmail.googleapis.com/default"},"reason":"RATE_LIMIT_EXCEEDED"}],"errors":[{"domain":"usageLimits","message":"Quota exceeded for quota metric 'Queries'"}]}}"#.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_quota_refusal_answers_429_with_retry_after() {
+        let r = email_err(&real_429_body());
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a per-minute quota is upstream DECLINING; 502 says amux is broken and tells the \
+             5xx detector the same thing"
+        );
+        assert_eq!(
+            r.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "the exceeded quota is per MINUTE, so the window turns over within 60s"
+        );
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["rate_limited"], true);
+    }
+
+    /// The control that keeps this from swallowing real faults. An ordinary
+    /// upstream failure must STAY a 502, including one whose text merely
+    /// mentions a quota — which is why the predicate reads structure rather
+    /// than searching for a substring.
+    #[tokio::test]
+    async fn ordinary_upstream_faults_stay_502() {
+        for e in [
+            "gmail api 500: {\"error\":{\"code\":500,\"message\":\"Backend Error\"}}",
+            "gmail api 404: {\"error\":{\"code\":404,\"message\":\"Not Found\"}}",
+            // Mentions the words, carries none of the structure.
+            "gmail api 500: {\"error\":{\"code\":500,\"message\":\"usageLimits RATE_LIMIT_EXCEEDED happened downstream\"}}",
+            "gmail batch transport error - falling back to single fetches",
+        ] {
+            assert_eq!(
+                email_err(e).status(),
+                StatusCode::BAD_GATEWAY,
+                "this is amux failing, not declining: {e}"
+            );
+        }
+    }
+
+    /// A dead credential must keep its own 403 + needs_auth answer (AMUX-3809).
+    /// The new arm runs in the same function and must not shadow it.
+    #[tokio::test]
+    async fn a_revoked_token_still_answers_403_needs_auth() {
+        let e = "token refresh failed (400): {\"error\":\"invalid_grant\",\"error_description\":\"Token has been expired or revoked\"}";
+        let r = email_err(e);
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(r.into_body(), 8192).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["needs_auth"], true, "re-consent, not a retry");
     }
 }

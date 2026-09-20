@@ -126,10 +126,15 @@ pub fn apply_event(
                 tracing::warn!(worker = wid, turn = turn_id.as_str(),
                     "turn started with no live session row; recorded with NULL session_id");
             }
+            let task_id = commands::in_flight(conn, worker)?.and_then(|cmd| match cmd.command {
+                WorkerCommand::ExecuteTask(task) => Some(task.to_string()),
+                _ => None,
+            });
             let n = conn.execute(
-                "INSERT OR IGNORE INTO _amux_turns (id, session_id, worker_id, started_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![turn_id.as_str(), ses_id, wid, now_s],
+                "INSERT OR IGNORE INTO _amux_turns
+                 (id, session_id, worker_id, task_id, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![turn_id.as_str(), ses_id, wid, task_id, now_s],
             )?;
             if n > 0 {
                 events.push(ev(EntityType::Turn, turn_id.as_str(), MutationKind::Created));
@@ -209,6 +214,66 @@ pub fn apply_event(
                     // untouched" was observable nowhere.
                     if let WorkerCommand::ExecuteTask(task_id) = &cmd.command {
                         note_untouched_card(conn, wid, task_id, res, now, &mut events)?;
+                        if let Some(row) =
+                            crate::orchestrator::context::issue_by_internal_id(conn, task_id)?
+                        {
+                            let prior = crate::db::harness_store::get_checkpoint(conn, &row.id)?;
+                            let context_hash: Option<String> = conn
+                                .query_row(
+                                    "SELECT content_hash FROM _amux_context_snapshots
+                                     WHERE assignment_key=?1",
+                                    [&cmd.idempotency_key],
+                                    |r| r.get(0),
+                                )
+                                .optional()?;
+                            let mut completed_steps = prior
+                                .as_ref()
+                                .map(|checkpoint| checkpoint.completed_steps.clone())
+                                .unwrap_or_default();
+                            completed_steps.push(format!(
+                                "turn {} completed: {}",
+                                res.turn_id, res.outcome
+                            ));
+                            let artifacts = crate::db::artifact_store::list_for_task(conn, &row.id)?
+                                .into_iter()
+                                .filter(|artifact| {
+                                    !crate::db::artifact_store::is_retired_state(&artifact.state)
+                                })
+                                .map(|artifact| artifact.ref_value)
+                                .collect();
+                            let next_action = row
+                                .next_action
+                                .clone()
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or_else(|| {
+                                    format!("Inspect turn {} and continue {}", res.turn_id, row.id)
+                                });
+                            let unresolved = row.unresolved.clone().into_iter().collect();
+                            let input_hash = context_hash
+                                .clone()
+                                .unwrap_or_else(|| cmd.idempotency_key.clone());
+                            let checkpoint = amux_core::harness::TaskCheckpoint {
+                                task_id: row.id.clone(),
+                                version: 0,
+                                completed_steps,
+                                next_action,
+                                artifacts,
+                                unresolved,
+                                input_hash,
+                                context_hash,
+                                last_result: Some(res.outcome.clone()),
+                                updated_by: wid.to_string(),
+                                updated_at: now,
+                            };
+                            let stored =
+                                crate::db::harness_store::put_checkpoint(conn, &checkpoint)?;
+                            events.push(PendingEvent {
+                                entity_type: EntityType::Other("checkpoint".into()),
+                                entity_id: row.id,
+                                mutation: MutationKind::Updated,
+                                payload: serde_json::to_value(stored).ok(),
+                            });
+                        }
                     }
                 }
                 // Dispatched-but-unacked: see module docs — not ours to confirm.
@@ -218,7 +283,21 @@ pub fn apply_event(
         WorkerEvent::Waiting(w) => {
             // Invariant 11's table includes Waiting; it costs one line here
             // and its absence would leave the worker frozen at "active".
-            let state = WorkerState::Waiting { reason: w.reason.clone() };
+            let state = if w.reason == "idle_prompt" {
+                // A provider's ready composer asks for no response. Preserve the
+                // existing idle timestamp on replay rather than manufacturing activity.
+                let since = match prior_state.as_ref() {
+                    Some(WorkerState::Idle { since }) => *since,
+                    _ => now,
+                };
+                if !matches!(prior_state, Some(WorkerState::Idle { .. })) {
+                    tracing::info!(target: "amux::status", worker = wid,
+                        verdict = "ready_composer_idle", "idle prompt is not a human-input wait");
+                }
+                WorkerState::Idle { since }
+            } else {
+                WorkerState::Waiting { reason: w.reason.clone() }
+            };
             write_state(conn, prior_state.as_ref(), wid, &state, &now_s, &mut events)?;
         }
 
@@ -264,33 +343,94 @@ pub fn apply_event(
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
-                let (tokens_spent, wall_clock_secs) = match &open {
+                let (tokens_spent, wall_clock_secs, open_started_at) = match &open {
                     Some((started, tokens_json)) => {
-                        let spent = serde_json::from_str::<serde_json::Value>(tokens_json)
-                            .ok()
-                            .and_then(|v| v.get("reported_total").and_then(|n| n.as_u64()))
+                        let tokens = serde_json::from_str::<serde_json::Value>(tokens_json)
+                            .map_err(corrupt)?;
+                        let spent = tokens
+                            .get("reported_total")
+                            .and_then(|value| value.as_u64())
                             .unwrap_or(0); // unreported stays 0, not invented
-                        let wall = started
-                            .parse::<DateTime<Utc>>()
-                            .ok()
-                            .map(|s| (now - s).num_seconds().max(0) as u64)
-                            .unwrap_or(0);
-                        (spent, wall)
+                        let started_at = started.parse::<DateTime<Utc>>().map_err(corrupt)?;
+                        let wall = (now - started_at).num_seconds().max(0) as u64;
+                        (spent, wall, Some(started_at))
                     }
-                    None => (0, 0),
+                    None => (0, 0, None),
                 };
                 let prior_n: u32 = conn.query_row(
                     "SELECT COUNT(*) FROM _amux_attempts WHERE task_id = ?1 AND worker_id = ?2",
                     params![task.as_str(), wid],
                     |r| r.get(0),
                 )?;
+                let semantic_task = crate::orchestrator::context::issue_by_internal_id(conn, &task)?
+                    .map(|row| row.id);
+                let rejected_evidence = semantic_task
+                    .as_deref()
+                    .map(|id| {
+                        conn.query_row(
+                            "SELECT evidence FROM _amux_verifications
+                             WHERE task_id=?1 AND verdict='failed'
+                             ORDER BY created_at DESC LIMIT 1",
+                            params![id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()
+                    })
+                    .transpose()?
+                    .flatten()
+                    .map(|raw| {
+                        serde_json::from_str::<Vec<serde_json::Value>>(&raw).map_err(corrupt)
+                    })
+                    .transpose()?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|value| value.to_string())
+                    .collect();
+                let tool_calls: u64 = conn.query_row(
+                    "SELECT COUNT(*) FROM _amux_tool_events
+                     WHERE task_id=?1 AND worker_id=?2
+                       AND created_at >= COALESCE(?3, created_at)",
+                    params![task.as_str(), wid, open.as_ref().map(|(started, _)| started)],
+                    |r| r.get(0),
+                )?;
+                let cost_microusd = semantic_task
+                    .as_deref()
+                    .map(|id| {
+                        conn.query_row(
+                            "SELECT COALESCE(ROUND(SUM(cost_usd) * 1000000), 0)
+                             FROM token_ledger WHERE task=?1 AND ts >= ?2",
+                            params![
+                                id,
+                                open_started_at
+                                    .as_ref()
+                                    .map(|at| at.timestamp())
+                                    .unwrap_or(0)
+                            ],
+                            |r| r.get::<_, u64>(0),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                let decomposition_attempted: bool = semantic_task
+                    .as_deref()
+                    .map(|id| {
+                        conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM _amux_decompositions WHERE parent_task_id=?1)",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
                 let record = AttemptRecord {
                     attempt: prior_n + 1,
                     failure_reason: f.reason.clone(),
-                    rejected_evidence: Vec::new(),
+                    rejected_evidence,
                     tokens_spent,
                     wall_clock_secs,
-                    decomposition_attempted: false,
+                    tool_calls,
+                    cost_microusd,
+                    decomposition_attempted,
                     tree_status: None,
                     at: now,
                 };
@@ -345,10 +485,40 @@ pub fn apply_event(
         // created by the start path). ToolUsed belongs in logs correlated by
         // turn (Invariant 30), TaskUpdated is the board's own write path,
         // ContextLow drives compaction (RR-0069) — each lands with its item.
-        WorkerEvent::Started
-        | WorkerEvent::ToolUsed(_)
-        | WorkerEvent::TaskUpdated(_)
-        | WorkerEvent::ContextLow(_) => {}
+        WorkerEvent::ToolUsed(tool) => {
+            let turn_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM _amux_turns WHERE worker_id=?1 AND ended_at IS NULL
+                     ORDER BY started_at DESC LIMIT 1",
+                    params![wid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let task_id = commands::in_flight(conn, worker)?.and_then(|cmd| match cmd.command {
+                WorkerCommand::ExecuteTask(task) => Some(task.to_string()),
+                _ => None,
+            });
+            conn.execute(
+                "INSERT INTO _amux_tool_events(worker_id,task_id,turn_id,tool,detail,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![wid, task_id, turn_id, tool.tool, tool.detail, now_s],
+            )?;
+            events.push(ev(
+                EntityType::Other("tool_event".into()),
+                wid,
+                MutationKind::Created,
+            ));
+        }
+        WorkerEvent::TraceObserved(trace) => {
+            let stored = crate::db::trace_store::insert(conn, worker, trace, now)?;
+            events.push(PendingEvent {
+                entity_type: EntityType::Other("turn_trace".into()),
+                entity_id: stored.id,
+                mutation: MutationKind::Created,
+                payload: None,
+            });
+        }
+        WorkerEvent::Started | WorkerEvent::TaskUpdated(_) | WorkerEvent::ContextLow(_) => {}
     }
 
     // `applied` mirrors the events: every real write above pushes one, so an
@@ -532,9 +702,18 @@ pub async fn run_event_processors(store: SharedStore, protocol: Arc<dyn AgentPro
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::EVENT_PROCESSORS);
-        if let Err(e) = supervise_once(&store, &protocol, &mut procs).await {
-            tracing::warn!(error = %e, "event-processor supervision cycle failed");
+        // AMUX-4828: bracket the cycle. The one-shot writes no duration, so
+        // `classify_observed`'s only `slow` branch is dead for this job and a
+        // long cycle can present only as `ok` or `stalled`. tick_end sits in
+        // the Ok arm, so a failing cycle cannot read as a working one.
+        crate::runtime_jobs::registry::tick_start(
+            crate::runtime_jobs::registry::ids::EVENT_PROCESSORS,
+        );
+        match supervise_once(&store, &protocol, &mut procs).await {
+            Ok(_) => crate::runtime_jobs::registry::tick_end(
+                crate::runtime_jobs::registry::ids::EVENT_PROCESSORS,
+            ),
+            Err(e) => tracing::warn!(error = %e, "event-processor supervision cycle failed"),
         }
     }
 }
@@ -548,7 +727,7 @@ mod tests {
     use crate::opencode::AgentState;
     use amux_core::ids::{CommandId, TurnId};
     use amux_core::protocol::{
-        DeliveryTiming, ExitStatus, Failure, ProgressReport, TurnResult,
+        DeliveryTiming, ExitStatus, Failure, ProgressReport, ToolEvent, TurnResult,
     };
     use amux_core::provider::ProviderId;
     use amux_core::session::BackendId;
@@ -766,6 +945,13 @@ mod tests {
         );
         apply(
             &store,
+            WorkerEvent::ToolUsed(ToolEvent {
+                tool: "Bash".into(),
+                detail: Some("cargo test".into()),
+            }),
+        );
+        apply(
+            &store,
             WorkerEvent::Failed(Failure { reason: "api blew up".into(), retryable: true }),
         );
 
@@ -789,9 +975,82 @@ mod tests {
         let record: AttemptRecord = serde_json::from_str(&record_json).unwrap();
         assert_eq!(record.failure_reason, "api blew up");
         assert_eq!(record.tokens_spent, 500, "tokens from the open turn's report");
+        assert_eq!(record.tool_calls, 1, "tool calls come from the event ledger");
         drop(conn);
         // Worker landed in Error.
         assert!(matches!(worker_state(&store), WorkerState::Error { .. }));
+    }
+
+    #[test]
+    fn completed_task_turn_writes_resumable_checkpoint_and_task_correlation() {
+        let store = store();
+        seed(&store);
+        let semantic = "AMUX-9000";
+        let task = crate::db::board_store::internal_id(semantic);
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO issues(id,title,\"desc\",status,creator,created,updated,next_action)
+                     VALUES(?1,'checkpoint fixture','do it','doing','test',?2,?2,
+                            'Run independent verification')",
+                    params![semantic, Utc::now().timestamp()],
+                )?;
+                Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        let cmd_id = enqueue_and_deliver(&store, WorkerCommand::ExecuteTask(task.clone()));
+        store
+            .write({
+                let cmd_id = cmd_id.clone();
+                let task = task.clone();
+                move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_context_snapshots
+                         (assignment_key,task_id,worker_id,content_hash,fragments,at)
+                         VALUES(?1,?2,?3,'ctx-abc','[]',?4)",
+                        params![
+                            cmd_id.as_str(),
+                            task.as_str(),
+                            wid().as_str(),
+                            Utc::now().to_rfc3339()
+                        ],
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    })
+                }
+            })
+            .unwrap();
+
+        apply(&store, WorkerEvent::TurnStarted { turn_id: trn(30) });
+        apply(
+            &store,
+            WorkerEvent::TurnCompleted(TurnResult {
+                turn_id: trn(30),
+                outcome: "implemented and tested".into(),
+            }),
+        );
+
+        let conn = store.read().unwrap();
+        let turn_task: String = conn
+            .query_row(
+                "SELECT task_id FROM _amux_turns WHERE id=?1",
+                [trn(30).as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(turn_task, task.to_string());
+        let checkpoint = crate::db::harness_store::get_checkpoint(&conn, semantic)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.context_hash.as_deref(), Some("ctx-abc"));
+        assert_eq!(checkpoint.input_hash, "ctx-abc");
+        assert_eq!(checkpoint.last_result.as_deref(), Some("implemented and tested"));
+        assert_eq!(checkpoint.next_action, "Run independent verification");
     }
 
     #[test]
@@ -846,6 +1105,8 @@ mod tests {
                 let row = crate::db::board_store::create_issue(
                     conn,
                     &crate::db::board_store::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
                         title: "drift specimen".into(),
                         desc: String::new(),
                         status: "doing".into(),
@@ -1034,4 +1295,39 @@ mod tests {
         supervise_once(&store, &protocol, &mut procs).await.unwrap();
         assert!(procs.is_empty(), "ended session -> processor reaped");
     }
+    #[test]
+    fn status_chaos_provider_events_keep_quota_error_idle_and_input_distinct() {
+        use crate::backend::adapter::TerminalAdapter;
+        for (provider, model, idle, limited) in [
+            ("claude", "claude-sonnet-4-6 low", "❯\n? for shortcuts", "You've hit your session limit · resets 6:10pm\n❯\n? for shortcuts"),
+            ("claude", "claude-haiku-4-5", "❯\n? for shortcuts", "You've hit your session limit · resets 6:10pm\n❯\n? for shortcuts"),
+            ("codex", "gpt-5 low", "›", "■ You've hit your usage limit. Try again later in Codex.\n›"),
+            ("codex", "gpt-5.6-luna low", "›", "■ You've hit your usage limit. Try again later in Codex.\n›"),
+            ("gemini", "gemini-2.5-flash-lite", "│ Type your message", "✦ You have reached your daily quota limit for Gemini 2.5 Flash Lite.\n│ Type your message"),
+            ("gemini", "gemini-2.5-flash", "│ Type your message", "✦ Quota exceeded for quota metric 'Requests' of Gemini.\n│ Type your message"),
+        ] {
+            let store = store(); seed(&store);
+            let adapter = TerminalAdapter::new(ProviderId::new(provider));
+            for _ in 0..3 {
+                for event in adapter.scan(&format!("{model}\n{limited}")) { apply(&store, event); }
+                assert!(matches!(worker_state(&store), WorkerState::RateLimited {..}), "{provider}/{model}: {:?}", worker_state(&store));
+                for event in adapter.scan(&format!("{model}\n{idle}")) { apply(&store, event); }
+                assert!(matches!(worker_state(&store), WorkerState::Idle {..}), "{provider}/{model}: {:?}", worker_state(&store));
+                let question = match provider {
+                    "claude" => "Which format?\n❯ 1. JSON\n2. Text\nEnter to select · Esc to cancel",
+                    "codex" => "Which format?\n› 1. JSON\n2. Text\nPress enter to continue",
+                    _ => "│ Which format?\n│ ● 1. JSON\n│   2. Text\n╰ Enter to select",
+                };
+                for event in adapter.scan(question) { apply(&store, event); }
+                assert!(matches!(worker_state(&store), WorkerState::Waiting {ref reason} if reason == "user_input"), "{provider}: {:?}", worker_state(&store));
+                for event in adapter.scan(&format!("{question}\n{idle}")) { apply(&store, event); }
+                assert!(matches!(worker_state(&store), WorkerState::Idle {..}), "{provider} recovered question: {:?}", worker_state(&store));
+            }
+        }
+        let store = store(); seed(&store);
+        let adapter = TerminalAdapter::new(ProviderId::new("claude"));
+        for event in adapter.scan("⏺ API Error: 529 Overloaded\n❯\n? for shortcuts") { apply(&store, event); }
+        assert!(matches!(worker_state(&store), WorkerState::Error {..}));
+    }
+
 }

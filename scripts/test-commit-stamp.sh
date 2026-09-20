@@ -17,7 +17,7 @@
 # not move.
 #
 # Runs the SHIPPED hook, not a retyped copy.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 HOOK="${COMMIT_STAMP_HOOK:-$(pwd)/scripts/git-hooks/prepare-commit-msg}"
 PASS=0; FAIL=0
@@ -224,11 +224,17 @@ case "$D_MSG" in
   *"Amux-Committer"*) no "an AGREEING stamp must not add Amux-Committer" "got '$D_MSG'" ;;
   *) ok "no Amux-Committer when the declared stamp agrees (presence is the signal)" ;;
 esac
-if [ -z "$D_ERR" ]; then
-  ok "an agreeing stamp is silent"
-else
-  no "an agreeing stamp must not warn" "got '$D_ERR'"
-fi
+# SCOPED TO THE COMMITTER WARNING, not to total silence (AMUX-4559). This
+# harness runs inside a real amux pane, so setting $AMUX_SESSION to a fixture
+# lane is itself an env/ancestry disagreement and the hook now says so on
+# stderr — correctly, and about a different fact than this cell tests. The
+# property here is "an agreeing DECLARATION produces no committer complaint",
+# and asserting empty stderr conflated that with "the hook is silent about
+# everything", which is a strictly weaker claim wearing a stronger one.
+case "$D_ERR" in
+  *"already declares"*) no "an agreeing stamp must not warn about the declaration" "got '$D_ERR'" ;;
+  *) ok "an agreeing declaration draws no committer complaint" ;;
+esac
 
 # NEGATIVE CONTROL 2: the ordinary path, which is every commit on this box.
 declare_run "" my-lane
@@ -237,6 +243,102 @@ case "$D_MSG" in
   *"Amux-Session: my-lane"*) ok "an undeclared message is stamped exactly as before" ;;
   *) no "the ordinary stamp path must be unchanged" "got '$D_MSG'" ;;
 esac
+
+
+# ---------------------------------------------------------------------------
+# AMUX-4559: the env/ancestry disagreement is RECORDED.
+#
+# Four commits on 2026-09-14 (87f7adec, 2a395b8d, a86bc0de, 1010835e) carry one
+# `Amux-Agent: pid=1079` and THREE different `Amux-Session` values, each with
+# the matching wrong `Amux-Conversation` so the pair read as corroborated. The
+# only way to notice was to compare agent pids across commits by hand.
+#
+# This harness runs inside a real amux pane, so any fixture lane it sets is by
+# construction a disagreement — which is what makes the positive case testable
+# here at all. The NEGATIVE control is the one that needs care: it has to name
+# the pane's own lane, or it would be asserting that a disagreement is silent.
+# ---------------------------------------------------------------------------
+echo "cell: env/ancestry disagreement"
+_pane_lane=""
+_pp=$$
+_hops=0
+_panelist="$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null || true)"
+while [ -n "$_panelist" ] && [ "$_hops" -lt 12 ]; do
+  _hops=$((_hops + 1))
+  _m="$(printf '%s\n' "$_panelist" | awk -v p="$_pp" '$1==p {print $2; exit}')"
+  case "$_m" in amux-*) _pane_lane="${_m#amux-}"; break ;; esac
+  _pp="$(ps -o ppid= -p "$_pp" 2>/dev/null | tr -d ' ')"
+  case "$_pp" in ''|0|1) break ;; esac
+done
+
+if [ -z "$_pane_lane" ]; then
+  # Stated, not skipped silently: outside a pane this cell cannot run, and a
+  # quiet skip would read as a pass (ethos rule 4).
+  printf '  ..   SKIPPED: not running under an amux- tmux pane, so there is no ancestry to disagree with\n'
+else
+  _t="$(mktemp)"; printf 'subject line\n' > "$_t"
+  AMUX_SESSION="definitely-not-this-lane" sh "$HOOK" "$_t" >/dev/null 2>&1
+  if grep -q "^Amux-Ancestry: ${_pane_lane}\$" "$_t"; then
+    ok "a lying \$AMUX_SESSION is contradicted by Amux-Ancestry: $_pane_lane"
+  else
+    no "a lying \$AMUX_SESSION must record the ancestry lane" "got '$(grep -a '^Amux-' "$_t" | tr '\n' ' ')'"
+  fi
+  if grep -q "^Amux-Session: definitely-not-this-lane\$" "$_t"; then
+    ok "and the stamp itself is UNCHANGED (this records, it does not override)"
+  else
+    no "the stamp must not be overridden by this change" "got '$(grep -a '^Amux-Session:' "$_t")'"
+  fi
+  rm -f "$_t"
+
+  # NEGATIVE CONTROL: agreement must add nothing. Without this the cell above
+  # would pass against a hook that stamped Amux-Ancestry unconditionally, which
+  # would destroy the field's whole property — presence IS the signal.
+  _t2="$(mktemp)"; printf 'subject line\n' > "$_t2"
+  AMUX_SESSION="$_pane_lane" sh "$HOOK" "$_t2" >/dev/null 2>&1
+  if grep -q "^Amux-Ancestry: " "$_t2"; then
+    no "an AGREEING \$AMUX_SESSION must not add Amux-Ancestry" "got '$(grep -a '^Amux-' "$_t2" | tr '\n' ' ')'"
+  else
+    ok "no Amux-Ancestry when the environment and the process tree agree"
+  fi
+  rm -f "$_t2"
+fi
+
+# ---------------------------------------------------------------------------
+# AMUX-4602: a tmux session with no env file is NOT a lane.
+#
+# `amux-` is a naming convention; the env file under ~/.amux/sessions is what
+# makes a lane. A server test that reached start_session once created a live
+# `amux-client-left-fixture` on the machine's real tmux server, the fleet
+# adopted it, and the commit stamp named it: ba203699 permanently carries
+# `Amux-Committer: client-left-fixture` for a session that was never a lane.
+#
+# Both recovery paths are covered because both strip the same prefix: the
+# MR-43 `tmux display-message` fallback, and the AMUX-4559 ancestry walk.
+# Pointing AMUX_HOME at an empty directory is exactly what a leaked fixture
+# looks like to them — the pane is real, the lane is not.
+# ---------------------------------------------------------------------------
+echo "cell: a tmux session without an env file is not a lane"
+_empty_home="$(mktemp -d)"
+_t="$(mktemp)"; printf 'subject line\n' > "$_t"
+AMUX_HOME="$_empty_home" AMUX_SESSION="" sh "$HOOK" "$_t" >/dev/null 2>&1
+_got="$(sed -n 's/^Amux-Session:[[:space:]]*//p' "$_t" | head -1)"
+if [ "$_got" = "(human)" ]; then
+  ok "no env file under AMUX_HOME -> (human), not an invented lane name"
+else
+  no "a session with no env file must not be named" "got Amux-Session: $_got"
+fi
+# THE CONTROL, without which the cell above passes against a hook that always
+# answers (human) and has stopped recovering real lanes at all.
+_t2="$(mktemp)"; printf 'subject line\n' > "$_t2"
+AMUX_SESSION="" sh "$HOOK" "$_t2" >/dev/null 2>&1
+_got2="$(sed -n 's/^Amux-Session:[[:space:]]*//p' "$_t2" | head -1)"
+if [ "$_got2" != "(human)" ] && [ -n "$_got2" ]; then
+  ok "and a REAL lane with an env file still resolves ($_got2)"
+else
+  # Outside a pane there is nothing to recover; say so rather than fail.
+  printf '  ..   SKIPPED control: not in an amux- pane with an env file, nothing to recover\n'
+fi
+rm -rf "$_empty_home" "$_t" "$_t2"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

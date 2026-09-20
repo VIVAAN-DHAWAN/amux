@@ -65,16 +65,28 @@ pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 /// list against the routes mod.rs actually mounts (a view must share the
 /// predicate of the mechanism it describes — ethos rule 1).
 pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
+    ("/api/brex", "tokenized card issuance, webhook budget checks and credential health; disabled until configured (api/brex.rs)"),
+    ("/api/_clear_sw", "service-worker cache reset landing page"),
     ("/health", "health + build discriminator"),
     // The /api-prefixed alias for the same handler. Lanes guess this path
     // because every sibling diagnostic is under /api/ (2026-08-30 sweep: 20
     // 404s in 24h, hand-typed).
     ("/api/health", "alias of /health; also the /api/health/invariants prefix"),
     ("/manifest.json", "PWA manifest from branding prefs"),
+    (
+        "/api/_clear_sw",
+        "service-worker cleanup landing outside the service worker intercept scope (api/static_files.rs)",
+    ),
+    (
+        "/api/screen",
+        "loopback-only screenshot capture (api/screen.rs); native, never proxied — \
+         the bytes are of the owner's physical display",
+    ),
     ("/api/calendar.ics", "iCal feed"),
     ("/api/sync", "delta sync"),
     ("/api/events", "SSE stream"),
     ("/api/board", "board/tasks CRUD, gates, contract"),
+    ("/api/board-lifecycle", "durable command decisions and measured planning costs"),
     ("/api/lookup", "explain-selection helper (peek view)"),
     ("/api/tts", "text-to-speech read-aloud synthesis (+ /api/tts/voices)"),
     ("/api/orchestrate", "voice fleet-orchestrator: transcript -> helper-model routing plan (api/orchestrate.rs, AMUX-3074)"),
@@ -96,6 +108,10 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/memory", "global memory document"),
     ("/api/review", "weekly trends engine + digest markdown"),
     ("/api/workers", "modern worker API (+dead-letters)"),
+    (
+        "/api/models",
+        "typed OpenAI, Claude, and Gemini model catalog shared by provider adapters and every worker picker (api/workers.rs)",
+    ),
     ("/api/sessions", "python-SHAPE session list (rust-derived) + per-name verbs — peek/send/config/start/stop/… native over the fleet substrate (api/session_verbs.rs, AMUX-2598)"),
     ("/api/identity", "cloud user + auth-config introspection over server.env/.claude.json (mod.rs)"),
     ("/api/sessions-git", "bulk {session: {branch, repo}} map for the session cards — REUSES the session list's branch (one answer, not two) and adds repo, one rev-parse per DISTINCT dir, 30s TTL (api/sessions_git.rs, AMUX-2599)"),
@@ -108,17 +124,20 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/search", "universal FTS5 search over cards (incl. their log lines), messages, memories, workers, journal, schedules + the index's own drift status/reindex (api/search.rs, migration 0013, RR-0110). Net-new: python never had this route"),
     ("/api/why", "provenance explainer — correlates the state-event journal, request log, card log, schedule runs/audit and turn ledger for one entity or a time window; every line cites its table (api/why.rs, RR-0109). Net-new"),
     ("/api/verify", "verification endpoints"),
+    ("/api/harness", "production-harness checkpoints, handoffs, budgets, sensors, guides, compilation, ratchet, and health"),
+    ("/api/policy", "capability-policy evaluation, exact approvals, and durable decision receipts"),
     ("/api/prefs", "key/value prefs"),
     ("/api/criteria", "gate criteria"),
     ("/api/metrics", "metrics"),
     ("/api/reclaim", "disk scan, reclaim findings, treemap, quarantine"),
+    ("/api/recordings", "audio recorder: upload, list, folder config, local transcription (api/recordings.rs)"),
     ("/api/usage", "token usage"),
     ("/api/alert", "owner alerts"),
     ("/api/stats", "daily stats"),
     ("/api/branding", "white-label branding + assets"),
     ("/api/email", "email send/read (gmail api)"),
     ("/api/cal-events", "calendar events CRUD"),
-    ("/api/browser", "full browser family: launch/profiles + CDP driver verbs (screenshot/state/action/inspect/navigate/search) against the server-machine Chrome; /agent answers 501 — the session's model drives the native verbs (api/browser.rs, AMUX-2598)"),
+    ("/api/browser", "full browser family: launch/profiles + CDP driver verbs (screenshot/state/action/inspect/navigate/search) against the server-machine Chrome, with durable redacted history in session_events; /agent answers 501 — the session's model drives the native verbs (api/browser.rs, AMUX-2598)"),
     ("/api/files", "modern files API (raw-body upload, rooted)"),
     ("/api/file", "file VIEWER: payload + raw range streaming + vtt + prepare/transcode with durable media jobs (api/file_viewer.rs)"),
     ("/api/library", "ebook library index — calibre metadata.db / opf scan (api/file_viewer.rs)"),

@@ -231,6 +231,14 @@ impl Bootstrap {
                 queries::get_worker(&conn, &worker_id)?
             };
             let Some(row) = row else { continue };
+            let lock = crate::api::workers::lifecycle_lock(&row.display_name);
+            let _guard = lock.lock().await;
+            // Re-read under the lifecycle lock: the Starting scan can predate Pause.
+            let row = {
+                let conn = self.store.read()?;
+                queries::get_worker(&conn, &worker_id)?
+            };
+            let Some(row) = row.filter(|r| r.lifecycle.can_start() && matches!(r.state, WorkerState::Starting)) else { continue };
             let Ok(worker) = WorkerId::parse(&row.id) else { continue };
 
             let Some(backend) = self.backend(&backend_name) else {
@@ -255,9 +263,21 @@ impl Bootstrap {
                 continue;
             };
 
+            let mut command = adapter.build_command(PromptMode::Interactive);
+            if row.permissions.iter().any(|permission| {
+                permission == "unsafe" || permission == "claude:skip_permissions"
+            }) && command.first().is_some_and(|binary| binary == "claude")
+            {
+                tracing::warn!(
+                    worker = %row.id,
+                    permission = "claude:skip_permissions",
+                    "worker explicitly enabled Claude's unsafe permission bypass"
+                );
+                command.push("--dangerously-skip-permissions".into());
+            }
             let spec = SessionSpec {
                 worker: worker.clone(),
-                command: adapter.build_command(PromptMode::Interactive),
+                command,
                 cwd: row.cwd.clone(),
                 // Worker-scope env only for now; the four-tier scope
                 // assembly (amux-core scope) wires in with RR-0040.
@@ -388,13 +408,26 @@ impl Bootstrap {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::BOOTSTRAP);
+            // AMUX-4828: bracket the pass; the one-shot records no duration.
+            crate::runtime_jobs::registry::tick_start(
+                crate::runtime_jobs::registry::ids::BOOTSTRAP,
+            );
             match self.pass_once().await {
                 Ok(r) if !r.is_empty() => {
                     tracing::info!(report = %serde_json::to_string(&r).unwrap_or_default(),
                         "bootstrap pass");
+                    // BOTH Ok arms stamp. Stamping only the empty-report arm
+                    // would leave a pass that actually did work unreported, so
+                    // the busiest passes would be the ones reading as stalled.
+                    crate::runtime_jobs::registry::tick_end(
+                        crate::runtime_jobs::registry::ids::BOOTSTRAP,
+                    );
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    crate::runtime_jobs::registry::tick_end(
+                        crate::runtime_jobs::registry::ids::BOOTSTRAP,
+                    );
+                }
                 Err(e) => tracing::warn!(error = %e, "bootstrap pass failed"),
             }
         }
@@ -591,7 +624,7 @@ mod tests {
         assert_eq!(spawns.len(), 1);
         assert_eq!(
             spawns[0].command,
-            vec!["claude", "--dangerously-skip-permissions"]
+            vec!["claude"]
         );
         assert_eq!(spawns[0].cwd, "/tmp/bootstrap-test-cwd");
         assert_eq!(spawns[0].env.get("FOO").map(String::as_str), Some("bar"));
@@ -618,6 +651,33 @@ mod tests {
         assert_eq!(regs[0].0, id);
         assert_eq!(regs[0].1.provider, CliProvider::ClaudeCode);
         assert_eq!(regs[0].1.model.as_deref(), Some("haiku"));
+    }
+
+    #[tokio::test]
+    async fn claude_permission_bypass_requires_an_explicit_worker_permission() {
+        let (store, _dir) = store();
+        let (id, _) = seed(&store, WorkerState::Starting, "herdr", "claude", true);
+        let worker_id = id.to_string();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE _amux_workers SET permissions='[\"claude:skip_permissions\"]' WHERE id=?1",
+                    params![worker_id],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let boot = bootstrap(store, backend.clone(), registrar);
+
+        boot.pass_once().await.unwrap();
+
+        let spawns = backend.spawns.lock().unwrap();
+        assert_eq!(
+            spawns[0].command,
+            vec!["claude", "--dangerously-skip-permissions"]
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,266 @@
 [
   {
+    "hash": "ce1e91b0",
+    "short": "ce1e91b0",
+    "title": "Email inbox paginates past the 500-message cap",
+    "date": "2026-09-11",
+    "type": "feat",
+    "tags": ["email", "inbox"],
+    "description": "GET /api/email/inbox now supports a cursor parameter and paginates through inboxes with more than 500 messages. Previously the endpoint silently returned only the most recent 500, with no indication that messages were missing."
+  },
+  {
+    "hash": "f58964ae",
+    "short": "f58964ae",
+    "title": "Scheduler reclaims memory when amux is under pressure",
+    "date": "2026-09-11",
+    "type": "feat",
+    "tags": ["scheduler", "health", "mac"],
+    "description": "On macOS, the scheduler now monitors amux's own memory footprint and triggers a compaction pass when it exceeds the configured threshold. Keeps the server running cleanly on machines where agent fleets accumulate state over long overnight runs."
+  },
+  {
+    "hash": "3fc9ee30",
+    "short": "3fc9ee30",
+    "title": "Composer recovers chunked uploads across reloads",
+    "date": "2026-09-11",
+    "type": "fix",
+    "tags": ["mobile", "composer", "uploads"],
+    "description": "Chunked file uploads from the mobile composer are now persisted in IndexedDB and recovered automatically if the page reloads mid-upload. Previously a reload would silently discard the in-progress upload with no recovery path."
+  },
+  {
+    "hash": "e480cb29",
+    "short": "e480cb29",
+    "title": "Typed needsyou asks are exempt from age-based auto-discard",
+    "date": "2026-09-11",
+    "type": "fix",
+    "tags": ["board", "hygiene"],
+    "description": "Cards created via a typed needsyou ask (question + unblocking sentence) are now flagged as owner-gated and excluded from the board hygiene job's age-based auto-discard pass. A card that is genuinely waiting on a decision should not be discarded for being old."
+  },
+  {
+    "hash": "8a130c0b",
+    "short": "8a130c0b",
+    "title": "Dashboard sends messages directly, queues only on failure",
+    "date": "2026-09-10",
+    "type": "fix",
+    "tags": ["dashboard", "messages"],
+    "description": "Message sends from the web dashboard now go directly over SSE. The local queue is used only as a fallback when the direct path fails, rather than as the default path. Reduces latency and eliminates the double-delivery edge case when a queued message also arrived via SSE."
+  },
+  {
+    "hash": "31292617",
+    "short": "31292617",
+    "title": "amux board shepherd: escape hatch for stuck cards",
+    "date": "2026-09-10",
+    "type": "feat",
+    "tags": ["cli", "board"],
+    "description": "New command: amux board shepherd. Scans for cards in invalid states (doing with no active session, blocked by a session that no longer exists, done without evidence on a gated card) and offers targeted fixes. Replaces the previous approach of manual state inspection and curl patches."
+  },
+  {
+    "hash": "69490b05",
+    "short": "69490b05",
+    "title": "Mobile terminal renders diffs and streams incrementally",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["dashboard", "mobile", "terminal"],
+    "description": "The mobile dashboard now renders terminal output as incremental diffs rather than full-frame snapshots. Output appears as it arrives, so monitoring an overnight agent from your phone shows live progress. Fixes AF-640."
+  },
+  {
+    "hash": "8f491b19",
+    "short": "8f491b19",
+    "title": "Terminal scroll notices kept truthful",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["dashboard", "terminal"],
+    "description": "Fixed scroll position notices in the terminal view that could report stale state, making the indicator mislead about whether output had advanced since the last view."
+  },
+  {
+    "hash": "7e3ca68f",
+    "short": "7e3ca68f",
+    "title": "Board deduplicates autofix cards and expires stale alerts",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["board", "hygiene"],
+    "description": "Autofix cards that trigger repeatedly for the same condition are now deduplicated rather than accumulating. Stale alert cards past their TTL are expired automatically. Conversational acks (messages that only acknowledge a prior message) are filtered out of the capture queue."
+  },
+  {
+    "hash": "7de6f593",
+    "short": "7de6f593",
+    "title": "Board hygiene runtime job: needsyou aging and stale card sweeps",
+    "date": "2026-09-09",
+    "type": "feat",
+    "tags": ["board", "runtime", "hygiene"],
+    "description": "A new background job runs continuously to keep the board clean. It ages out stale needsyou cards (no activity past a configurable threshold), deduplicates autofix alert bursts, and removes conversational acks that clog the review queue. Morning review queues now surface real decisions rather than resolved notifications."
+  },
+  {
+    "hash": "5abadb51",
+    "short": "5abadb51",
+    "title": "Break worker-list overload loop on session boot",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["sessions", "reliability"],
+    "description": "Fixed an overload loop that could fire repeatedly during worker list initialization when a session booted while many sessions were active."
+  },
+  {
+    "hash": "05388566",
+    "short": "05388566",
+    "title": "Session log rotation, audit dir cleanup, and age-pruned dirs",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["storage", "reliability"],
+    "description": "Added log rotation for session log files to prevent unbounded growth. Audit directories are cleaned when their associated sessions are gone. Additional directories are now included in age-based pruning."
+  },
+  {
+    "hash": "f6a0edbf",
+    "short": "f6a0edbf",
+    "title": "Board captures require a disposition before requeuing",
+    "date": "2026-09-09",
+    "type": "fix",
+    "tags": ["board", "capture", "reliability"],
+    "description": "Fixed a gap where a captured message could be requeued without a recorded disposition, leaving the audit trail incomplete. The board now requires an explicit outcome (fold, discard, or forward) before the capture is released back to the queue."
+  },
+  {
+    "hash": "526f1ea6",
+    "short": "526f1ea6",
+    "title": "Lanes can declare a card fold directly from the CLI",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["board", "cli", "audit"],
+    "description": "Previously, a card fold required constructing a hand-rolled log entry. Now any lane can declare a fold with a single CLI command: amux board fold <card-id> --into <target-id>. The server records it identically to a system-generated fold, so the audit trail is consistent regardless of how the fold happened. Useful when a task absorbs another mid-sprint and the board should reflect that without manual cleanup."
+  },
+  {
+    "hash": "4b8ee664",
+    "short": "4b8ee664",
+    "title": "Workspace members can be assigned to scoped teams",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["org", "teams", "permissions"],
+    "description": "Engineering organizations using amux can now partition their workspace into named teams. Each team has its own scoped membership, so a mobile team and a backend team can share one amux instance while seeing only their own sessions, board cards, and logs. Team assignment is managed through the Settings tab."
+  },
+  {
+    "hash": "c07923e6",
+    "short": "c07923e6",
+    "title": "Worker message view now has composable filters",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["dashboard", "workers", "filtering"],
+    "description": "The worker message panel now supports composable filters: filter by session name, runtime type, or message keyword in any combination. Previously you had to scroll through all messages across all workers to find what you were looking for. With composable filters, watching 10 mixed Claude Code and Codex CLI sessions simultaneously is manageable at a glance. (AMUX-4242)"
+  },
+  {
+    "hash": "06270da7",
+    "short": "06270da7",
+    "title": "Owner access link is now visible in Settings",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["dashboard", "settings", "auth"],
+    "description": "The dashboard Settings tab now shows the owner access link directly, so you can copy it without running a CLI command. Previously, finding the access URL required running amux url or checking server.env. This is especially useful when setting up remote access from a new device."
+  },
+  {
+    "hash": "4b428256",
+    "short": "4b428256",
+    "title": "Server logs can be filtered by IP address",
+    "date": "2026-09-08",
+    "type": "feat",
+    "tags": ["logs", "observability", "filtering"],
+    "description": "The log analysis endpoint now accepts an IP filter. Pass ?ip=192.168.1.x to isolate requests from a specific client. Previously, the only way to narrow down log noise from a shared amux instance was to grep the raw log file. The filter is now a first-class query parameter with proper column indexing."
+  },
+  {
+    "hash": "0096077c",
+    "short": "0096077c",
+    "title": "Repeated card re-assignment to the same lane is now flagged",
+    "date": "2026-09-07",
+    "type": "feat",
+    "tags": ["board", "invariants", "observability", "drain"],
+    "description": "If a lane is handed the same board card more than once in a short window, the invariants panel now surfaces this as a violation. The silent looping pattern — where a session fails a card and it bounces back repeatedly — was previously invisible until you dug through logs. Now it appears in the dashboard health view as soon as it starts. (AF-543)"
+  },
+  {
+    "hash": "af53a6bb",
+    "short": "af53a6bb",
+    "title": "Board idle dispatch no longer loops when no cards are available",
+    "date": "2026-09-07",
+    "type": "fix",
+    "tags": ["board", "drain", "performance", "reliability"],
+    "description": "Fixed a bug where the idle card dispatch and recovery loop ran continuously when the board had no todo cards, burning CPU and producing noisy logs. The scheduler now backs off properly when there is nothing to claim rather than spinning. (AMUX-4168)"
+  },
+  {
+    "hash": "63b7684d",
+    "short": "63b7684d",
+    "title": "Email ledger shows send status on every row",
+    "date": "2026-09-06",
+    "type": "feat",
+    "tags": ["email", "ledger", "observability", "audit"],
+    "description": "The email audit log now shows whether each message was sent successfully, failed, or is pending directly on every row. Previously you had to click into a message to find its delivery status — unhelpful for scanning a day's outbound volume at a glance."
+  },
+  {
+    "hash": "a626c008",
+    "short": "a626c008",
+    "title": "Email approval status is readable without triggering the approval flow",
+    "date": "2026-09-06",
+    "type": "feat",
+    "tags": ["email", "approval", "dashboard"],
+    "description": "You can now see whether a pending email was approved, rejected, or timed out without going through the approval interaction. Previously, checking the status required presenting the approval prompt, which consumed an interaction slot even when you just wanted to audit the outcome."
+  },
+  {
+    "hash": "322f76c8",
+    "short": "322f76c8",
+    "title": "AI provider catalog is now typed and centralized",
+    "date": "2026-09-06",
+    "type": "feat",
+    "tags": ["models", "multi-runtime", "providers", "configuration"],
+    "description": "All AI providers — Claude, GPT-4o, Gemini, Codex — are now defined in a single typed catalog shared across the server. Adding a new provider or model variant no longer requires changes across multiple files. This makes multi-runtime fleet configuration more reliable and reduces the surface area for provider name mismatches."
+  },
+  {
+    "hash": "2dab07907e1f3b4a5c6d8e9f0a1b2c3d4e5f6a7b",
+    "short": "2dab0790",
+    "title": "Browser sessions now keep a privacy-safe activity trail",
+    "date": "2026-09-05",
+    "type": "feat",
+    "tags": ["browser", "activity", "privacy", "audit"],
+    "description": "The browser controller now records a local, privacy-safe activity log for each session — what pages were visited, what actions were taken, and when. The log stays on your machine and strips personally identifiable content. Useful for client billing audits and reviewing what an overnight browser agent actually did."
+  },
+  {
+    "hash": "ecbf4daf3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8",
+    "short": "ecbf4daf",
+    "title": "Settings shows current usage window for every AI provider",
+    "date": "2026-09-05",
+    "type": "feat",
+    "tags": ["settings", "usage", "providers", "cost"],
+    "description": "The Settings tab now displays the active usage window and remaining quota for every connected AI provider — Anthropic, OpenAI, Google — in one view. No more checking three separate dashboards to understand where you are in your billing cycle across a multi-runtime fleet."
+  },
+  {
+    "hash": "dd57e1d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f",
+    "short": "dd57e1d5",
+    "title": "Sessions resume automatically after a usage limit resets",
+    "date": "2026-09-05",
+    "type": "fix",
+    "tags": ["workers", "usage", "resume", "reliability"],
+    "description": "Sessions that stopped because they hit a provider usage limit (Claude Max monthly cap, OpenAI daily quota) now automatically pick up where they left off once the usage window resets. Previously, they stayed idle and required a manual restart — which meant overnight runs often stalled and did nothing for hours."
+  },
+  {
+    "hash": "ccb37879f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+    "short": "ccb37879",
+    "title": "Delegated board requests are now tracked as task dependencies",
+    "date": "2026-09-04",
+    "type": "feat",
+    "tags": ["board", "dependencies", "delegation", "coordination"],
+    "description": "When a session delegates a request to another session via the board, the delegating card now lists the delegated card as a dependency. The parent card cannot be marked done until all its delegated children complete. This gives the board an honest view of inter-agent handoffs rather than letting parent cards close prematurely."
+  },
+  {
+    "hash": "384a0c16b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e",
+    "short": "384a0c16",
+    "title": "Board block command now keeps the card out of auto-drain",
+    "date": "2026-09-04",
+    "type": "fix",
+    "tags": ["board", "drain", "block", "reliability"],
+    "description": "Running 'amux board block CARD-ID' now reliably prevents the card from being picked up by auto-drain sessions. Previously, the block flag was ignored by the drain scheduler, so blocked cards could still be claimed and worked. Use this to hold review-gated work until you explicitly clear the block."
+  },
+  {
+    "hash": "363622d2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d",
+    "short": "363622d2",
+    "title": "Schedule run history is now searchable — three months of forensics available",
+    "date": "2026-09-04",
+    "type": "fix",
+    "tags": ["scheduler", "history", "forensics", "observability"],
+    "description": "Three months of scheduler run records existed in the database but no query could reach them. The /api/schedules/runs endpoint now accepts date range filters and returns full run history with outcome, duration, and error details. Previously, the UI only showed the most recent handful of runs and older records were effectively invisible."
+  },
+  {
     "hash": "83e180ef0b8ecedd1591fa9471a5ab6904261d39",
     "short": "83e180ef",
     "title": "Tab customizer button now works on phones",

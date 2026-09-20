@@ -29,9 +29,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 pub fn routes() -> Router<AppState> {
@@ -39,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_board).post(create_item))
         // Static /export outranks /{id}, same as /statuses below.
         .route("/export", get(export_board))
+        .route("/orchestrations", get(super::orchestrations::list))
         // Static segment outranks /{id} in axum: /statuses never collides.
         .route("/statuses", get(list_statuses).post(create_status))
         // Static /reorder outranks /{sid}; both outrank /api/board/{id}.
@@ -53,15 +55,31 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /derived outranks /{id}. Computed display status from durable
+        // facts, never stored (AO architecture: display status is derived at
+        // read time).
+        .route("/derived", get(derived_board))
         // Static /ready outranks /{id}. The read side of the dependency graph
         // (AMUX-3948) — READY is a query, never a stored status.
         .route("/ready", get(ready_frontier))
+        // RR-0052 Invariant 5: is this lane's board drained, and if not, what is
+        // in the way. Static, before /{id}.
+        .route("/drain", get(board_drain))
+        // CDC catch-up: lets clients replay missed board mutations after a
+        // reconnect, keyed by the seq cursor from board_change_log.
+        .route("/changes", get(board_changes))
         // Static /bulk-migrate outranks /{id}. Moving a whole column at once
         // (AMUX-4044) — a single write transaction, because backlog alone
         // holds 489 live cards and 489 sequential PATCHes is minutes of load.
         .route("/bulk-migrate", axum::routing::post(bulk_migrate))
         // Static /needsyou outranks /{id}. The one owner view (AF-318).
         .route("/needsyou", get(needsyou_queue))
+        // A semantic-concern claim is deliberately separate from a card claim:
+        // two cards may coexist, but two workers must not both complete/deploy
+        // the same concern merely because they learned about each other late.
+        .route("/overlap", post(reconcile_overlap))
+        .route("/overlap/deployment-permit", get(overlap_deployment_permit))
+        .route("/overlap/{coordination_id}", get(get_overlap))
         // DELETE was never registered, so the SPA's own Delete button on a
         // card 405'd — and `deleteBoardItem` removes the card optimistically
         // BEFORE the request, so the card vanished, the server kept it, and it
@@ -69,9 +87,16 @@ pub fn routes() -> Router<AppState> {
         // items are not moving" (AMUX board sweep, 2026-08-09).
         // Before the /{id} wildcard, or "clear-done" is swallowed as an id.
         .route("/clear-done", post(clear_done))
+        // One-shot launcher: plain-text priorities -> epic + children + fan-out.
+        .route("/launch", post(launch_priorities))
+        // RR-0052 Invariant 3: the pull half of dispatch. Static, so it sits
+        // before the /{id} wildcard like clear-done.
+        .route("/lease-next", post(lease_next_item))
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
+        // The inverse of DELETE (AF-922) — see undelete_item's own doc comment.
+        .route("/{id}/undelete", post(undelete_item))
         // The D1-exit pair — see the handlers below for why their 405 was the
         // most expensive shape available.
         .route("/{id}/status-request", post(status_request))
@@ -85,6 +110,7 @@ pub fn routes() -> Router<AppState> {
         // epic that the originating message already points at, and every child
         // is created with its owner, priority and dependency edges intact.
         .route("/{id}/decompose", post(decompose_item))
+        .route("/{id}/fan-out", post(fan_out_item))
         .route("/{id}/capsule", get(capsule))
         .route("/{id}/verifications", get(list_verifications))
         .route("/{id}/artifacts", get(list_artifacts).post(create_artifact))
@@ -158,11 +184,16 @@ async fn needsyou_queue(
     // One `today` for the whole pass: computing it per row could straddle
     // midnight mid-sort and make two cards disagree about what "due today" is.
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // ONE pass for every row's blast radius, not one query per row. This was an
+    // N+1 over an unindexable `LIKE '%id%'` (the planner answers SCAN issues),
+    // measured at 52.7ms x 257 rows = 13.6s against 12.2-14.3s observed on a
+    // 26KB response (AMUX-4618).
+    let radii = bs::blast_radius_many(&conn, &rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
     let mut scored: Vec<(bool, f64, Value)> = rows
         .iter()
         .map(|r| {
             let age_days = ((now - r.created as f64) / 86_400.0).max(0.0);
-            let radius = bs::blast_radius(&conn, &r.id);
+            let radius = radii.get(&r.id).copied().unwrap_or(0);
             // radius + 1, so a card nobody depends on still ranks by age
             // instead of scoring zero and sinking below every card forever.
             let score = age_days * (radius + 1) as f64;
@@ -313,15 +344,150 @@ async fn needsyou_queue(
     .into_response()
 }
 
-/// The creator name the queue-disposition job files under (AF-317).
-///
-/// Exempt from the todo WIP limit BY NAME. Its card is the one that has to
-/// arrive precisely when a lane's queue is too long, so refusing it for queue
-/// depth would make the mechanism suppress its own alarm.
-pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
+/// Creator name exempt from the todo WIP limit (AF-317). Cards filed under
+/// this creator exist to report queue problems, so refusing them for queue
+/// depth would suppress their own alarm.
+pub const WIP_EXEMPT_CREATOR: &str = "queue-disposition";
 
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
+
+// ---- GET /api/board/derived -----------------------------------------------
+
+/// Derived display status from durable facts.
+///
+/// The stored `status` is the lifecycle position a worker set. The `display_status`
+/// is what a human triaging the board should see, computed from timestamps, session
+/// liveness, evidence, and dependency state. This endpoint returns the board with
+/// both, so the dashboard can group by either.
+///
+/// Rules (in priority order; first match wins):
+///   1. status=needsyou AND entered_state_at older than 14 days: "aged-needsyou"
+///   2. status=doing AND assigned session is not active for >1h: "stalled"
+///   3. source=capture AND status=todo AND age > 72h AND no log activity: "stale"
+///   4. status=done AND evidence IS NOT NULL: "verified-candidate"
+///   5. depends_on non-empty AND all resolved: "unblocked"
+///   6. otherwise: the stored status itself
+async fn derived_board(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        let rows =
+            bs::list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly)?;
+        let working =
+            crate::api::sessions_legacy::active_python_sessions(&conn);
+        let now = now_secs();
+
+        let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for r in &rows {
+            let display = derive_display_status(r, now, &working, &conn);
+            *counts.entry(display.clone()).or_default() += 1;
+            let mut v = list_body(r, true, is_stale(r, now, &working));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("display_status".into(), json!(display));
+            }
+            items.push(v);
+        }
+
+        Ok((items, counts))
+    })
+    .await;
+    let (items, counts) = match joined {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    Json(crate::api::measured::measured(
+        json!({
+            "items": items,
+            "counts": counts,
+            "total": items.len(),
+            "note": "display_status is computed from durable facts, never stored. \
+                     Rules: aged-needsyou (>14d), stalled (doing + session idle >1h), \
+                     stale (auto-captured todo >72h, no log), verified-candidate \
+                     (done + evidence), unblocked (all deps resolved). Otherwise \
+                     the stored status.",
+        }),
+        items.len(),
+    ))
+    .into_response()
+}
+
+fn derive_display_status(
+    row: &IssueRow,
+    now: i64,
+    working: &std::collections::BTreeSet<String>,
+    conn: &Connection,
+) -> String {
+    let status = row.status.as_str();
+    let age_secs = now - row.created;
+
+    // 1. Aged needsyou: status=needsyou and sitting longer than 14 days.
+    if status == "needsyou" {
+        let in_state_secs = row
+            .entered_state_at
+            .map(|t| now - t)
+            .unwrap_or(age_secs);
+        if in_state_secs > 14 * 86_400 {
+            return "aged-needsyou".into();
+        }
+    }
+
+    // 2. Stalled: status=doing but the assigned session is not active.
+    if status == "doing" {
+        if let Some(sess) = row.session.as_deref().filter(|s| !s.is_empty()) {
+            let idle_secs = now - row.updated;
+            if idle_secs > 3600 && !working.contains(sess) {
+                return "stalled".into();
+            }
+        }
+    }
+
+    // 3. Stale autofix/capture: auto-captured todo older than 72h with no log.
+    if status == "todo" {
+        let is_auto = row
+            .source
+            .as_deref()
+            .is_some_and(|s| s == "capture" || s == "autofix");
+        let no_activity = row
+            .log
+            .as_deref()
+            .map(|l| l.trim().is_empty())
+            .unwrap_or(true);
+        if is_auto && age_secs > 72 * 3600 && no_activity {
+            return "stale".into();
+        }
+    }
+
+    // 4. Verified candidate: done with evidence recorded.
+    if status == "done" && row.evidence.is_some() {
+        return "verified-candidate".into();
+    }
+
+    // 5. Unblocked: has dependencies and all are resolved (done/verified/discarded).
+    if !row.depends_on.is_empty() && matches!(status, "todo" | "backlog" | "doing") {
+        let all_resolved = row.depends_on.iter().all(|dep_id| {
+            bs::get_issue(conn, dep_id)
+                .ok()
+                .flatten()
+                .is_some_and(|dep| {
+                    matches!(
+                        dep.status.as_str(),
+                        "done" | "verified" | "discarded"
+                    )
+                })
+        });
+        if all_resolved {
+            return "unblocked".into();
+        }
+    }
+
+    // 6. Passthrough: the stored status.
+    status.to_string()
+}
 
 /// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
 ///
@@ -337,6 +503,8 @@ const NEEDSYOU_VIEW_CAP: usize = 10;
 pub(crate) enum FrontierExclusion {
     /// Carries the `blocked_on` dimension (AMUX-3949).
     Blocked,
+    /// Dormant containers and event watches are not actionable queue work.
+    DormantType,
     /// The continuation gate is on for this lane and the card cannot satisfy it
     /// (AMUX-3946), so `doing` would refuse it.
     NoContinuation,
@@ -358,6 +526,9 @@ pub(crate) fn frontier_exclusion(
     if bs::parse_status(&row.status) == Some(TaskStatus::Blocked) {
         return Some(FrontierExclusion::Blocked);
     }
+    if matches!(row.item_type.as_str(), "tripwire" | "watch" | "epic") {
+        return Some(FrontierExclusion::DormantType);
+    }
     if gate_on
         && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
             != bs::ContinuationVerdict::Ok
@@ -374,6 +545,8 @@ mod frontier_exclusion_tests {
     fn row(status: &str) -> bs::IssueRow {
         let conn = crate::db::migrate::test_memdb();
         let new = bs::NewIssue {
+            acceptance_criteria: None,
+            next_action: None,
             title: "t".into(),
             desc: String::new(),
             status: status.into(),
@@ -465,6 +638,23 @@ mod frontier_exclusion_tests {
         assert_eq!(frontier_exclusion(&w, true), None, "an empty string is not a block");
     }
 
+    /// AMUX-4203/RH-125: a status update on a stale-trigger watch should append
+    /// evidence, not resurrect the watch into current WIP.
+    #[test]
+    fn dormant_types_are_never_on_the_ready_frontier() {
+        let mut r = row("todo");
+        r.next_action = Some("Poll the external source when the watcher fires".into());
+        for item_type in ["tripwire", "watch", "epic"] {
+            let mut dormant = r.clone();
+            dormant.item_type = item_type.into();
+            assert_eq!(
+                frontier_exclusion(&dormant, false),
+                Some(FrontierExclusion::DormantType),
+                "{item_type} must not be claimable queue work"
+            );
+        }
+    }
+
     /// The continuation arm, and the control that it only fires when the gate is
     /// ON for the lane. 51 lanes have not opted in, and excluding their cards
     /// would empty every one of their frontiers.
@@ -546,7 +736,8 @@ async fn ready_frontier(
         "ready": f.ready,
         "claimable_now": f.claimable_now,
         "wip": {"doing": f.holding.len(), "cap": f.wip_cap, "available": f.wip_available,
-                "holding": f.holding},
+                "holding": f.holding, "measured": f.wip_measured,
+                "why_unmeasured": if f.wip_measured { None } else { Some("WIP capacity query failed; claims are unavailable") }},
         "excluded": {
             "blocked_by_deps": f.blocked_by_deps,
             "blocked_by_parked_dep": f.blocked_by_parked_dep,
@@ -555,6 +746,50 @@ async fn ready_frontier(
         },
     });
     Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
+
+/// CDC catch-up: returns board_change_log rows after a given seq.
+/// Clients call this after an SSE reconnect to replay missed mutations.
+async fn board_changes(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let since_seq: i64 = q
+        .get("since_seq")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+        .clamp(1, 5000);
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "db read failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::runtime_jobs::cdc_poller::changes_since(&conn, since_seq, limit) {
+        Ok(rows) => {
+            let cursor = crate::runtime_jobs::cdc_poller::last_seq();
+            Json(json!({
+                "changes": rows,
+                "cursor": cursor,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query failed: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// (considered, moved, refused) carried out of the bulk-migrate write closure,
@@ -622,6 +857,7 @@ fn unanimous_gate(considered: usize, moved: usize, refused: &[Value]) -> Option<
 async fn bulk_migrate(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Option<Json<Value>>,
 ) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
@@ -643,7 +879,20 @@ async fn bulk_migrate(
     if from == to {
         return err(StatusCode::BAD_REQUEST, json!({"error": "from and to are the same column"}));
     }
-    let actor = actor_from_headers(&headers).1;
+    // WHO IS CLEARING THE COLUMN (AMUX-4755). The dashboard is not a worker, so
+    // the ordinary resolution below answers `api-anonymous` for every click, and
+    // the biggest destructive action on the board carried no actor at all. The
+    // browser does present the owner bearer on every call, so ask for that
+    // rather than leaving the strongest available credential unread.
+    //
+    // ONLY WHEN THE ORDINARY ANSWER GAVE UP, and the order is load-bearing: a
+    // worker or a verified member keeps its own name (see `owner_token_actor`).
+    let actor = match actor_from_headers(&headers).1 {
+        a if a == "api-anonymous" => super::auth::owner_token_actor(&state, &headers, &uri)
+            .map(str::to_string)
+            .unwrap_or(a),
+        a => a,
+    };
 
     // THE GATE CHECK, once, up front, on a READ. Doing it inside the write
     // closure meant smuggling the verdict out through a fake event; a column's
@@ -693,10 +942,23 @@ async fn bulk_migrate(
             let mut moved = 0usize;
             let mut refused: Vec<Value> = Vec::new();
             let mut events = Vec::new();
+            // SAY IT WAS A SWEEP, ON THE CARD (AMUX-4755). The line used to read
+            // "bulk-migrated backlog -> discarded by <actor>", which a later
+            // reader cannot tell from a decision made about THIS card. It is the
+            // difference that matters: AF-398 and AF-640 were each read as
+            // individually retired when both were simply in a column somebody
+            // cleared, and the second was re-derived from scratch a day later.
+            //
+            // The count is the CONSIDERED population, named as such — `moved` is
+            // not known until the loop ends, and a card cannot honestly carry a
+            // number its own transition is still contributing to.
+            let scope = format!("{} cards considered", ids.len());
             for id in &ids {
                 let opts = crate::db::advance::AdvanceOpts {
                     expected_from: Some(f3.clone()),
-                    log_line: Some(format!("bulk-migrated {f3} -> {t3} by {actor3}")),
+                    log_line: Some(format!(
+                        "bulk-migrated {f3} -> {t3} by {actor3} (column sweep, {scope})"
+                    )),
                     ..Default::default()
                 };
                 match crate::db::advance::advance(conn, id, &t3, &actor3, &opts)? {
@@ -741,9 +1003,37 @@ async fn bulk_migrate(
                     }),
                 );
             }
+            // THE REGRESSION ANNOUNCER (AMUX-4755, the repo's two-fix rule). The
+            // defect was invisible for weeks because an unattributed sweep looks
+            // exactly like an attributed one from outside; nothing anywhere said
+            // "this write had no author". Now a sweep of the logs finds it by
+            // verdict, and the WARN fires on the same condition the fix targets,
+            // so if the dashboard ever stops presenting its bearer the next one
+            // announces itself instead of waiting to be noticed on a card.
+            if actor == "api-anonymous" {
+                tracing::warn!(
+                    target: "amux::board",
+                    verdict = "bulk_migrate_unattributed",
+                    from = %from, to = %to, considered, moved,
+                    "a column sweep was recorded with no actor: nobody can answer who cleared it"
+                );
+            } else {
+                tracing::info!(
+                    target: "amux::board",
+                    verdict = "bulk_migrate",
+                    actor = %actor, from = %from, to = %to, considered, moved,
+                    refused = refused.len(),
+                    "column sweep recorded"
+                );
+            }
             Json(json!({
                 "ok": true, "from": from, "to": to, "session": lane,
                 "considered": considered, "moved": moved,
+                // WHO THIS WAS RECORDED AS, back to the caller. The dashboard is
+                // the only place a human can notice the audit trail went blank,
+                // and it could not see the name the server stored (ethos rule 4:
+                // publish, beside the answer, whether the measurement ran).
+                "actor": actor,
                 // Named, not just counted: a caller that moved 480 of 489 needs
                 // to know WHICH nine and why, or the number is a mystery.
                 "refused": refused,
@@ -767,6 +1057,7 @@ pub(crate) struct LaneFrontier {
     pub claimable_now: usize,
     pub wip_cap: usize,
     pub wip_available: usize,
+    pub wip_measured: bool,
     pub holding: Vec<String>,
     pub blocked_by_deps: usize,
     /// Of `blocked_by_deps`, the ones whose blocker CANNOT clear on its own:
@@ -787,19 +1078,11 @@ pub(crate) fn lane_frontier(
     // same type exclusions, same archived/deleted filter. A frontier that
     // disagreed with the gate would offer cards the gate then refuses, which is
     // the view/mechanism split ethos rule 1 is about.
-    let holding: Vec<String> = conn
-        .prepare(
-            "SELECT id FROM issues WHERE session = ?1 AND status = 'doing' \
-               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') ORDER BY id",
-        )
-        .and_then(|mut st| {
-            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .unwrap_or_default();
+    let holding_result = crate::runtime_jobs::board_drive::wip_holding_ids(conn, lane, None);
+    let wip_measured = holding_result.is_ok();
+    let holding = holding_result.unwrap_or_default();
     let cap = crate::runtime_jobs::board_drive::wip_cap().max(0) as usize;
-    let available = cap.saturating_sub(holding.len());
+    let available = if wip_measured { cap.saturating_sub(holding.len()) } else { 0 };
 
     // Candidates: claimable cards this lane owns. `todo` only — `backlog` is
     // parked on a trigger and `review` is somebody else's turn.
@@ -856,6 +1139,9 @@ pub(crate) fn lane_frontier(
                 blocked_by_deps += 1;
                 continue;
             }
+            Some(FrontierExclusion::DormantType) => {
+                continue;
+            }
             Some(FrontierExclusion::NoContinuation) => {
                 missing_continuation += 1;
                 continue;
@@ -883,6 +1169,7 @@ pub(crate) fn lane_frontier(
         ready,
         wip_cap: cap,
         wip_available: available,
+        wip_measured,
         holding,
         blocked_by_deps,
         blocked_by_parked_dep,
@@ -931,7 +1218,7 @@ async fn get_contract(
     if let Ok(conn) = state.store.read() {
         for &st in &statuses {
             if let Some(target) = bs::parse_status(st) {
-                if let Some(g) = bs::configured_gate(&conn, target) {
+                if let Some((g, _additive)) = bs::configured_gate(&conn, target) {
                     global_gates.insert(st.to_string(), json!(g));
                 }
             }
@@ -1036,11 +1323,16 @@ async fn get_contract(
         // 1372 open cards, measured 2026-08-29). Published here for the AF-112
         // reason the `verified` block gives below.
         "done_requires_evidence": {
-            "rule": "a card entering done must carry `evidence`: what was actually run or produced",
+            "rule": "a card entering done or verified must carry `evidence`: what was actually run or produced",
             "why": "the asset-link rule looks for a path-shaped token anywhere in the desc, which the FILING supplies — a card that names the file it intends to edit passes its own done gate before anyone touches that file",
             "accepts": "a command (backticked, or on a `$ ` line), a repo file path, a URL, a commit sha, a #PR — or `none: <reason>` (3+ words) when the card genuinely produced no artifact",
             "field": "`evidence`, writable on its own so it can be recorded BEFORE the transition that needs it",
-            "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
+            "enforced": "server-validated on any transition to done or verified; force bypasses it (logged); gate_ack cannot",
+            "verified_too": "AMUX-4657: a card moved straight to verified used to skip this rule, so verified applies it as well",
+            "codes": {
+                "done": ["done_requires_evidence", "done_evidence_has_no_artifact", "done_evidence_none_unexplained"],
+                "verified": ["verified_requires_evidence", "verified_evidence_has_no_artifact", "verified_evidence_none_unexplained"],
+            },
             "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global configuration to opt that level out",
             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
         },
@@ -1079,14 +1371,25 @@ async fn get_contract(
             // where no refusal exists to correct you.
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
-        "worker_requests": {
-            "cli": "amux board request <worker> <title> [--desc ...] [--callback-prompt ...] [--no-callback]",
-            "api": "POST /api/board with a different session plus callback:true, a prompt string, or {prompt}; X-Amux-Worker is the verified requester",
-            "lifecycle": "created in backlog, advanced by board-drive through the same dependencies, priorities, gates and terminal states as every other task",
-            "callback": "optional; request CLI arms it by default. It fires exactly when the card first enters done, verified, or discarded and queues a durable message to the verified requester",
-            "durability": "requested_by, callback target/prompt/state/message id/fired time/error live on the task. A stable steering id makes restart recovery idempotent; model/provider context is not involved",
-            "visibility": "the initial request and terminal callback are Messages rows linked to the same task id; the card carries requester, callback state, action log and produced assets",
-            "security": "a callback can return only to the server-verified requester; isolated raw workers remain outside harness delivery",
+        "worker_board_ownership": {
+            "rule": "workers create and drain their own board; verified caller identity determines ownership",
+            "dependencies": "depends_on must reference existing cards on the same worker board, including during reassignment and fan-out; delegation cannot override this. Foreign artifacts belong in description/evidence, and the owner implements missing components",
+            "peer_messages": "coordination remains in Messages without automatically minting recipient tasks or callbacks",
+            "delegation": "request_to is refused by default (cross_board_delegation_forbidden); AMUX_BOARD_DELEGATION=1 is an explicit legacy cooperative-mode opt-in resolved by worker/group/global settings, not permission a worker should grant itself",
+            "security": "worker create and reassignment cannot place cards on peers; administrative callers retain placement, while dependency validation remains atomic"
+        },
+        "capture_decomposition": {
+            "cli": "amux board decompose <capture-id> --stdin",
+            "plan_shape": {"tasks":[
+                {"title":"Parse invoices", "description":"Parse and validate invoice rows", "type":"chore", "priority":1, "depends_on":[], "next_action":"Implement strict CSV parsing", "acceptance_criteria":["Malformed amounts exit nonzero with an explicit diagnostic"]},
+                {"title":"Produce report", "description":"Generate a report from valid rows", "type":"chore", "priority":1, "depends_on":[1], "next_action":"Generate the customer totals", "acceptance_criteria":["The report totals match the input invoices"]}
+            ]},
+            "atomicity": "the root becomes an epic and all 2-50 children are created in one SQLite writer transaction; any invalid child creates zero",
+            "required_per_child": ["unique title", "concrete description", "non-epic type", "p0-p3 priority", "earlier-task dependency indexes", "concrete next_action", "1-12 falsifiable acceptance_criteria"],
+            "idempotency": "the normalized plan SHA-256 is durable on the root epic; an identical retry returns idempotent=true and a different retry returns 409 decomposition_plan_conflict",
+            "dependency_execution": "todo/backlog claims are refused until every dependency is resolved: runtime-changing types require verified; other types may finish at done; missing or discarded dependencies remain blocking, and a committed successor is not stranded by unrelated todo queue depth",
+            "graph": "GET /api/graph/board: versioned snapshot of tasks, workers, artifacts and recorded messages, typed provenance, cycle/missing-reference verification, and deterministic prerequisite-first layers. GET /api/graph/board/verify or amux board graph --check: lightweight structural preflight using the same verifier, without task prose. Structural order is not a workflow readiness or artifact-existence claim. Mutate through board/decompose/artifacts APIs; periodic board.graph_integrity detects legacy corruption.",
+            "completion": "when every required child and linked canonical outcome meets the dependency completion gate (verified for runtime changes; done for other types), board-drive closes the root epic; discarded and quarantined required outcomes do not count as success",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
@@ -1665,6 +1968,18 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn scoped_board_forbidden(scope: &super::org::MemberScope, resource: &str) -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "outside local member access scope",
+            "scope_level": scope.level(),
+            "scope_name": scope.name(),
+            "resource": resource,
+        }),
+    )
+}
+
 use super::internal;
 
 fn not_found(id: &str) -> Response {
@@ -1773,7 +2088,17 @@ fn fold_capture_for_worker_card(
         &AdvanceOpts {
             force: true,
             expected_from: Some("doing".into()),
-            log_line: Some(format!("capture folded into {}", new.id)),
+            // AF-616: THIS PATH GUESSED THE TARGET, so say so. The query
+            // below picks the most recent unclaimed capture for the lane, which
+            // means "the first card since the message" and not "this card is
+            // about that message". The declared path (`--folded-into`, where a
+            // lane names its own target) writes the same line WITHOUT this
+            // marker, so a reader can tell an assertion from an inference.
+            log_line: Some(format!(
+                "capture folded into {} {}",
+                new.id,
+                bs::FOLD_INFERRED_MARKER
+            )),
             skip_continuation: true,
             ..AdvanceOpts::default()
         },
@@ -1856,7 +2181,9 @@ fn hhmm() -> String {
 /// fixes every already-installed CLI copy at once, and closes both effects
 /// together, whereas patching curl lines fixes only the machines that upgrade.
 fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
-    match Some(crate::api::groups::hdr_worker(headers))
+    match super::org::local_member_actor(headers)
+        .map(str::to_string)
+        .or_else(|| Some(crate::api::groups::hdr_worker(headers)))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -1903,6 +2230,114 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// Resolved through `session_is_isolated`, the same predicate the fleet filter
 /// and the send guard consult, so a card cannot claim a reachability the send
 /// path disagrees with.
+/// Publish whether this card still claims live work, BESIDE the fields a
+/// consumer would otherwise derive it from (AF-555).
+///
+/// A row ships 48 fields including `status` and `archived` and, until this,
+/// nothing that answered the question every consumer actually asks. So every
+/// consumer derived it, and a derivation nobody publishes is a derivation that
+/// diverges. gtm-engine's `is_active_card` read status and never `archived`,
+/// so an archived card in a dispatchable status suppressed a hand-raiser
+/// breach page while reaching nobody — board_drive excludes archived from
+/// dispatch and every closing verb refuses it, so the alarm went quiet because
+/// of a card that can be neither worked nor closed. 785 cards are archived
+/// while holding a non-terminal status, so the ambiguity is not rare.
+///
+/// `live_reason` is here because a bare boolean cannot say WHY, and "false"
+/// with no reason is the shape a consumer misreads next. It names which of the
+/// four rules fired.
+///
+/// Rides through slim on purpose: it is NOT in `SLIM_OMITS`, because a
+/// liveness verdict that disappears from the list payload is worse than one
+/// that was never there — `row.get("live")` returning None reads as an answer.
+/// RR-0052 Invariant 2: the 409 a non-holder worker gets for moving a leased
+/// card. Every constraint needs a truthful path in every legitimate state
+/// (ethos rule 3), so the body names all three: ask the holder, let the lease
+/// lapse (the reaper frees a silent holder's card), or override on the record.
+pub(crate) fn lease_held_409(row: &IssueRow, caller_lane: &str, target: &str, now: i64) -> Value {
+    let holder = row.lease_owner.as_deref().unwrap_or("");
+    json!({
+        "error": "lease_held",
+        "ok": false,
+        "blocked": true,
+        "card": row.id,
+        "holder": holder,
+        "caller": caller_lane,
+        "from": row.status,
+        "to": target,
+        "lease": {
+            "acquired_at": row.lease_acquired_at,
+            "heartbeat_at": row.lease_heartbeat_at,
+            "heartbeat_age_s": row.lease_heartbeat_at.map(|h| now - h),
+            "expires_at": row.lease_expires_at,
+            "generation": row.lease_generation,
+        },
+        "why": format!(
+            "{} holds the lease on {}: only the holder moves a card it is working. \
+             A move by another lane would strand the holder's attempt mid-work.",
+            holder, row.id
+        ),
+        "exits": {
+            "ask_the_holder": format!("amux send {holder} --stdin   (ask them to move {} to {target})", row.id),
+            "wait_for_expiry": "a holder that stops reporting loses the lease at expires_at; the board driver returns the card to todo and you can claim it",
+            "override_on_the_record": format!("amux board {target} {} --force --reason \"<why the holder cannot do this>\"", row.id),
+        },
+    })
+}
+
+/// RR-0052: who holds this card and how fresh the holding is, as one object on
+/// every row that carries a lease (absent otherwise, so "no lease" and "lease
+/// with a null field" never read the same). Kept OUT of `snapshot_fields` on
+/// purpose: that is the replay/journal snapshot, and a heartbeat moving every
+/// minute is not a card change the journal should see.
+fn designate_lease(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    let Some(holder) = row.lease_owner.as_deref().filter(|h| !h.is_empty()) else {
+        return;
+    };
+    obj.insert(
+        "lease".into(),
+        json!({
+            "holder": holder,
+            "acquired_at": row.lease_acquired_at,
+            "heartbeat_at": row.lease_heartbeat_at,
+            "expires_at": row.lease_expires_at,
+            "generation": row.lease_generation,
+        }),
+    );
+}
+
+fn designate_live_state(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    let (live, reason) = live_state(row);
+    obj.insert("live".into(), json!(live));
+    obj.insert("live_reason".into(), json!(reason));
+}
+
+/// The four rules, in order. Exported for tests and for any in-process caller
+/// that would otherwise write a fifth copy of this.
+pub(crate) fn live_state(row: &IssueRow) -> (bool, &'static str) {
+    // NO `deleted` ARM: `IssueRow` carries no such field, because a deleted row
+    // is filtered before it ever reaches serialization. Checked rather than
+    // assumed — writing one would have compiled against a field that is not
+    // there, which is how you get a rule that reads as covered and never runs.
+    let Some(st) = crate::db::board_store::parse_status(&row.status) else {
+        // An unparseable status is NOT reported as dead. A card whose status we
+        // cannot read is a card we cannot speak for, and answering "not live"
+        // would be a measurement that never ran wearing the clothes of one that
+        // did (ethos rule 4).
+        return (true, "status_unparseable");
+    };
+    if !st.claims_live_work() {
+        return (false, "status_claims_no_work");
+    }
+    if row.archived != 0 && !st.survives_archive() {
+        return (false, "archived");
+    }
+    if row.archived != 0 {
+        return (true, "archived_but_ask_still_owed");
+    }
+    (true, "live")
+}
+
 fn designate_owner_reach(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
     if !row.session.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated) {
         // Absent rather than `false`: this is a rare property and a key on every
@@ -1925,6 +2360,11 @@ fn detail_body(row: &IssueRow) -> Value {
     // insertion covers both shipped paths (AMUX-3713).
     if let Some(obj) = v.as_object_mut() {
         designate_owner_reach(obj, row);
+        // Same reasoning, same place: the single-card GET must carry the
+        // liveness verdict too, or a consumer that fetches one card gets a
+        // different contract from one that lists.
+        designate_live_state(obj, row);
+        designate_lease(obj, row);
     }
     v
 }
@@ -1935,6 +2375,11 @@ pub(crate) struct CallbackDispatch {
     pub attempted: usize,
     pub queued: usize,
     pub refused: usize,
+    /// AMUX-4558: callbacks closed without sending, because a discarded
+    /// capture shell owes its sender nothing. Counted rather than silent: a
+    /// drop nobody can see is how a cleanup that sends nothing and a cleanup
+    /// that sends 118 receipts look identical in the log.
+    pub suppressed: usize,
 }
 
 /// Drain terminal task callbacks through the same durable steering path as all
@@ -1987,6 +2432,17 @@ pub(crate) async fn dispatch_pending_callbacks(
                 if !matches!(row.callback_state.as_deref(), Some("pending" | "dispatching")) {
                     return Ok(no_write());
                 }
+                if !bs::dependency_is_resolved(&row.status, &row.item_type) && row.status != "discarded" {
+                    tracing::warn!(marker = "dependency_callback_not_resolved", task_id = %row.id,
+                        status = %row.status, measured = true, n_considered = 1,
+                        "withholding pending callback because dependency no longer resolves");
+                    row.callback_state = Some("armed".into());
+                    row.callback_error = Some("Waiting for verified dependency resolution".into());
+                    row.rev += 1;
+                    row.version += 1;
+                    bs::save_patched(conn, &mut row)?;
+                    return Ok(WriteOutcome { applied: true, events: vec![ev_snap(&row, MutationKind::Updated)] });
+                }
                 row.callback_state = Some("dispatching".into());
                 row.callback_message_id = Some(stable_w);
                 row.callback_error = None;
@@ -2008,20 +2464,133 @@ pub(crate) async fn dispatch_pending_callbacks(
             continue;
         };
         let sender = row.session.clone().unwrap_or_else(|| "board".into());
+        // Derive the return address from the durable dependency graph, never
+        // from remembered prose. A callback must resume the requester's task,
+        // not make the producer's child its new current-task context.
+        let parents: Vec<IssueRow> = match state.store.read().and_then(|conn| {
+            Ok(bs::list_issues(&conn, &[], std::slice::from_ref(&target), bs::ArchivedFilter::ActiveOnly)?)
+        }) {
+            Ok(rows) => rows.into_iter()
+                .filter(|parent| parent.depends_on.contains(&row.id) && !bs::is_terminal_status(&parent.status))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(marker = "dependency_callback_graph_unmeasured", task_id = %row.id,
+                    %error, measured = false, n_considered = 0,
+                    "callback awaits a successful graph lookup before delivery");
+                continue;
+            }
+        };
+        let context_card = if parents.len() == 1 { parents[0].id.clone() } else { row.id.clone() };
         let outcome = row
             .last_result
             .as_deref()
             .or(row.evidence.as_deref())
             .unwrap_or("The complete action log and produced assets are on the task card.");
+        // A FOLD IS NOT AN ABANDONMENT. `capture folded into <ID>` means the
+        // lane did the right thing: amux auto-captured an inbound routed
+        // message as a card, they carded the real work properly, and discarded
+        // the empty shell. Telling the ROUTING lane that their peer "closed the
+        // request without resolving the dependency" puts a false accusation in
+        // front of the one party who will act on it.
+        let folded = bs::folded_into_detail(row.log.as_deref());
+        // AMUX-4558. The sender of a captured message made no request, so a
+        // discard owes them no receipt. Suppressed here rather than at arming
+        // time because only this point knows whether the discard was a FOLD:
+        // `folded_into` is written on the way out, and a fold DOES owe the
+        // sender the id their content moved to.
+        if folded.is_none() && bs::is_capture_shell(&row) && row.status == "discarded" {
+            report.suppressed += 1;
+            let id_w = row.id.clone();
+            let stable_w = stable_id.clone();
+            let _ = state
+                .store
+                .write_async(move |conn| {
+                    let Some(mut latest) = bs::get_issue(conn, &id_w)? else {
+                        return Ok(no_write());
+                    };
+                    if latest.callback_message_id.as_deref() != Some(stable_w.as_str()) {
+                        return Ok(no_write());
+                    }
+                    latest.callback_state = Some("suppressed".into());
+                    latest.callback_error = None;
+                    latest.updated = now_secs();
+                    latest.rev += 1;
+                    latest.version += 1;
+                    bs::save_patched(conn, &mut latest)?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![ev_snap(&latest, MutationKind::Updated)],
+                    })
+                })
+                .await;
+            tracing::info!(
+                marker = "callbacks_suppressed_capture_discard",
+                verdict = "callbacks_suppressed_capture_discard",
+                task_id = %row.id,
+                target_session = %target,
+                sender = %row.session.as_deref().unwrap_or("board"),
+                measured = true,
+                n_considered = 1,
+                "closed a capture-discard callback instead of sending a receipt for a message that was not a request"
+            );
+            continue;
+        }
+        let folded_note;
+        let resolution = if let Some((target, inferred)) = folded.as_ref() {
+            // AF-616: an INFERRED target was chosen by adjacency and nothing
+            // compared it to the capture. Saying so costs one clause and is the
+            // difference between a fact and a guess for the lane reading this.
+            folded_note = if *inferred {
+                format!(
+                    "folded this capture into {target} (target inferred from timing, \
+                     not declared -- confirm it is about the capture)"
+                )
+            } else {
+                format!("folded this capture into {target}")
+            };
+            folded_note.as_str()
+        } else if bs::dependency_is_resolved(&row.status, &row.item_type) {
+            "resolved the dependency"
+        } else {
+            // AF-634's wording for an unfolded capture discard ("owed you
+            // nothing") used to live here. It is gone because that case no
+            // longer reaches this point: AMUX-4558 closes the callback above
+            // instead of composing a receipt. Its reasoning is kept there.
+            "closed the request without resolving the dependency"
+        };
         let mut prompt = format!(
-            "[task callback {}: {}] {} finished the task you requested. \
-             Terminal state: {}.\nOutcome: {}\nOpen board card {} for gates, action history, \
-             source message, epic, and produced assets.",
-            row.id, row.title, sender, row.status, outcome, row.id
+            "[task callback {}: {}] {} {}. \
+             State: {}.\nOutcome: {}\nOpen board card {} for verification evidence, action history, \
+             source message, and produced assets.",
+            row.id, row.title, sender, resolution, row.status, outcome, row.id
         );
-        if let Some(instruction) = row.callback_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Ok(conn) = state.store.read() {
+            for parent in &parents {
+                let blocking = crate::runtime_jobs::board_drive::deps_blocking(&conn, parent);
+                prompt.push_str(&format!("\nOriginal task {} — {}. Next action: {}.",
+                    parent.id, parent.title, parent.next_action.as_deref().unwrap_or("Read the original task and continue its work")));
+                if blocking.is_empty() {
+                    prompt.push_str(" All linked dependencies are resolved. Re-read and resume this original task now through its normal board claim. Keep the links as history; they no longer block it.");
+                } else {
+                    prompt.push_str(&format!(" Still blocked by: {}. Do not claim it until these dependencies resolve.", blocking.join(", ")));
+                }
+            }
+        }
+        let instruction = row.callback_prompt.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        // Older auto-captures stored this instruction on the RETURN message,
+        // addressed to the requester who was already being notified. Gemini
+        // turned those receipts into repeated reviews and new capture tasks.
+        let legacy_echo = instruction == Some("Notify the requesting worker with the terminal outcome and every produced asset.");
+        if legacy_echo {
+            tracing::warn!(task_id = %row.id, target_session = %target, measured = true,
+                n_considered = 1, verdict = "callback_echo_instruction_suppressed",
+                "legacy callback asked its recipient to repeat the notification");
+        }
+        if let Some(instruction) = instruction.filter(|_| !legacy_echo) {
             prompt.push_str("\nCallback instruction: ");
-            prompt.push_str(instruction.trim());
+            prompt.push_str(instruction);
+        } else {
+            prompt.push_str("\nThis receipt already notifies you as the requester. Do not acknowledge or relay it back, or create another task merely to process this notification. Resume your original linked task only when it has remaining actionable work.");
         }
         let guard = format!("task-callback:{}", row.id);
         // Re-resolve policy at delivery time. The request was authorized when
@@ -2047,6 +2616,8 @@ pub(crate) async fn dispatch_pending_callbacks(
         let sender_w = sender.clone();
         let prompt_w = prompt.clone();
         let stable_w = stable_id.clone();
+        let parents_w: Vec<String> = parents.iter().map(|parent| parent.id.clone()).collect();
+        let context_w = context_card.clone();
         match delivered {
             Ok(_) => {
                 report.queued += 1;
@@ -2071,8 +2642,8 @@ pub(crate) async fn dispatch_pending_callbacks(
                     ));
                     bs::save_patched(conn, &mut latest)?;
                     let exists = conn.query_row(
-                        "SELECT 1 FROM cmd_history WHERE card_id=?1 AND type='task-callback' LIMIT 1",
-                        rusqlite::params![id_w], |_| Ok(true),
+                        "SELECT 1 FROM cmd_history WHERE session=?1 AND type='task-callback' AND text LIKE ?2 LIMIT 1",
+                        rusqlite::params![target_w, format!("[task callback {id_w}:%")], |_| Ok(true),
                     ).unwrap_or(false);
                     let mut events = vec![ev_snap(&latest, MutationKind::Updated)];
                     if !exists {
@@ -2080,9 +2651,23 @@ pub(crate) async fn dispatch_pending_callbacks(
                             "INSERT INTO cmd_history \
                              (text,type,session,ts,origin,card_id,delivery,queued_at) \
                              VALUES (?1,'task-callback',?2,?3,?4,?5,'queued',?3)",
-                            rusqlite::params![prompt_w, target_w, now * 1000, sender_w, id_w],
+                            rusqlite::params![prompt_w, target_w, now * 1000, sender_w, context_w],
                         )?;
                         let message_id = conn.last_insert_rowid();
+                        for parent_id in &parents_w {
+                            let Some(mut parent) = bs::get_issue(conn, parent_id)? else { continue; };
+                            if !parent.depends_on.contains(&id_w) { continue; }
+                            parent.log = Some(bs::append_log(parent.log.as_deref(), &hhmm(),
+                                &format!("dependency {id_w} reported {} by {sender_w}; callback {stable_w}, message MSG-{message_id} completion indicator queued for this task", latest.status)));
+                            parent.updated = now;
+                            parent.rev += 1;
+                            parent.version += 1;
+                            bs::save_patched(conn, &mut parent)?;
+                            events.push(ev_snap(&parent, MutationKind::Updated));
+                        }
+                        tracing::info!(marker = "dependency_callback_linked", task_id = %id_w,
+                            original_task = %context_w, message_id, measured = true,
+                            n_considered = parents_w.len(), "completion callback linked to its original work");
                         events.push(crate::db::PendingEvent {
                             entity_type: amux_core::revision::EntityType::Message,
                             entity_id: format!("MSG-{message_id}"),
@@ -2140,7 +2725,14 @@ mod callback_dispatch_tests {
     }
 
     fn pending_request(state: &AppState) -> String {
+        request_at(state, "verified")
+    }
+
+    fn request_at(state: &AppState, status: &str) -> String {
+        let status = status.to_owned();
         let new = bs::NewIssue {
+            acceptance_criteria: None,
+            next_action: None,
             title: "Produce the launch report".into(),
             desc: "Requested by another worker.".into(),
             status: "todo".into(),
@@ -2168,7 +2760,7 @@ mod callback_dispatch_tests {
         let id_w = id.clone();
         state.store.write(move |conn| {
             let mut row = bs::create_issue(conn, &new, 1000)?;
-            row.status = "done".into();
+            row.status = status;
             row.last_result = Some("Report written to /tmp/launch-report.md".into());
             row.updated = 2000;
             row.rev += 1;
@@ -2179,6 +2771,236 @@ mod callback_dispatch_tests {
         }).expect("create and complete request");
         let created_id = id.lock().unwrap().clone();
         created_id
+    }
+
+    /// A capture shell: the card amux makes out of somebody's inbound message.
+    /// `fold_target` writes the server's own fold marker into the log.
+    fn capture_shell(state: &AppState, fold_target: Option<&str>) -> String {
+        let new = bs::NewIssue {
+            acceptance_criteria: None,
+            next_action: None,
+            title: "whats the status on the rollout".into(),
+            desc: "**Prompt:** whats the status on the rollout".into(),
+            status: "todo".into(),
+            session: Some("worker-b".into()),
+            item_type: "code".into(),
+            creator: "amux".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            ask_actor: None,
+            source: Some("agent".into()),
+            requested_by: Some("worker-a".into()),
+            callback_session: Some("worker-a".into()),
+            callback_prompt: None,
+        };
+        let fold = fold_target.map(str::to_owned);
+        let id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let id_w = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::create_issue(conn, &new, 1000)?;
+            if let Some(target) = &fold {
+                row.log = Some(format!("`09:15` capture folded into {target}"));
+            }
+            row.status = "discarded".into();
+            row.updated = 2000;
+            row.rev += 1;
+            row.version += 1;
+            bs::save_patched(conn, &mut row)?;   // armed -> pending on discard
+            *id_w.lock().unwrap() = row.id;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).expect("create and discard the capture");
+        let created = id.lock().unwrap().clone();
+        created
+    }
+
+    fn queued_for(state: &AppState, id: &str) -> i64 {
+        let conn = state.store.read().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+            [format!("task-callback-{id}")], |r| r.get(0)).unwrap()
+    }
+
+    /// AMUX-4558. Discarding a capture shell used to send its sender a receipt
+    /// for a message that was never a request: one cleanup on backend's board
+    /// would have sent 118 of them to ~20 lanes, and ts-gke got 19 in a night.
+    /// AF-634 fixed the WORDS of that receipt; a message saying it owed you
+    /// nothing is still a message, so now the callback is closed instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_discarded_capture_shell_closes_its_callback_instead_of_sending_a_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        // Delivery reads the session env file, and without this the callbacks
+        // are refused with "no-env-file" rather than sent. The guard also holds
+        // the test-env lock, so this test cannot borrow another test's HOME:
+        // that is what made an earlier cut of it pass for the wrong reason.
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["worker-a", "worker-b"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let state = state(home.path());
+
+        let shell = capture_shell(&state, None);
+        let report = dispatch_pending_callbacks(&state, Some(&shell)).await;
+        assert_eq!(
+            (report.attempted, report.queued, report.suppressed, report.refused),
+            (1, 0, 1, 0),
+            "an unfolded capture discard is counted as suppressed, not sent"
+        );
+        assert_eq!(queued_for(&state, &shell), 0, "nothing may reach the sender's queue");
+        {
+            let conn = state.store.read().unwrap();
+            let row = bs::get_issue(&conn, &shell).unwrap().unwrap();
+            assert_eq!(row.callback_state.as_deref(), Some("suppressed"),
+                "the callback is CLOSED, not left pending for the next tick to retry");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE type='task-callback'",
+                [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        // A second pass must not find it again: a suppressed callback is terminal.
+        let again = dispatch_pending_callbacks(&state, Some(&shell)).await;
+        assert_eq!((again.attempted, again.suppressed), (0, 0), "suppression is not a retry loop");
+
+        // CONTROL 1: a FOLD still delivers. The sender learns which card their
+        // content became, which is worth the turn it costs them.
+        let folded = capture_shell(&state, Some("REAL-42"));
+        let report = dispatch_pending_callbacks(&state, Some(&folded)).await;
+        assert_eq!((report.queued, report.suppressed), (1, 0), "a fold is not suppressed");
+        assert_eq!(queued_for(&state, &folded), 1);
+        {
+            let conn = state.store.read().unwrap();
+            let text: String = conn.query_row(
+                "SELECT text FROM cmd_history WHERE session='worker-a' AND type='task-callback'",
+                [], |r| r.get(0)).unwrap();
+            assert!(text.contains("folded this capture into REAL-42"), "{text}");
+        }
+
+        // CONTROL 2: a real request that is discarded still reports back. Only
+        // the capture shell is exempt, and `is_capture_shell` is what separates
+        // them; without this the fix would silence genuine requesters.
+        let request = request_at(&state, "discarded");
+        let report = dispatch_pending_callbacks(&state, Some(&request)).await;
+        assert_eq!((report.queued, report.suppressed), (1, 0), "a real request still gets its answer");
+        assert_eq!(queued_for(&state, &request), 1);
+    }
+
+    /// Code completion has two edges: done records implementation, verified
+    /// releases the graph and its durable return message. Drive the real store,
+    /// dispatcher and steering outbox, including recovery, as one scenario.
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_dependency_returns_to_original_task_once() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["worker-a", "worker-b"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let state = state(home.path());
+        let id = request_at(&state, "done");
+        let child = id.clone();
+        state.store.write(move |conn| {
+            conn.execute("INSERT INTO issues(id,title,status,session,type,owner_type,created,updated,depends_on,next_action) \
+                VALUES ('P-1','Integrate the verified report','todo','worker-a','chore','agent',1,1,?1,'Integrate the returned report into the final output')",
+                [serde_json::to_string(&vec![child]).unwrap()])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        {
+            let conn = state.store.read().unwrap();
+            let parent = bs::get_issue(&conn, "P-1").unwrap().unwrap();
+            assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &parent), vec![id.clone()]);
+            assert_eq!(bs::get_issue(&conn, &id).unwrap().unwrap().callback_state.as_deref(), Some("armed"));
+        }
+        assert_eq!(dispatch_pending_callbacks(&state, Some(&id)).await.attempted, 0,
+            "done without verification must neither notify nor resume the original worker");
+        let child = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::get_issue(conn, &child)?.unwrap();
+            row.status = "verified".into(); row.updated = 3000; row.rev += 1; row.version += 1;
+            row.evidence = Some("python verify_report.py -> PASS: report content checked independently".into());
+            bs::save_patched(conn, &mut row)?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let delivered = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((delivered.attempted, delivered.queued, delivered.refused), (1, 1, 0));
+        {
+            let conn = state.store.read().unwrap();
+            let parent = bs::get_issue(&conn, "P-1").unwrap().unwrap();
+            assert!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &parent).is_empty());
+            assert_eq!(parent.depends_on, vec![id.clone()], "keep the linkage as durable history");
+            assert!(parent.log.unwrap().contains(&format!("dependency {id} reported verified by worker-b")));
+            let (text, card, origin): (String, String, String) = conn.query_row(
+                "SELECT text,card_id,origin FROM cmd_history WHERE session='worker-a' AND type='task-callback'",
+                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(card, "P-1", "the worker's current task must remain the original task");
+            assert_eq!(origin, "worker-b");
+            assert!(text.contains("Original task P-1"));
+            assert!(text.contains("All linked dependencies are resolved"));
+            assert!(text.contains("Integrate the returned report"));
+        }
+        let child = id.clone();
+        state.store.write(move |conn| {
+            conn.execute("UPDATE issues SET callback_state='dispatching' WHERE id=?1",[child])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(dispatch_pending_callbacks(&state, Some(&id)).await.queued, 1);
+        let conn = state.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+            [format!("task-callback-{id}")], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE card_id='P-1' AND type='task-callback'",
+            [], |r| r.get::<_, i64>(0)).unwrap(), 1, "recovery cannot duplicate the linked message");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reopened_dependency_cannot_dispatch_a_stale_completion() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        let state = state(home.path());
+        let id = pending_request(&state);
+        let child = id.clone();
+        state.store.write(move |conn| {
+            let mut row = bs::get_issue(conn, &child)?.unwrap();
+            row.status = "doing".into();
+            bs::save_patched(conn, &mut row)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let result = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((result.attempted, result.queued), (1, 0));
+        let conn = state.store.read().unwrap();
+        assert_eq!(bs::get_issue(&conn, &id).unwrap().unwrap().callback_state.as_deref(), Some("armed"));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_callback_receipt_does_not_request_an_acknowledgement_loop() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["worker-a", "worker-b"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let state = state(home.path());
+        let id = pending_request(&state);
+        let child = id.clone();
+        state.store.write(move |conn| {
+            conn.execute("UPDATE issues SET callback_prompt=?1 WHERE id=?2",
+                rusqlite::params!["Notify the requesting worker with the terminal outcome and every produced asset.", child])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let result = dispatch_pending_callbacks(&state, Some(&id)).await;
+        assert_eq!((result.attempted, result.queued), (1, 1));
+        let conn = state.store.read().unwrap();
+        let prompt: String = conn.query_row("SELECT text FROM steering_queue WHERE id=?1",
+            [format!("task-callback-{id}")], |r| r.get(0)).unwrap();
+        assert!(prompt.contains("Report written to /tmp/launch-report.md"));
+        assert!(prompt.contains("Do not acknowledge or relay it back"));
+        assert!(!prompt.contains("Callback instruction:"));
+        assert!(!prompt.contains("Notify the requesting worker"));
     }
 
     /// Happy path plus the crash window: enqueue succeeds, but the process dies
@@ -2300,7 +3122,13 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     // `detail_body` above, which is also the function the single-card GET calls.
     if slim {
         designate_owner_reach(obj, row);
+        designate_lease(obj, row);
     }
+    // BOTH paths, unlike designate_owner_reach above: the full branch gets its
+    // owner-reach fields inside detail_body, but liveness is inserted here so
+    // the list and the single-card GET cannot drift (detail_body carries its
+    // own call for the single-card route).
+    designate_live_state(obj, row);
     // (see designate_owner_reach for why this exists)
     if slim {
         // AF-346: `desc` may be a bounded PREFIX here. The two derivations
@@ -2579,7 +3407,7 @@ const RECOGNISED_BOARD_PARAMS: &[&str] = &[
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
 /// are not surfaced as "ignored" (that would be pure noise on every polled tab).
-const BENIGN_QUERY_KEYS: &[&str] =
+pub(crate) const BENIGN_QUERY_KEYS: &[&str] =
     &["_", "t", "v", "ts", "cb", "_t", "cache", "cachebust", "nocache"];
 
 /// Query keys GET /api/board neither consumes nor treats as a benign
@@ -2738,6 +3566,7 @@ pub struct ExportParams {
 
 pub async fn export_board(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<ExportParams>,
 ) -> Response {
     let conn = match state.store.read() {
@@ -2749,11 +3578,22 @@ pub async fn export_board(
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let workers: Vec<String> = p
+    let mut workers: Vec<String> = p
         .worker
         .as_deref()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if workers.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(&scope, "board export");
+        }
+        if workers.is_empty() {
+            workers = super::org::scoped_worker_names(&scope);
+            if workers.is_empty() {
+                workers.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // Default ActiveOnly: an export is a working document, and silently
     // including archived cards would overstate the board. `archived=all`
     // opts in, and the header below always says which was used.
@@ -2908,7 +3748,18 @@ pub async fn list_board(
     }
     // ETag based on global_rev — saves 3.5MB on unchanged polls.
     let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
-    let etag_val = format!("\"board-{}\"", rev);
+    let member_scope = super::org::local_member_scope(&headers);
+    let scope_etag = member_scope
+        .as_ref()
+        .map(|scope| {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(
+                format!("{}\0{}", scope.level(), scope.name()).as_bytes(),
+            );
+            format!("-{}", &hex::encode(digest)[..12])
+        })
+        .unwrap_or_default();
+    let etag_val = format!("\"board-{}{scope_etag}\"", rev);
     if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
         if inm == etag_val || inm == format!("W/{etag_val}") {
             let mut h = HeaderMap::new();
@@ -2944,7 +3795,20 @@ pub async fn list_board(
             .collect()
     };
     let status_f = split(&p.status);
-    let session_f = split(&p.session);
+    let mut session_f = split(&p.session);
+    if let Some(scope) = member_scope.as_ref().filter(|scope| !scope.is_global()) {
+        if session_f.iter().any(|worker| !scope.allows_worker(worker)) {
+            return scoped_board_forbidden(scope, "board list");
+        }
+        if session_f.is_empty() {
+            session_f = super::org::scoped_worker_names(scope);
+            if session_f.is_empty() {
+                // An empty SQL filter means "all sessions", so use an
+                // impossible sentinel when a group currently has no workers.
+                session_f.push("__amux_no_permitted_worker__".into());
+            }
+        }
+    }
     // `archived` grammar (amux-server.py:68758 + 14025, ported on AMUX-2586 fix #5):
     //   "1"/"true"/"yes"          -> archived-only
     //   any OTHER non-empty value -> non-archived only ("0", "false", "all", "2", ...)
@@ -3021,7 +3885,7 @@ pub async fn list_board(
     let prose = if slim { bs::Prose::SlimDerivations } else { bs::Prose::Full };
     let quota = qp_truthy(p.quota.as_deref());
     let store = state.store.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         // Fused filter+cap with lazy hydration (AMUX-3491): the old
         // list_issues + cap_terminal pair decoded every undeleted row's
@@ -3057,10 +3921,17 @@ pub async fn list_board(
         } else {
             Default::default()
         };
-        Ok((kept, term_total, term_kept, working))
+        // RR-0052: the running attempt number for leased rows, one query over
+        // the running set, only when a leased row is in the page at all.
+        let attempt_nums = if kept.iter().any(|r| r.lease_owner.is_some()) {
+            crate::db::attempts::running_attempt_numbers(&conn).unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        Ok((kept, term_total, term_kept, working, attempt_nums))
     })
     .await;
-    let (kept, term_total, term_kept, working) = match joined {
+    let (kept, term_total, term_kept, working, attempt_nums) = match joined {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
@@ -3156,7 +4027,13 @@ pub async fn list_board(
 
     let items: Vec<Value> = page
         .iter()
-        .map(|r| list_body(r, slim, is_stale(r, now, &working)))
+        .map(|r| {
+            let mut v = list_body(r, slim, is_stale(r, now, &working));
+            if let (Some(n), Some(lease)) = (attempt_nums.get(&r.id), v.get_mut("lease")) {
+                lease["attempt"] = json!(n);
+            }
+            v
+        })
         .collect();
 
     let mut headers = HeaderMap::new();
@@ -3208,6 +4085,83 @@ fn body_opt_str(map: &Map<String, Value>, key: &str) -> Option<Option<String>> {
     }
 }
 
+/// Validates and JSON-encodes a create or PATCH value for `acceptance_criteria`
+/// (AF-711). `None` = clear; `Some(s)` = the string to store, already
+/// JSON-encoded so the read side's `parse_json_or_raw_string` round-trips it
+/// exactly — a plain string stores as a JSON string (`"..."`, reads back as
+/// the identical string) and an array of strings stores as a JSON array
+/// (`[...]`, matching what `board decompose` itself writes). Any other JSON
+/// shape (number, bool, object, or an array with a non-string entry) is
+/// rejected rather than silently coerced into a clear, which is the one
+/// behavior every reporter of this bug agreed was wrong.
+fn encode_acceptance_criteria(v: &Value) -> Result<Option<String>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) if s.trim().is_empty() => Ok(None),
+        Value::String(_) => Ok(Some(serde_json::to_string(v).expect("a JSON string always encodes"))),
+        Value::Array(items) if items.iter().all(Value::is_string) => {
+            if items.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(serde_json::to_string(v).expect("an array of JSON strings always encodes")))
+            }
+        }
+        Value::Array(_) => {
+            Err("acceptance_criteria array entries must all be strings".to_string())
+        }
+        other => Err(format!(
+            "acceptance_criteria must be a string, an array of strings, or null, got {other}"
+        )),
+    }
+}
+
+/// Validates and JSON-encodes a PATCH value for `waiting_on` (AF-930).
+/// `None` = clear; `Some(s)` = the string to store, already JSON-encoded so
+/// `snapshot_fields`'s read side (`serde_json::from_str(s).ok()`) round-trips
+/// it exactly. `waiting_on` is documented (migrations/0048) as a JSON object
+/// `{"actor":...,"type":...,"question":...,"unblocks":...}` -- the exact
+/// shape `advance()`'s Gap-4 logic writes when a card enters NeedsYou.
+///
+/// Before this, `waiting_on` routed through plain `set_opt`, i.e.
+/// `body_opt_str`'s `Some(v) => Some(v.as_str().map(str::to_string))`. An
+/// incoming JSON OBJECT -- the field's own documented, correct shape --
+/// makes `Value::as_str()` return `None`, INDISTINGUISHABLE from an explicit
+/// null-clears-the-field request in that same match arm. The write proceeded
+/// as a silent CLEAR, not a rejected write and not a no-op, with the response
+/// still reporting `applied:true` and the log recording `waiting_on` as
+/// changed. Same defect AF-711 already fixed for `acceptance_criteria` a few
+/// lines above; unfixed here.
+///
+/// Accepts an object (encoded to canonical JSON, matching what `advance()`
+/// itself writes) or a non-empty string (encoded as a JSON string, so a
+/// plain human-readable note also survives the read side's JSON-decode
+/// instead of silently rendering as `null`). Rejects any other JSON shape
+/// (number, bool, array) rather than silently coercing it into a clear.
+fn encode_waiting_on(v: &Value) -> Result<Option<String>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) if s.trim().is_empty() => Ok(None),
+        // AF-935: a caller who pre-serializes the object to a JSON string
+        // (instead of sending the object itself) used to get it silently
+        // double-encoded here -- `serde_json::to_string` on a `Value::String`
+        // re-quotes the already-JSON text, and the read side's single
+        // `serde_json::from_str` pass only strips that outer layer, leaving a
+        // raw string where an object was intended. Reject it with an
+        // actionable message instead of storing corrupted data.
+        Value::String(s) if matches!(serde_json::from_str::<Value>(s), Ok(Value::Object(_))) => {
+            Err("waiting_on was sent as a string containing an already-JSON-encoded object; \
+                 send the object itself as the field's value, not a pre-serialized string of it"
+                .to_string())
+        }
+        Value::String(_) => Ok(Some(serde_json::to_string(v).expect("a JSON string always encodes"))),
+        Value::Object(map) if map.is_empty() => Ok(None),
+        Value::Object(_) => Ok(Some(serde_json::to_string(v).expect("a JSON object always encodes"))),
+        other => Err(format!(
+            "waiting_on must be an object ({{\"actor\":...,\"type\":...,\"question\":...,\"unblocks\":...}}), a string, or null, got {other}"
+        )),
+    }
+}
+
 /// tags/depends_on style list: array of strings; a bare string is coerced to
 /// a one-element list (SP-539: iterating a str exploded it into one tag per
 /// character — 200, no error, silently corrupted card).
@@ -3232,6 +4186,14 @@ fn body_str_list(v: &Value) -> Result<Vec<String>, String> {
         }
         _ => Err("must be a list of strings".into()),
     }
+}
+
+fn foreign_dependency_refusal(deps: &[(String, String)]) -> Value {
+    tracing::warn!(marker="cross_board_dependency_refused", dependencies=?deps,
+        measured=true, n_considered=deps.len(), "foreign task cannot gate a self-contained board");
+    json!({"code":"cross_board_dependency_forbidden", "error":"dependencies must belong to the same worker board",
+        "dependencies":deps.iter().map(|(id,session)|json!({"id":id,"session":session})).collect::<Vec<_>>(),
+        "how_to_fix":"keep the required outcome on your own board and own its missing components; reference existing peer artifacts in the description or evidence instead of depends_on. Do not relocate a peer wait into source_ref, blocked_on, next_action or gate text: keep the actual prerequisite on this board and implement it here. Preserve real access, spend and customer-outbound restrictions."})
 }
 
 fn unknown_type_response(t: &str) -> Response {
@@ -3344,6 +4306,373 @@ fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>
     )
 }
 
+fn fanout_verification_refusal(id: &str, session: Option<&str>, detail: &str) -> Value {
+    tracing::warn!(card=id, session, measured=true, n_considered=1,
+        verdict="fanout_verification_requires_integration", detail,
+        "refused verification without a current clean integrated worktree");
+    json!({
+        "error":detail, "code":"fanout_verification_requires_integration", "item":id,
+        "how_to_fix":"Keep implemented work in review/done with evidence. Recover this worker's own workspace, set its reviewed worktree_base and worktree_verify command, and let the harness validate and integrate the committed candidate. Then verify the actual output. No outside worker or Needs You request is required."
+    })
+}
+
+/// The TAG door's twin of `needsyou_ask_refusal` (AMUX-4590, 2026-09-14).
+///
+/// AF-318/AMUX-3929 closed the STATUS door: a card cannot enter `needsyou`
+/// without a typed ask. The `needs:you*` TAG stayed a second, unvalidated door
+/// into the identical set of exclusions — `deps_blocking`, WIP holding
+/// (`wip_holding_ids`), and backlog dispatch (`dispatch_backlog_when_idle_in`)
+/// all skip a card on the TAG alone, with no regard for its status. A
+/// `PATCH {"tags":["needs:you"]}` carrying no `status` never reaches the
+/// status-transition gate at all, and a `POST` with `status` left at `todo`
+/// skips it the same way at creation.
+///
+/// That gap is not hypothetical: mvs-infra's live board (2026-09-14) carried
+/// `todo`-status cards tagged `needs:you` with the reason written only in
+/// `source_ref` prose — including one titled "Fix Namespace Pollution", the
+/// same shape `needsyou_refuses_a_park_that_names_no_human_act` names as the
+/// archetype the status gate was built to catch. The tag earned the card
+/// every dispatch exclusion the real ask gets, never appeared in
+/// `/api/board/needsyou` (the one queue built to surface asks), and never
+/// accrued the 3-day re-nag that status gets — an ask nobody could find.
+///
+/// Same response shape as the status door on purpose (one contract at either
+/// door), and the escape is the same one: transition the status for real.
+fn needsyou_tag_refusal_body(id: &str, session: Option<&str>, current_status: &str) -> Value {
+    tracing::warn!(
+        "needsyou_tag_gate: blocked a bare needs:you tag on {} for session {} (status stays {})",
+        id,
+        session.unwrap_or("-"),
+        current_status
+    );
+    json!({
+        "error": "a needs:you tag requires the needsyou status",
+        "code": "needsyou_tag_requires_status",
+        "ok": false,
+        "blocked": true,
+        "item": id,
+        "why": format!(
+            "Tagging a card needs:you while it stays `{current_status}` excludes it from \
+             dispatch and the WIP count exactly as a real needsyou ask does, but skips the \
+             typed-ask requirement and never appears in /api/board/needsyou — the one queue \
+             built to surface asks. If a human genuinely has to act, transition the status \
+             instead; if not, drop the tag and let the card stay dispatchable."
+        ),
+        "ask_types": bs::ASK_TYPES,
+        "how_to_fix": {
+            "fields": "ask_actor (a named person/external actor), ask_type, ask_question (a direct question containing ?), and ask_unblocks (the observable exit).",
+            "cli": "amux board needsyou <ID> --actor <name> --ask <type> --question \"...?\" --unblocks \"...\"",
+            "not_an_ask": "If nobody is actually waiting on a person, this is not a needsyou card — drop the tag rather than parking it silently.",
+        },
+    })
+}
+
+#[derive(Debug)]
+struct RequestParentRefusal {
+    code: &'static str,
+    why: String,
+    candidates: Vec<String>,
+}
+
+#[derive(Debug)]
+enum RequestParentResolution {
+    /// A peer request may intentionally be standalone. Preserve that existing
+    /// use when the requester has no active task rather than inventing a
+    /// parent from an unrelated todo.
+    Standalone,
+    Linked(Box<IssueRow>),
+    Refused(RequestParentRefusal),
+}
+
+/// What happened when a worker-side helper tried to leave evidence on the task
+/// that caused it. This is deliberately a receipt, not another board card:
+/// high-frequency helper calls are activity INSIDE work, and minting one task
+/// per read would turn observability into the board accumulation it is meant to
+/// explain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TaskActivityReceipt {
+    pub measured: bool,
+    pub n_considered: usize,
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+fn request_parent_is_owned(row: &IssueRow, requester: &str) -> bool {
+    row.session.as_deref() == Some(requester)
+        && row.owner_type == "agent"
+        && row.archived == 0
+}
+
+/// A todo parent is considered current only when this requester already
+/// delegated one of its open dependencies. That is the multiple-fanout case:
+/// the first request requeues the parent, then subsequent requests in the same
+/// turn must append to that same task instead of becoming standalone siblings.
+fn is_open_delegation_parent(conn: &rusqlite::Connection, row: &IssueRow, requester: &str) -> bool {
+    row.status == "todo"
+        && row.depends_on.iter().any(|id| {
+            conn.query_row(
+                "SELECT requested_by, status FROM issues \
+                 WHERE id=?1 AND deleted IS NULL AND COALESCE(archived,0)=0",
+                rusqlite::params![id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+            .is_some_and(|(requested_by, status)| {
+                requested_by.as_deref() == Some(requester) && !bs::is_terminal_status(&status)
+            })
+        })
+}
+
+/// Resolve which requester task a peer request belongs to.
+///
+/// Explicit `request_parent` is authoritative. Without it, the latest durable
+/// message->task link is the current-task signal; only when that is absent do
+/// we accept a unique `doing` card. Multiple doing cards are refused because
+/// silently selecting the wrong task would corrupt the dependency graph.
+fn resolve_request_parent(
+    conn: &rusqlite::Connection,
+    requester: &str,
+    explicit: Option<&str>,
+) -> rusqlite::Result<RequestParentResolution> {
+    if let Some(id) = explicit {
+        let Some(row) = bs::get_issue(conn, id)? else {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_found",
+                why: format!("request_parent {id} does not name a live task"),
+                candidates: Vec::new(),
+            }));
+        };
+        if !request_parent_is_owned(&row, requester) {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_owned",
+                why: format!(
+                    "request_parent {id} is not a live agent task owned by requester {requester}"
+                ),
+                candidates: Vec::new(),
+            }));
+        }
+        if !matches!(row.status.as_str(), "doing" | "todo") {
+            return Ok(RequestParentResolution::Refused(RequestParentRefusal {
+                code: "task_request_parent_not_active",
+                why: format!(
+                    "request_parent {id} is {}, but delegation can attach only to doing or todo work",
+                    row.status
+                ),
+                candidates: Vec::new(),
+            }));
+        }
+        return Ok(RequestParentResolution::Linked(Box::new(row)));
+    }
+
+    let linked_ids: Vec<String> = conn
+        .prepare(
+            "SELECT i.id FROM cmd_history h JOIN issues i ON i.id=h.card_id \
+             WHERE h.session=?1 AND i.session=?1 AND i.owner_type='agent' \
+               AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+               AND i.status IN ('doing','todo') \
+             ORDER BY h.id DESC LIMIT 32",
+        )?
+        .query_map(rusqlite::params![requester], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    for id in linked_ids {
+        if let Some(row) = bs::get_issue(conn, &id)? {
+            if row.status == "doing" || is_open_delegation_parent(conn, &row, requester) {
+                return Ok(RequestParentResolution::Linked(Box::new(row)));
+            }
+        }
+    }
+
+    let doing: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session=?1 AND status='doing' \
+             AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+             ORDER BY updated DESC,id",
+        )?
+        .query_map(rusqlite::params![requester], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    match doing.as_slice() {
+        [] => Ok(RequestParentResolution::Standalone),
+        [id] => Ok(RequestParentResolution::Linked(Box::new(
+            bs::get_issue(conn, id)?.expect("selected live parent disappeared inside one write"),
+        ))),
+        _ => Ok(RequestParentResolution::Refused(RequestParentRefusal {
+            code: "task_request_parent_ambiguous",
+            why: format!(
+                "requester {requester} has multiple doing tasks; refusing to attach the delegated work to the wrong one"
+            ),
+            candidates: doing,
+        })),
+    }
+}
+
+/// Append compact worker activity to the SAME current-task predicate used by
+/// peer delegation. That shared resolver matters: a bulk read and a farmed-out
+/// dependency must not disagree about which parent the worker is advancing.
+///
+/// The payload is caller-supplied summary metadata only (counts/model/verdict),
+/// never helper output or source contents. The task mutation carries a normal
+/// StateEvent, so other dashboard clients see it through the existing board
+/// realtime path rather than a private side channel.
+fn record_session_task_activity(
+    conn: &rusqlite::Connection,
+    session: &str,
+    explicit: Option<&str>,
+    line: &str,
+    now: i64,
+) -> rusqlite::Result<(TaskActivityReceipt, Option<PendingEvent>)> {
+    match resolve_request_parent(conn, session, explicit)? {
+        RequestParentResolution::Standalone => Ok((
+            TaskActivityReceipt {
+                measured: true,
+                n_considered: 0,
+                verdict: "no_active_task".into(),
+                card_id: None,
+                why: Some(format!(
+                    "worker {session} has no active task; the helper receipt remains in amux logs"
+                )),
+            },
+            None,
+        )),
+        RequestParentResolution::Refused(refusal) => {
+            let n_considered = refusal.candidates.len();
+            Ok((
+                TaskActivityReceipt {
+                    measured: true,
+                    n_considered,
+                    verdict: refusal.code.into(),
+                    card_id: None,
+                    why: Some(refusal.why),
+                },
+                None,
+            ))
+        }
+        RequestParentResolution::Linked(mut row) => {
+            row.log = Some(bs::append_log(row.log.as_deref(), &hhmm(), line));
+            row.updated = now;
+            bs::save_patched(conn, &mut row)?;
+            let event = ev_snap(&row, MutationKind::Updated);
+            Ok((
+                TaskActivityReceipt {
+                    measured: true,
+                    n_considered: 1,
+                    verdict: "attached".into(),
+                    card_id: Some(row.id),
+                    why: None,
+                },
+                Some(event),
+            ))
+        }
+    }
+}
+
+pub(crate) async fn append_session_task_activity(
+    state: &AppState,
+    session: &str,
+    explicit: Option<&str>,
+    line: &str,
+) -> Result<TaskActivityReceipt, anyhow::Error> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Ok(TaskActivityReceipt {
+            measured: false,
+            n_considered: 0,
+            verdict: "unattributed".into(),
+            card_id: None,
+            why: Some(
+                "no X-Amux-Worker or X-Amux-Session header; no task owner could be resolved"
+                    .into(),
+            ),
+        });
+    }
+    let (session, explicit, line) = (
+        session.to_string(),
+        explicit.map(str::to_string),
+        line.to_string(),
+    );
+    let slot = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    state
+        .store
+        .write_async(move |conn| {
+            let (receipt, event) = record_session_task_activity(
+                conn,
+                &session,
+                explicit.as_deref(),
+                &line,
+                now_secs(),
+            )?;
+            let applied = event.is_some();
+            *slot_w.lock().expect("task activity receipt slot poisoned") = Some(receipt);
+            Ok(WriteOutcome {
+                applied,
+                events: event.into_iter().collect(),
+            })
+        })
+        .await?;
+    let receipt = slot
+        .lock()
+        .expect("task activity receipt slot poisoned")
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("task activity receipt was not produced"));
+    receipt
+}
+
+/// AMUX-4860. Whether a requested `todo` has to be stored as `backlog`
+/// because the lane it names is isolated.
+///
+/// `todo` is the dispatch queue and a card there claims to be next.
+/// `board_drive` skips isolated lanes before any claim, so such a card is
+/// never offered to anyone, which is what `board.todo_is_reachable_by_dispatch`
+/// reports. It failed 18863 times over 13 days on one card, because nothing
+/// stopped the filing.
+///
+/// PARAMETERISED ON THE PREDICATE, for the reason `scope_env_layers` and
+/// `stranded_lanes` already are: `session_is_isolated` reads a file under
+/// `AMUX_HOME`, `AMUX_HOME` is process-global, and cargo runs a binary's tests
+/// in PARALLEL. A test that set it to fake an isolated lane would race its
+/// siblings over one file, and serialising with `--test-threads=1` would make
+/// it green while making it order-dependent. Both handlers pass the real
+/// `session_is_isolated`, so this is the shipped decision rather than a
+/// paraphrase of it.
+///
+/// The empty-lane arm is not a formality: a detector card carries no session,
+/// and an empty name would otherwise be handed to a predicate that reads a
+/// path built from it.
+pub(crate) fn todo_unreachable_on_isolated_lane(
+    requested_todo: bool,
+    lane: &str,
+    is_isolated: &dyn Fn(&str) -> bool,
+) -> bool {
+    requested_todo && !lane.is_empty() && is_isolated(lane)
+}
+
+/// AMUX-4860. Tell the caller the status it asked for is not the status it got.
+///
+/// ONE FUNCTION FOR EVERY RESPONSE ARM, because the first version of this
+/// change set the fields inline on the `Applied` arm only. Asking for `todo` on
+/// an isolated lane whose card is ALREADY `backlog` adjusts the target, leaves
+/// nothing to write, and returns through `Noop`, so the caller got `backlog`
+/// after asking for `todo` with nothing in the reply saying why. That is the
+/// AMUX-4776 silent-adjustment trap on the one path where it is hardest to
+/// notice, and it survived a green unit suite because the unit test covered the
+/// DECISION and not the disclosure. A third success arm must call this too.
+///
+/// `None` writes nothing, so an ordinary response is untouched.
+pub(crate) fn note_status_adjustment(body: &mut Value, adjusted_from: Option<&str>, lane: &str) {
+    let Some(from) = adjusted_from else { return };
+    body["status_adjusted_from"] = json!(from);
+    body["status_adjusted_reason"] = json!(format!(
+        "lane '{lane}' is isolated, so board_drive never offers its todo cards; stored as \
+         backlog, which is unbounded and claims nothing. Clear CC_ISOLATED on the lane to take \
+         board automation, or send as the owner."
+    ));
+}
+
 pub async fn create_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3364,19 +4693,168 @@ pub async fn create_item(
     // present, the card is for the sender's own lane. An EXPLICIT value —
     // including explicit "" / null for a deliberately unassigned card — is
     // always respected.
-    let (_, hdr_name) = actor_from_headers(&headers);
-    let hdr_session = if hdr_name == "api-anonymous" {
+    let (_, actor_name) = actor_from_headers(&headers);
+    let hdr_session = if actor_name == "api-anonymous"
+        || super::org::is_verified_local_member(&headers)
+    {
         String::new()
     } else {
-        hdr_name.clone()
+        actor_name.clone()
     };
-    let session = if map.contains_key("session") {
+    // AMUX-4653: `request_to` routes a card onto ANOTHER lane's board.
+    //
+    // The rule this relaxes ("workers may create board items only on their own
+    // board") was already false of the delegation path the fleet actually uses:
+    // `amux send` to a peer files a card on the RECIPIENT's board every time,
+    // via associate_capture_card + arm_peer_callback. So the refusal below
+    // described the create verb alone, and `amux board request` obeyed it by
+    // parking the card on the SENDER's board with the target only as reviewer.
+    // Dispatch selects by session and the reviewer nudge fires only on
+    // review/done, so the target never saw it: 88 such cards were sitting in
+    // senders' backlogs on 2026-09-15, ten of them mixpeek-finances'
+    // (MF-1160..1167, 1169, 1174), draining back into their own pickup as churn.
+    //
+    // This branch does what the capture path already does, with the attribution
+    // a capture cannot carry: type, desc, depends_on and due survive, because
+    // mint_capture_card titles a card from the prompt text and drops the rest.
+    //
+    // Narrow on purpose. `requested_by` is taken from the verified header and
+    // never from the body, the callback is armed to that same caller, the card
+    // may not be created terminal, and a plain cross-board create is still
+    // refused below. Nothing is typed into the target's pane: dispatch offers
+    // the card at their turn boundary like any other.
+    let request_to = body_str(&map, "request_to").map(|s| s.trim().to_string());
+    if map.contains_key("request_to") && request_to.as_deref().unwrap_or("").is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "request_to is empty", "code": "request_to_empty"}),
+        );
+    }
+    let request_to = request_to.filter(|s| !s.is_empty());
+    if let Some(target) = request_to.as_deref() {
+        if hdr_session.is_empty() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "a routed request requires a verified X-Amux-Worker requester",
+                    "code": "request_requires_verified_caller",
+                }),
+            );
+        }
+        if target == hdr_session {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "request_to names your own lane; create the card without it",
+                    "code": "request_to_self",
+                }),
+            );
+        }
+        // An explicit `session` that disagrees is an ambiguity, and picking
+        // either one silently would put the card somewhere the caller did not
+        // ask for.
+        if body_str(&map, "session")
+            .map(|s| s.trim().to_string())
+            .is_some_and(|s| !s.is_empty() && s != target)
+        {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "session and request_to disagree about whose board this is",
+                    "code": "request_target_ambiguous",
+                    "session": body_str(&map, "session"),
+                    "request_to": target,
+                }),
+            );
+        }
+        if !bs::board_delegation_allowed(Some(&hdr_session)) || !bs::board_delegation_allowed(Some(target)) {
+            tracing::warn!(marker="board_delegation_refused", requester=%hdr_session, target_lane=%target,
+                measured=true, n_considered=1, "worker owns its outcome; cross-board assignment refused");
+            return err(StatusCode::CONFLICT, json!({
+                "code":"cross_board_delegation_forbidden", "error":"workers manage their own boards",
+                "requester":hdr_session, "request_to":target,
+                "how_to_fix":"create or update the outcome on your own board; implement missing components yourself and reference peer evidence without assigning work or waiting on another worker"
+            }));
+        }
+        if let Some((code, why)) =
+            super::session_verbs::request_target_refusal(&hdr_session, target)
+        {
+            let status = match code {
+                "unknown_lane" => StatusCode::NOT_FOUND,
+                "peer_interaction_refused" => StatusCode::FORBIDDEN,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            tracing::warn!(
+                target: "amux::board",
+                marker = "board_request_target_refused",
+                requester = %hdr_session,
+                target_lane = %target,
+                verdict = code,
+                measured = true,
+                "routed board request refused: the target cannot receive one"
+            );
+            let mut body = json!({
+                // The resolver writes this sentence and names its own remedy,
+                // so the refusal a request sees is word for word the one a
+                // send sees.
+                "error": why,
+                "code": code,
+                "request_to": target,
+            });
+            // DESCRIPTIVE, never the decision, and OMITTED when there is no
+            // lane to describe. `lane_lifecycle` reads an env file that does
+            // not exist for an unknown lane, finds no flags, and answers
+            // "active" — so an unconditional field reported a lifecycle for a
+            // lane that is not there, next to a code saying it is not there.
+            // Measured in prod on 274f619e: request_to "lane-nobody" answered
+            // 404 unknown_lane with target_lifecycle "active". An absence has
+            // to read as an absence.
+            if code == "peer_interaction_refused" {
+                body["target_lifecycle"] = json!(super::session_verbs::lane_lifecycle(target));
+            }
+            return err(status, body);
+        }
+
+    }
+
+    let session = if let Some(target) = request_to.clone() {
+        target
+    } else if map.contains_key("session") {
         body_str(&map, "session").unwrap_or_default().trim().to_string()
     } else {
         hdr_session.chars().take(64).collect()
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if session.is_empty() || !scope.allows_worker(&session) {
+            return scoped_board_forbidden(&scope, if session.is_empty() { "unassigned card" } else { &session });
+        }
+    }
+    if request_to.is_none() && !hdr_session.is_empty() && session != hdr_session {
+        tracing::warn!(
+            caller = %hdr_session,
+            requested_owner = %(if session.is_empty() { "(unassigned)" } else { session.as_str() }),
+            "cross-board card creation refused"
+        );
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "workers may create board items only on their own board",
+                "code": "cross_board_create_forbidden",
+                "caller": hdr_session,
+                "requested_owner": if session.is_empty() { Value::Null } else { json!(session) },
+                // Keep the remedy on the same board, including when the
+                // requested peer is paused or otherwise unreachable.
+                "how_to_fix": "create or update the outcome on your own board; own missing components and reference peer evidence without delegating or creating cross-worker dependencies",
+            }),
+        );
+    }
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
+    if bs::parse_status(&status_in) == Some(TaskStatus::Verified) && !session.is_empty() {
+        if let Err(detail) = crate::fanout_workspace::verification_ready(&session).await {
+            return err(StatusCode::CONFLICT, fanout_verification_refusal("(new card)", Some(&session), &detail));
+        }
+    }
     // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
     // held — `PATCH {"status":"needsyou"}` and `amux board status <id> needsyou`
     // are both refused — while `POST {"status":"needsyou"}` returned 201 with
@@ -3400,6 +4878,11 @@ pub async fn create_item(
                 return needsyou_ask_refusal(verdict, "(new card)", session_for_gate.as_deref());
             }
         }
+    }
+    if bs::parse_status(&status_in) == Some(TaskStatus::NeedsYou)
+        && !bs::approval_type_allowed(Some(&session), body_str(&map,"ask_type").as_deref().unwrap_or("")) {
+        tracing::warn!(session, verdict="approval_category_refused", "needsyou is outside the standing authorization policy");
+        return err(StatusCode::CONFLICT,json!({"error":"needsyou is reserved for the configured authorization categories","code":"needsyou_outside_approval_policy","allowed":bs::approval_types(Some(&session)),"how_to_fix":"Proceed with ordinary decisions. For a capability failure, record the concrete blocker and attempt an authorized remedy; do not invent an approval request."}));
     }
     // AMUX-2609: a status outside the typed vocabulary may still be a real
     // user-created column. The `statuses` table is the vocabulary for those —
@@ -3483,15 +4966,38 @@ pub async fn create_item(
         None => Vec::new(),
         Some(v) => body_str_list(v).unwrap_or_default(),
     };
+    // AMUX-4590: the tag door, same predicate as the status door eleven lines
+    // up (see `needsyou_tag_refusal_body`). A card created with a bare
+    // `needs:you*` tag and any other status gets the exclusion without the
+    // accountability.
+    if tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"))
+        && bs::parse_status(&status_in) != Some(TaskStatus::NeedsYou)
+    {
+        let session_for_gate = body_str(&map, "session")
+            .or_else(|| Some(actor_from_headers(&headers).1))
+            .filter(|s| !s.trim().is_empty());
+        if bs::needsyou_ask_required(session_for_gate.as_deref()) {
+            return err(
+                StatusCode::CONFLICT,
+                needsyou_tag_refusal_body("(new card)", session_for_gate.as_deref(), &status_in),
+            );
+        }
+    }
 
     // Creator attribution (AMUX-1812): the body value is a self-reported
     // CLAIM; the verified header wins, and a disagreement is recorded.
     let claimed = body_str(&map, "creator").unwrap_or_default().trim().to_string();
-    let creator = match (&hdr_session.is_empty(), claimed.is_empty()) {
-        (false, false) if hdr_session != claimed => format!("{hdr_session} (claimed {claimed})"),
-        (false, _) => hdr_session.clone(),
-        (true, false) => claimed,
-        (true, true) => String::new(),
+    let verified_creator = (actor_name != "api-anonymous").then_some(actor_name.as_str());
+    let creator = match (verified_creator, claimed.is_empty()) {
+        // A local member's author is derived from the verified invite cookie.
+        // Old dashboard clients still send a device-name `creator`; retaining
+        // that self-reported value would make the same person appear under a
+        // different author on every device and would allow deliberate spoofing.
+        (Some(author), _) if super::org::is_verified_local_member(&headers) => author.to_string(),
+        (Some(author), false) if author != claimed => format!("{author} (claimed {claimed})"),
+        (Some(author), _) => author.to_string(),
+        (None, false) => claimed,
+        (None, true) => String::new(),
     };
 
     let owner_type = match body_str(&map, "owner_type").as_deref() {
@@ -3501,27 +5007,6 @@ pub async fn create_item(
         None => if session.is_empty() { "human" } else { "agent" }.to_string(),
     };
 
-    // A peer request is a BOARD CONTRACT, not an ordinary pane message. The
-    // requester comes only from the verified worker header; accepting a body
-    // field here would let a worker manufacture somebody else's return path.
-    let is_peer_request = !hdr_session.is_empty() && !session.is_empty() && hdr_session != session;
-    if is_peer_request {
-        if let Err(reason) =
-            crate::api::session_verbs::cross_group_send_ok(&hdr_session, &session)
-        {
-            return err(
-                StatusCode::FORBIDDEN,
-                json!({
-                    "error": reason,
-                    "code": "task_request_not_authorized",
-                    "requester": hdr_session,
-                    "target": session,
-                    "how_to_fix": "put both workers in a group, or enable the existing cross-group worker configuration; the board request and direct-send paths use the same policy",
-                }),
-            );
-        }
-    }
-    let requested_by = is_peer_request.then(|| hdr_session.clone());
     let callback_specified = map.contains_key("callback");
     let (callback_session, callback_prompt) = match map.get("callback") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => (None, None),
@@ -3575,16 +5060,64 @@ pub async fn create_item(
         );
     }
 
+    // AMUX-4653: a routed request ALWAYS returns to its requester, whether or
+    // not the caller thought to ask for a callback. The whole point of routing
+    // work to another board is that the requester learns how it ended, and a
+    // request created terminal would have nothing to report.
+    let (requested_by, callback_session, callback_prompt) = match request_to.as_ref() {
+        None => (None, callback_session, callback_prompt),
+        Some(_) => {
+            if bs::is_terminal_status(&status_raw) {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": "a routed request cannot be created in a terminal status",
+                        "code": "request_created_terminal",
+                        "status": status_raw,
+                    }),
+                );
+            }
+            (Some(hdr_session.clone()), Some(hdr_session.clone()), callback_prompt)
+        }
+    };
+
     let known_keys = [
         "title", "desc", "status", "session", "type", "depends_on", "tags", "creator",
         "reviewer", "shepherd", "gate", "owner_type", "due", "due_time", "callback",
-        "ask_actor", "ask_type", "ask_question", "ask_unblocks",
+        "ask_actor", "ask_type", "ask_question", "ask_unblocks", "request_to",
+        // AMUX-4748. Omitting this made create DROP the exact field the pickup
+        // gate requires: a caller sent a good continuation, it landed in
+        // `ignored_fields`, and dispatch then refused the card for not having
+        // one. Measured 2026-09-17: 14 eligible todos, every candidate refused,
+        // the lane idle. Same shape the ask_* fields were fixed for.
+        "next_action", "acceptance_criteria",
     ];
     let ignored: Vec<String> = map
         .keys()
         .filter(|k| !known_keys.contains(&k.as_str()))
         .cloned()
         .collect();
+
+    // Validate before semantic reconciliation or any write; malformed criteria
+    // must not be silently discarded by either create or merge.
+    let acceptance_criteria = match encode_acceptance_criteria(
+        map.get("acceptance_criteria").unwrap_or(&Value::Null),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(verdict = "create_acceptance_criteria_refused", %session, %error);
+            return err(StatusCode::BAD_REQUEST, json!({"error": error, "code": "invalid_acceptance_criteria"}));
+        }
+    };
+    let _intake_guard = super::board_intake::lock(&session, &owner_type).await;
+    let intake = super::board_intake::plan_create(&map, &item_type, || async {
+        super::board_intake::plan(&state.store, &session, &owner_type, &title,
+            &body_str(&map, "desc").unwrap_or_default()).await
+    }).await;
+    let intake_response = intake.clone();
+    // A repeated/refined request should not be refused merely because the
+    // existing queue is full; reconciliation adds no WIP slot.
+    let intake_matches = intake.decision.action != "create";
 
     // AF-317: THE WIP LIMIT HAS TO COVER CREATION, or it is decorative.
     //
@@ -3599,7 +5132,47 @@ pub async fn create_item(
     // queue-disposition job is exempt BY NAME: it is the one card whose whole
     // purpose is to arrive when the queue is too long, so refusing it for queue
     // depth would be the mechanism suppressing its own alarm.
-    if status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != QUEUE_DISPOSITION_CREATOR {
+    // AMUX-4860: A `todo` FOR AN ISOLATED LANE IS A CLAIM NOTHING CAN HONOUR.
+    //
+    // `todo` is the dispatch queue and a card there claims to be next.
+    // board_drive skips isolated lanes before any claim (board_drive.rs,
+    // verdict "isolated_not_claimed"), so such a card is never offered to
+    // anyone. That is what board.todo_is_reachable_by_dispatch reports, and it
+    // failed 18863 times over 13 days on ONE card (DESKT-44 on `desktop`)
+    // because nothing stopped the filing in the first place.
+    //
+    // DEFAULTED, NOT REFUSED, which is the opposite of the WIP cap below and
+    // deliberately so. The cap refuses something the FILER can resolve by
+    // finishing work. Isolation is a property of the LANE that the filer
+    // usually neither knows nor controls, so a 409 would fail a legitimate
+    // filing for an unactionable reason, and the obvious escape from it is to
+    // clear CC_ISOLATED, which is the one remedy AMUX-4850 ruled out.
+    //
+    // ADJUSTED BEFORE the cap, on purpose: the card is no longer entering
+    // `todo`, so it must not consume a todo WIP slot.
+    //
+    // `session_is_isolated` is called rather than re-reading CC_ISOLATED,
+    // because it is the same predicate board_drive and the invariant consult.
+    // checks.rs's own doc comment warns that a second definition is how this
+    // check goes quietly wrong.
+    let mut status_adjusted_from: Option<&'static str> = None;
+    let mut status_raw = status_raw;
+    if todo_unreachable_on_isolated_lane(status_raw == "todo", &session, &|l| {
+        crate::api::session_verbs::session_is_isolated(l)
+    }) {
+        tracing::info!(
+            target: "amux::board",
+            marker = "todo_defaulted_to_backlog",
+            verdict = "isolated_lane_cannot_be_dispatched",
+            session = %session,
+            measured = true,
+            n_considered = 1,
+            "board create: todo filed for an isolated lane, stored as backlog"
+        );
+        status_adjusted_from = Some("todo");
+        status_raw = "backlog".to_string();
+    }
+    if !intake_matches && status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != WIP_EXEMPT_CREATOR {
         let limit = bs::todo_wip_limit(Some(&session));
         if limit > 0 {
             let held_and_stalest = state.store.read().ok().map(|c| {
@@ -3642,11 +5215,37 @@ pub async fn create_item(
         }
     }
 
+    // VALIDATED BY THE GATE'S OWN FUNCTION, not a second opinion. `enforce`
+    // refuses a claim whose next_action is missing or not a sentence, via
+    // bs::continuation_verdict. Create now runs the identical check, so a card
+    // cannot be born carrying a continuation that dispatch will reject; the two
+    // ends of the contract agree by construction rather than by coincidence.
+    let next_action = match body_str(&map, "next_action") {
+        Some(raw) if !raw.trim().is_empty() => {
+            match bs::continuation_verdict(&raw) {
+                bs::ContinuationVerdict::NotASentence => {
+                    return err(StatusCode::BAD_REQUEST, json!({
+                        "ok": false,
+                        "code": "next_action_not_a_sentence",
+                        "error": "next_action must be a sentence saying what the next actor should do",
+                        "you_sent": raw,
+                        "why": "A card is created with the continuation the pickup gate will demand. \
+                                Storing one this gate would later reject is how a card gets filed and \
+                                then refused for the field it already carries.",
+                    }));
+                }
+                _ => Some(raw.trim().to_string()),
+            }
+        }
+        _ => None,
+    };
     let new = bs::NewIssue {
+        acceptance_criteria,
+        next_action,
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
         status: status_raw,
-        session: Some(session).filter(|s| !s.is_empty()),
+        session: Some(session.clone()).filter(|s| !s.is_empty()),
         item_type,
         creator,
         owner_type,
@@ -3671,7 +5270,9 @@ pub async fn create_item(
 
     enum Out {
         Cycle(Vec<String>),
-        Created(Box<IssueRow>),
+        ForeignDependencies(Vec<(String, String)>),
+        WipLimit(String, i64, i64),
+        Created(Box<IssueRow>, bool),
     }
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -3682,6 +5283,35 @@ pub async fn create_item(
     let write = state
         .store
         .write_async(move |conn| {
+            let foreign = bs::foreign_dependencies(conn, new.session.as_deref(), &new.depends_on)?;
+            if !foreign.is_empty() {
+                return finish(&slot_w, Out::ForeignDependencies(foreign), no_write());
+            }
+            // AMUX-4653: a routed request never reaches here. `plan_create`
+            // counts `request_to` as structured, so the semantic comparison is
+            // skipped and the request keeps its own record. The first cut of
+            // this change instead ARMED a folded request's callback here, and a
+            // mutation that deleted that block left the suite green: the fold
+            // needs a model client, which no test has, so the cell was asserting
+            // about the create path while claiming to cover the fold. Making the
+            // path unreachable is the better answer anyway, for the reason
+            // board_intake now carries.
+            if let Some(row) = super::board_intake::apply(conn, &intake, &new.title, &new.desc, now_secs())? {
+                let event = ev_snap(&row, MutationKind::Updated);
+                return finish(&slot_w, Out::Created(Box::new(row), true), WriteOutcome {applied:true,events:vec![event]});
+            }
+            // Recheck in the writer, including a semantic target that changed
+            // while the model ran. A failed merge must not bypass the WIP gate.
+            if new.status == "todo" && new.owner_type == "agent" && new.creator != WIP_EXEMPT_CREATOR {
+                if let Some(session) = new.session.as_deref() {
+                    let limit = bs::todo_wip_limit(Some(session));
+                    let held = bs::todo_wip_count(conn, session, "");
+                    if limit > 0 && held >= limit {
+                        tracing::warn!(session, held, limit, "todo_wip_gate: refused create in writer");
+                        return finish(&slot_w, Out::WipLimit(session.to_string(), held, limit), no_write());
+                    }
+                }
+            }
             // Acyclicity is validated INSIDE the write so no interleaved
             // create can slip a cycle between check and insert. The new id
             // does not exist yet, so a placeholder self id is fine — only
@@ -3710,32 +5340,11 @@ pub async fn create_item(
                     return finish(&slot_w, Out::Cycle(cycle), no_write());
                 }
             }
-            let row = bs::create_issue(conn, &new, now_secs())?;
+            let now = now_secs();
+            let mut row = bs::create_issue(conn, &new, now)?;
+            row.log = Some(bs::append_log(row.log.as_deref(), &hhmm(), &format!("{}; disposition=create", intake.log_line())));
+            bs::save_patched(conn, &mut row)?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
-            // The Messages ledger carries the SAME task id. Delivery is
-            // `board`, not `direct` or `queued`: the recipient consumes this
-            // request through board-drive and the card is the source of truth.
-            if let (Some(requester), Some(target)) =
-                (row.requested_by.as_deref(), row.session.as_deref())
-            {
-                let text = format!(
-                    "[board request {}] {} requested work from {}: {}",
-                    row.id, requester, target, row.title
-                );
-                conn.execute(
-                    "INSERT INTO cmd_history \
-                     (text,type,session,ts,origin,card_id,delivery,delivered_at,submit_verdict) \
-                     VALUES (?1,'session',?2,?3,?4,?5,'board',?3,'accepted')",
-                    rusqlite::params![text, target, now_secs() * 1000, requester, row.id],
-                )?;
-                let message_id = conn.last_insert_rowid();
-                events.push(crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Message,
-                    entity_id: format!("MSG-{message_id}"),
-                    mutation: MutationKind::Created,
-                    payload: None,
-                });
-            }
             // AMUX-3391: fold the silent auto-capture card into this worker card
             // (see fold_capture_for_worker_card). The window is env-tunable.
             let fold_window: i64 = std::env::var("AMUX_CAPTURE_FOLD_WINDOW_S")
@@ -3750,7 +5359,7 @@ pub async fn create_item(
             }
             finish(
                 &slot_w,
-                Out::Created(Box::new(row)),
+                Out::Created(Box::new(row), false),
                 WriteOutcome {
                     applied: true,
                     events,
@@ -3766,10 +5375,71 @@ pub async fn create_item(
     match outcome {
         None => internal("create produced no outcome"),
         Some(Out::Cycle(cycle)) => cycle_response(&cycle),
-        Some(Out::Created(row)) => {
+        Some(Out::ForeignDependencies(deps)) => err(StatusCode::CONFLICT, foreign_dependency_refusal(&deps)),
+        Some(Out::WipLimit(session, held, limit)) => err(StatusCode::CONFLICT,
+            json!({"ok":false,"code":"todo_wip_limit_reached","error":"todo queue is at its limit for this lane",
+                "session":session,"holding":held,"limit":limit,"how_to_fix":"create in backlog or finish existing todo work"})),
+        Some(Out::Created(row, reused)) => {
             let mut v = detail_body(&row);
             v["rev"] = json!(row.rev);
             v["global_rev"] = json!(reply.rev.0);
+            // AF-922: the status code already distinguishes this (200 for a
+            // fold, 201 for a genuine create, a few lines down), but a caller
+            // checking only the body -- which is most of them, this lane's
+            // own near-miss included -- saw an `id` field that looked exactly
+            // like every other create and had no reason to open `intake` to
+            // learn otherwise. One unmistakable top-level boolean, so "did
+            // this create anything new" never depends on knowing the intake
+            // subsystem exists.
+            //
+            // NAMED `card_created`, not `created` -- the row itself already
+            // carries `created` (its own creation unix timestamp, from
+            // `detail_body`/`IssueRow::snapshot`), and a same-named boolean
+            // would silently overwrite it. Caught by create_list_detail_
+            // lifecycle's own assertion ("created must be unix INTEGER
+            // seconds") reddening under this exact mutation.
+            v["card_created"] = json!(!reused);
+            v["intake"] = json!({"action":if reused {intake_response.decision.action.as_str()} else {"create"}, "comparison":intake_response});
+            // AMUX-4846. A create that waited on the classifier should say what
+            // would have skipped it.
+            //
+            // `model_ms` already tells the caller the call happened and how long
+            // it took (AMUX-4655). What it cannot say is that the wait was
+            // AVOIDABLE. plan_create skips the comparison entirely when the
+            // create carries its own structure, and 963 of 1185 intake decisions
+            // in one 28h window took that path; the 222 that did not have a p50
+            // of 3322ms.
+            //
+            // Worth saying on this path specifically because the two sets
+            // coincide: a card filed with no `next_action` is also the card the
+            // continuation gate refuses to dispatch, so the creates paying three
+            // seconds here are largely the ones that cannot be picked up
+            // afterwards. Naming the keys turns a cost the caller cannot see
+            // into one they can remove, which is cheaper than moving the call
+            // off the request and does not touch the 201-vs-200 contract every
+            // worker's create recipe reads.
+            //
+            // Built from board_intake::STRUCTURED_KEYS rather than a written-out
+            // list, so the advice cannot drift from the gate that enforces it.
+            if intake_response.model_ms.is_some() {
+                v["intake_wait_avoidable"] = json!({
+                    "why": "this create waited on the semantic classifier because it carried no \
+                            structure of its own; a create carrying any of these keys skips the \
+                            comparison and returns without a model call",
+                    "keys": super::board_intake::STRUCTURED_KEYS,
+                    "note": "`next_action` is usually the one worth adding: the continuation gate \
+                             already refuses to dispatch a card without it, so supplying it here \
+                             removes this wait and makes the card claimable.",
+                });
+            }
+            // AMUX-4860. The status the caller asked for is not the status it
+            // got, so SAY SO in the reply. A create that silently becomes
+            // something else is the AMUX-4776 trap: there, intake folded a
+            // create into another card and the response still carried an `id`,
+            // so a caller reading only `id` could not tell. The code stays 201
+            // because a card really was created; this field is how the caller
+            // learns the queue it named was not the queue it got.
+            note_status_adjustment(&mut v, status_adjusted_from, &session);
             if !ignored.is_empty() {
                 v["ignored_fields"] = json!(ignored);
             }
@@ -3812,19 +5482,26 @@ pub async fn create_item(
                 owner_session = %row.session.as_deref().unwrap_or("(none)"),
                 "board card created"
             );
-            // A peer request should enter the same durable board-drive path
-            // immediately; waiting for the periodic sweep makes a successful
-            // request look lost for up to a minute.
-            if row.requested_by.is_some() {
-                if let Some(target) = row.session.clone() {
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        let _ = crate::runtime_jobs::board_drive::drive_session(&st, &target).await;
-                        crate::api::session_verbs::steer_deliver_for_session(&st, &target).await;
-                    });
-                }
+            // AMUX-4653: a ROUTED request gets its own verdict line, because
+            // "board card created" cannot say that this one crossed a board
+            // boundary, and a relaxation of the cross-board rule that leaves no
+            // trace is the audit trail ethos rule 6 warns about. `grep
+            // board_request_routed` is the index for who routed what to whom.
+            if request_to.is_some() {
+                tracing::info!(
+                    target: "amux::board",
+                    marker = "board_request_routed",
+                    card = %row.id,
+                    requester = %row.requested_by.as_deref().unwrap_or("(none)"),
+                    target_lane = %row.session.as_deref().unwrap_or("(none)"),
+                    callback = %row.callback_state.as_deref().unwrap_or("(none)"),
+                    folded = reused,
+                    status = %row.status,
+                    measured = true,
+                    "board request filed on the target lane's board"
+                );
             }
-            (StatusCode::CREATED, Json(v)).into_response()
+            (if reused {StatusCode::OK} else {StatusCode::CREATED}, Json(v)).into_response()
         }
     }
 }
@@ -3833,6 +5510,14 @@ pub async fn create_item(
 
 fn resolve_task_asset(reference: &str, work_dir: &str) -> String {
     let reference = reference.trim();
+    if reference.starts_with("file:") {
+        // File URLs are absolute references, never workspace-relative strings.
+        return reqwest::Url::parse(reference)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| reference.to_string());
+    }
     if let Some(rest) = reference.strip_prefix("~/") {
         return std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -3954,6 +5639,13 @@ mod task_asset_resolution_tests {
     }
 
     #[test]
+    fn file_urls_decode_without_joining_the_worker_directory() {
+        assert_eq!(resolve_task_asset("file:///tmp/a%20report.md", "/work"), "/tmp/a report.md");
+        assert_eq!(resolve_task_asset("file://localhost/tmp/report.md", "/work"), "/tmp/report.md");
+        assert_eq!(resolve_task_asset("file://remote-host/tmp/report.md", "/work"), "file://remote-host/tmp/report.md");
+    }
+
+    #[test]
     fn file_shaped_assets_resolve_without_doubling_repo_relative_prefixes() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("mixpeek");
@@ -3988,10 +5680,84 @@ mod task_asset_resolution_tests {
     }
 }
 
-pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+#[derive(Debug, Deserialize)]
+pub struct DrainParams {
+    session: Option<String>,
+}
+
+/// GET /api/board/drain[?session=<lane>] (RR-0052 Invariant 5). The drain answer
+/// per lane from `runtime_jobs::board_drain::drain_state`, the same dependency
+/// predicate dispatch uses. Without `session` it covers every lifecycle-active
+/// lane, since a paused or archived lane is not being driven. `measured` and
+/// `n_considered` travel with it, as every diagnostic here owes (AF-320).
+pub async fn board_drain(State(state): State<AppState>, Query(p): Query<DrainParams>) -> Response {
+    let now = chrono::Utc::now().timestamp();
+    let lanes: Vec<String> = match p.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(lane) => vec![lane.to_string()],
+        None => crate::api::session_verbs::all_lane_names()
+            .into_iter()
+            .filter(|lane| crate::api::session_verbs::lane_lifecycle(lane) == "active")
+            .collect(),
+    };
+    let store = state.store.clone();
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        Ok(lanes
+            .iter()
+            .map(|lane| crate::runtime_jobs::board_drain::drain_state(&conn, lane, now))
+            .collect::<Vec<_>>())
+    })
+    .await;
+    match joined {
+        Ok(Ok(states)) => {
+            let drained = states.iter().filter(|s| s.verdict == "drained").count();
+            let unmeasured = states.iter().filter(|s| !s.measured).count();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "measured": unmeasured == 0,
+                    "n_considered": states.len(),
+                    "drained": drained,
+                    "unmeasured": unmeasured,
+                    "lanes": states,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
+    }
+}
+
+/// POST /api/board/lease-next (RR-0052 Invariant 3: workers receive tasks,
+/// they do not browse for them). The caller's lane gets back the card it
+/// already holds, or one claimed by the driver's own selector, or a reason
+/// there is nothing to lease plus the lane's drain state. Same identity rules
+/// as `/claim`: a lease with no worker behind it is refused.
+pub async fn lease_next_item(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (_actor, lane) = actor_from_headers(&headers);
+    if lane == "api-anonymous" || lane.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "lease-next needs a worker: send X-Amux-Session: <your session> (`amux board lease` does this)",
+            })),
+        )
+            .into_response();
+    }
+    let out = crate::runtime_jobs::board_drive::lease_next(&state, &lane).await;
+    (StatusCode::OK, Json(json!(out))).into_response()
+}
+
+pub async fn get_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let store = state.store.clone();
     let key = id.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let member_scope = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global());
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         let Some(row) = bs::get_issue(&conn, &key)? else {
             return Ok(None);
@@ -4007,6 +5773,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         let children = child_ids
             .iter()
             .filter_map(|child| bs::get_issue(&conn, child).ok().flatten())
+            .filter(|child| {
+                member_scope.as_ref().is_none_or(|scope| {
+                    child
+                        .session
+                        .as_deref()
+                        .is_some_and(|worker| scope.allows_worker(worker))
+                })
+            })
             .map(|child| {
                 json!({
                     "id": child.id,
@@ -4026,15 +5800,22 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         // A child inherits the source message of its epic for display, while
         // cmd_history.card_id itself remains attached to the root epic. That
         // keeps the Messages chip stable from prompt through completion.
-        let message_root = row.epic.as_deref().unwrap_or(&row.id);
+        // A child normally inherits its epic's prompt. For a scoped member,
+        // crossing that parent boundary could reveal a prompt on a card they
+        // cannot open, so only use the directly-authorized card as the root.
+        let message_root = if member_scope.is_some() {
+            &row.id
+        } else {
+            row.epic.as_deref().unwrap_or(&row.id)
+        };
         let mut messages = Vec::new();
         let mut msg_stmt = conn.prepare(
             "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
-             WHERE card_id=?1 ORDER BY ts DESC LIMIT 20",
+             WHERE card_id IN (?1,?2) OR (session=?3 AND instr(text,?2)>0) ORDER BY ts DESC,id DESC LIMIT 100",
         )?;
         messages.extend(
             msg_stmt
-                .query_map(rusqlite::params![message_root], |r| {
+                .query_map(rusqlite::params![message_root, row.id, row.session.as_deref().unwrap_or("")], |r| {
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
                         "text": r.get::<_, String>(1)?,
@@ -4045,7 +5826,10 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
                         "card_id": r.get::<_, Option<String>>(6)?,
                     }))
                 })?
-                .flatten(),
+                .flatten()
+                .filter(|message| message["card_id"].as_str().is_some_and(|id| id == message_root || id == row.id)
+                    || card_refs(message["text"].as_str().unwrap_or("")).contains(&row.id))
+                .take(20),
         );
         let mut artifacts = crate::db::artifact_store::list_for_task(&conn, &row.id)?
             .into_iter()
@@ -4127,11 +5911,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
                 "layers": trail.layers,
             })
         }).collect::<Vec<_>>();
-        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements)))
+        let verified_gate = bs::effective_gate_trail(&conn, &row, TaskStatus::Verified, &groups);
+        let verification = crate::db::verification_store::coverage(&conn, &row, &verified_gate.criteria)?;
+        let attempts = crate::db::attempts::list_for_card(&conn, &row.id)?;
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))
     })
     .await;
     match joined {
-        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements)))) => {
+        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
             if let Ok(v) = format!("W/\"{}-{}\"", row.id, row.rev).parse() {
@@ -4143,6 +5930,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
             body["artifacts"] = json!(artifacts);
             body["asset_links"] = json!(asset_links);
             body["gate_requirements"] = json!(gate_requirements);
+            body["verification"] = verification;
+            // RR-0052 Invariant 1: every holding of this card, oldest first.
+            if let Some(n) = attempts.iter().rev().find(|a| a.ended_at.is_none()).map(|a| a.attempt) {
+                if let Some(lease) = body.get_mut("lease") {
+                    lease["attempt"] = json!(n);
+                }
+            }
+            body["attempts"] = json!(attempts);
             (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),
@@ -4160,8 +5955,73 @@ struct DecomposeTask {
     item_type: String,
     priority: u8,
     #[serde(default)]
-    depends_on: Vec<usize>,
+    depends_on: Vec<DepRef>,
     next_action: String,
+    /// Plain-language success conditions carried on the card itself. These are
+    /// deliberately not the typed `_amux_criteria` verifier objects: a
+    /// decomposition is authored by the worker that will execute it, while
+    /// typed criteria enforce independent authorship. This field is the
+    /// worker-visible draft the independent reviewer can turn into verifiers.
+    #[serde(default)]
+    acceptance_criteria: Vec<TextRef>,
+}
+
+/// One `depends_on` entry AS THE CALLER WROTE IT (AF-523).
+///
+/// The field is a 1-based index into the sibling `tasks` array, and this used
+/// to be typed `Vec<usize>` — so a caller who sent something else was answered
+/// by SERDE, at the body layer, before the handler that owns the real message
+/// ever ran. The same mistake made two ways got two qualities of answer, and
+/// the worse one came first:
+///
+///   depends_on: ["[incident] RCA doc: ..."]  -> 422, axum's raw rejection:
+///     "tasks[1].depends_on[0]: invalid type: string \"...\", expected usize"
+///   depends_on: [0]                          -> 400, amux's own:
+///     "task 2 dependency 0 must name an earlier task by 1-based index"
+///
+/// Measured 2026-09-06 by the daily log sweep: `backend` hit the first three
+/// times in 42 seconds, then the second, then got it right — four attempts for
+/// one field. `expected usize` is true and does not say that the usize is a
+/// position in the array they just wrote. Naming the thing you depend on is
+/// what `depends_on` means everywhere else on this board, so it is the honest
+/// guess, and it was the one answered by the framework.
+///
+/// Accepting the value here does not accept the MISTAKE — it routes it to
+/// `validate_decomposition`, which already has the sentence worth reading.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DepRef {
+    Index(usize),
+    Other(serde_json::Value),
+}
+
+/// Preserve a malformed criterion until amux can explain the expected shape.
+/// A `Vec<String>` would let serde answer first with an opaque 422, the exact
+/// failure AF-523 fixed for `depends_on` one field above.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TextRef {
+    Text(String),
+    Other(serde_json::Value),
+}
+
+impl TextRef {
+    fn shown(&self) -> String {
+        match self {
+            TextRef::Text(s) => format!("{s:?}"),
+            TextRef::Other(v) => v.to_string(),
+        }
+    }
+}
+
+impl DepRef {
+    /// How the caller wrote it, for an error message that quotes them back.
+    fn shown(&self) -> String {
+        match self {
+            DepRef::Index(n) => n.to_string(),
+            DepRef::Other(v) => v.to_string(),
+        }
+    }
 }
 
 fn default_decompose_type() -> String {
@@ -4173,14 +6033,41 @@ struct DecomposeBody {
     tasks: Vec<DecomposeTask>,
 }
 
-fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
+#[derive(Debug)]
+struct ValidatedDecomposition {
+    dependencies: Vec<Vec<usize>>,
+    acceptance_criteria: Vec<Vec<String>>,
+    plan_sha256: String,
+}
+
+/// Validate, and return the NORMALIZED 1-based dependency indices per task.
+///
+/// Returning them rather than re-reading `depends_on` downstream is what makes
+/// the "not an index" branch impossible to reach twice: after this returns Ok
+/// there is no `DepRef::Other` left in play, so the child-creation loop has no
+/// can't-happen arm to guess at (AF-523).
+fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<ValidatedDecomposition, String> {
     if !(2..=50).contains(&tasks.len()) {
         return Err("decomposition requires 2 to 50 child tasks".into());
     }
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(tasks.len());
+    let mut all_criteria: Vec<Vec<String>> = Vec::with_capacity(tasks.len());
+    let mut titles = std::collections::HashSet::new();
     for (idx, task) in tasks.iter().enumerate() {
         let n = idx + 1;
         if task.title.trim().is_empty() {
             return Err(format!("task {n} has an empty title"));
+        }
+        if !titles.insert(task.title.trim().to_ascii_lowercase()) {
+            return Err(format!(
+                "task {n} repeats the title {:?}; every child must be independently identifiable",
+                task.title.trim()
+            ));
+        }
+        if bs::continuation_verdict(&task.description) != bs::ContinuationVerdict::Ok {
+            return Err(format!(
+                "task {n} needs a concrete description of at least three words"
+            ));
         }
         if !bs::KNOWN_TYPES.contains(&task.item_type.as_str()) || task.item_type == "epic" {
             return Err(format!(
@@ -4196,8 +6083,47 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
                 "task {n} needs a concrete next_action of at least three words"
             ));
         }
+        if task.acceptance_criteria.is_empty() || task.acceptance_criteria.len() > 12 {
+            return Err(format!(
+                "task {n} needs 1 to 12 acceptance_criteria so its terminal state is falsifiable"
+            ));
+        }
+        let mut criteria = Vec::with_capacity(task.acceptance_criteria.len());
+        let mut seen_criteria = std::collections::HashSet::new();
+        for (criterion_idx, criterion) in task.acceptance_criteria.iter().enumerate() {
+            let TextRef::Text(text) = criterion else {
+                return Err(format!(
+                    "task {n} acceptance_criteria entry {} must be a string, got {}",
+                    criterion_idx + 1,
+                    criterion.shown()
+                ));
+            };
+            let text = text.trim();
+            if bs::continuation_verdict(text) != bs::ContinuationVerdict::Ok {
+                return Err(format!(
+                    "task {n} acceptance_criteria entry {} must be a concrete condition of at least three words",
+                    criterion_idx + 1
+                ));
+            }
+            if !seen_criteria.insert(text.to_ascii_lowercase()) {
+                return Err(format!(
+                    "task {n} repeats acceptance criterion {:?}",
+                    text
+                ));
+            }
+            criteria.push(text.to_string());
+        }
         let mut seen = std::collections::HashSet::new();
+        let mut deps: Vec<usize> = Vec::with_capacity(task.depends_on.len());
         for dep in &task.depends_on {
+            let DepRef::Index(dep) = dep else {
+                return Err(format!(
+                    "task {n} dependency {} must name an earlier task by 1-based index \
+                     (a POSITION in this request's `tasks` array, 1 for the first), not a \
+                     card id or a title",
+                    dep.shown()
+                ));
+            };
             if *dep == 0 || *dep >= n {
                 return Err(format!(
                     "task {n} dependency {dep} must name an earlier task by 1-based index"
@@ -4206,9 +6132,50 @@ fn validate_decomposition(tasks: &[DecomposeTask]) -> Result<(), String> {
             if !seen.insert(*dep) {
                 return Err(format!("task {n} repeats dependency {dep}"));
             }
+            deps.push(*dep);
         }
+        out.push(deps);
+        all_criteria.push(criteria);
     }
-    Ok(())
+
+    // A retry is idempotent only when the normalized PLAN is the same. The
+    // hash is written on the root epic before the transaction commits, so a
+    // lost response, a restart, and a concurrent retry all share one durable
+    // discriminator. Mutable child prose/status never participates.
+    let canonical = tasks
+        .iter()
+        .enumerate()
+        .map(|(idx, task)| {
+            json!({
+                "title": task.title.trim(),
+                "description": task.description.trim(),
+                "type": task.item_type,
+                "priority": task.priority,
+                "depends_on": out[idx],
+                "next_action": task.next_action.trim(),
+                "acceptance_criteria": all_criteria[idx],
+            })
+        })
+        .collect::<Vec<_>>();
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(serde_json::to_vec(&canonical).expect("JSON values always serialize"));
+    let plan_sha256 = format!("{:x}", digest.finalize());
+
+    Ok(ValidatedDecomposition {
+        dependencies: out,
+        acceptance_criteria: all_criteria,
+        plan_sha256,
+    })
+}
+
+fn decomposition_plan_sha256(log: Option<&str>) -> Option<String> {
+    log.unwrap_or_default()
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.strip_prefix("plan_sha256="))
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
 }
 
 /// POST /api/board/{id}/decompose — atomically turn a capture shell into an
@@ -4219,9 +6186,27 @@ async fn decompose_item(
     headers: HeaderMap,
     Json(body): Json<DecomposeBody>,
 ) -> Response {
-    if let Err(why) = validate_decomposition(&body.tasks) {
-        return err(StatusCode::BAD_REQUEST, json!({"error": why, "item": id}));
-    }
+    let validated = match validate_decomposition(&body.tasks) {
+        Ok(d) => d,
+        Err(why) => {
+            tracing::warn!(
+                target: "amux::board",
+                epic = %id,
+                verdict = "invalid_plan",
+                measured = true,
+                n_considered = body.tasks.len(),
+                reason = %why,
+                "board capture decomposition refused"
+            );
+            return err(StatusCode::BAD_REQUEST, json!({
+                "error": why,
+                "item": id,
+                "verdict": "invalid_plan",
+                "measured": true,
+                "n_considered": body.tasks.len(),
+            }));
+        }
+    };
     let (_, actor) = actor_from_headers(&headers);
     if actor == "api-anonymous" {
         return err(
@@ -4234,10 +6219,14 @@ async fn decompose_item(
         Missing,
         NotCapture,
         WrongOwner(String),
-        Already(IssueRow, Vec<IssueRow>),
+        Already(IssueRow, Vec<IssueRow>, Option<String>),
         Created(IssueRow, Vec<IssueRow>),
     }
     let tasks = body.tasks;
+    let dep_indices = validated.dependencies;
+    let acceptance_criteria = validated.acceptance_criteria;
+    let plan_sha256 = validated.plan_sha256;
+    let submitted_plan_sha256 = plan_sha256.clone();
     let id_w = id.clone();
     let actor_w = actor.clone();
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
@@ -4263,7 +6252,12 @@ async fn decompose_item(
                     .iter()
                     .filter_map(|child| bs::get_issue(conn, child).ok().flatten())
                     .collect();
-                return finish(&slot_w, Out::Already(parent, children), no_write());
+                let existing_plan_sha256 = decomposition_plan_sha256(parent.log.as_deref());
+                return finish(
+                    &slot_w,
+                    Out::Already(parent, children, existing_plan_sha256),
+                    no_write(),
+                );
             }
             if parent.source.as_deref() != Some("capture")
                 && !parent.desc.trim_start().starts_with("**Prompt:**")
@@ -4292,20 +6286,21 @@ async fn decompose_item(
                 parent.log.as_deref(),
                 &stamp,
                 &format!(
-                    "decomposed by {actor_w} into {} ordered child task(s)",
-                    tasks.len()
+                    "decomposed by {actor_w} into {} ordered child task(s) plan_sha256={plan_sha256}",
+                    tasks.len(),
                 ),
             ));
             bs::save_patched(conn, &mut parent)?;
             let mut events = vec![ev_snap(&parent, MutationKind::Updated)];
             let mut children: Vec<IssueRow> = Vec::with_capacity(tasks.len());
             for (idx, task) in tasks.iter().enumerate() {
-                let deps = task
-                    .depends_on
+                let deps = dep_indices[idx]
                     .iter()
                     .map(|n| children[*n - 1].id.clone())
                     .collect::<Vec<_>>();
                 let new = bs::NewIssue {
+                    acceptance_criteria: None,
+                    next_action: None,
                     title: task.title.trim().to_string(),
                     desc: task.description.trim().to_string(),
                     status: if deps.is_empty() {
@@ -4336,6 +6331,10 @@ async fn decompose_item(
                 let mut child = bs::create_issue(conn, &new, now)?;
                 child.epic = Some(parent.id.clone());
                 child.next_action = Some(task.next_action.trim().to_string());
+                child.acceptance_criteria = Some(
+                    serde_json::to_string(&acceptance_criteria[idx])
+                        .expect("validated string criteria always serialize"),
+                );
                 child.log = Some(bs::append_log(
                     child.log.as_deref(),
                     &stamp,
@@ -4377,15 +6376,59 @@ async fn decompose_item(
             StatusCode::FORBIDDEN,
             json!({"error":"capture belongs to another worker", "item":id, "owner":owner, "caller":actor}),
         ),
-        Some(Out::Already(parent, children)) => Json(json!({
-            "ok": true,
-            "id": parent.id,
-            "status": parent.status,
-            "epic": detail_body(&parent),
-            "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
-            "idempotent": true,
-        }))
-        .into_response(),
+        Some(Out::Already(parent, children, existing_plan_sha256)) => {
+            match existing_plan_sha256 {
+                Some(existing) if existing == submitted_plan_sha256 => Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "idempotent": true,
+                    "idempotency_measured": true,
+                    "plan_sha256": existing,
+                }))
+                .into_response(),
+                Some(existing) => {
+                    tracing::warn!(
+                        target: "amux::board",
+                        epic = %parent.id,
+                        verdict = "plan_conflict",
+                        measured = true,
+                        n_considered = children.len(),
+                        existing_plan_sha256 = %existing,
+                        submitted_plan_sha256 = %submitted_plan_sha256,
+                        "board capture decomposition retry differs from committed plan"
+                    );
+                    err(StatusCode::CONFLICT, json!({
+                        "error": "capture already has a different decomposition plan",
+                        "code": "decomposition_plan_conflict",
+                        "item": parent.id,
+                        "idempotent": false,
+                        "idempotency_measured": true,
+                        "measured": true,
+                        "n_considered": children.len(),
+                        "existing_plan_sha256": existing,
+                        "submitted_plan_sha256": submitted_plan_sha256,
+                        "existing_tasks": children.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                    }))
+                }
+                // Legacy decompositions predate the durable discriminator. Do
+                // not pretend their payload was compared; preserve retry
+                // compatibility and say exactly what could not be measured.
+                None => Json(json!({
+                    "ok": true,
+                    "id": parent.id,
+                    "status": parent.status,
+                    "epic": detail_body(&parent),
+                    "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "idempotent": true,
+                    "idempotency_measured": false,
+                    "why_unmeasured": "this decomposition predates the durable plan fingerprint",
+                }))
+                .into_response(),
+            }
+        }
         Some(Out::Created(parent, children)) => {
             tracing::info!(
                 target: "amux::board",
@@ -4404,6 +6447,7 @@ async fn decompose_item(
                     "status": parent.status,
                     "epic": detail_body(&parent),
                     "tasks": children.iter().map(detail_body).collect::<Vec<_>>(),
+                    "plan_sha256": submitted_plan_sha256,
                 })),
             )
                 .into_response()
@@ -4412,20 +6456,2323 @@ async fn decompose_item(
     }
 }
 
-/// POST /api/board/{id}/claim — atomically take a `todo` or `backlog` card and
-/// start it.
+// ---- Ephemeral fan-out (plan task #6) -----------------------------------
+
+fn ephemeral_completion_notice(card: &str, worker: &str) -> String {
+    format!("Fan-out outcome {card} on {worker} reached its completion boundary. Read its evidence and update the owning epic; preserve any other work assigned to the worker. The harness owns worker retirement and worktree cleanup.")
+}
+
+struct EphemeralConfig<'a> {
+    parent: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    flags: &'a str,
+    creator: &'a str,
+}
+
+/// One provisioning policy for both launch and fan-out. A retry may resume a
+/// failed start, but cannot overwrite a worker's configuration or pause state.
+async fn provision_ephemeral(
+    state: &AppState,
+    child: &IssueRow,
+    name: &str,
+    config: &EphemeralConfig<'_>,
+) -> Result<(), String> {
+    use crate::api::session_verbs::{self, EnvFile, env_path};
+    if !session_verbs::valid_session_name(name) { return Err("invalid ephemeral worker name".into()); }
+    static PROVISIONING: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let provisioning = PROVISIONING.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let parent = session_verbs::parse_env(config.parent);
+    if parent.get("CC_PAUSED") == Some("1") || parent.get("CC_ARCHIVED") == Some("1") {
+        return Err("parent worker is paused or archived".into());
+    }
+    // Provisioning follows the writer transaction. Recheck the assignment after
+    // that boundary so a closed, moved or held task cannot start from a stale row.
+    {
+        let conn = state.store.read().map_err(|e| e.to_string())?;
+        let current = bs::get_issue(&conn, &child.id).map_err(|e| e.to_string())?
+            .ok_or_else(|| "assignment no longer exists".to_string())?;
+        if current.session.as_deref() != Some(name) || current.archived != 0
+            || bs::execution_is_terminal(&current.status, &current.item_type)
+            || !matches!(current.status.as_str(), "todo" | "doing" | "done")
+            || current.blocked_on.as_deref().is_some_and(|v| !v.trim().is_empty())
+            || current.depends_on.iter().any(|id| !bs::dependency_resolved(&conn, id).unwrap_or(false)) {
+            tracing::info!(card = %child.id, session = name, verdict = "ephemeral_assignment_changed",
+                "ephemeral start refused after assignment changed or lost readiness");
+            return Err("assignment changed or is no longer ready; worker not started".into());
+        }
+    }
+    let path = env_path(name);
+    let mut env = EnvFile::load(&path);
+    if path.exists() {
+        if env.get("CC_EPHEMERAL") != Some("1") || env.get("CC_PARENT") != Some(config.parent)
+            || env.get("CC_BOARD_CARD").is_some_and(|id| id != child.id) {
+            return Err(format!("worker {name} already belongs to another assignment"));
+        }
+        if env.get("CC_PAUSED") == Some("1") || env.get("CC_ARCHIVED") == Some("1") {
+            return Err(format!("worker {name} is paused or archived; preserving lifecycle state"));
+        }
+        if session_verbs::is_running(name).await {
+            tracing::info!(session = name, card = %child.id, verdict = "ephemeral_reused",
+                "fan-out retry reused running worker without restarting it");
+            return Ok(());
+        }
+    } else {
+        env.set("CC_DIR", parent.get_or("CC_DIR", ""));
+        env.set("CC_WORKTREE", "1");
+        env.set("CC_WORKTREE_AUTO_MERGE", "1");
+        if let Some(command) = parent.get("CC_WORKTREE_VERIFY") { env.set("CC_WORKTREE_VERIFY", command); }
+        env.set("CC_EPHEMERAL", "1");
+        env.set("CC_PARENT", config.parent);
+        env.set("CC_BOARD_CARD", &child.id);
+        env.set("CC_PROVIDER", config.provider);
+        let tags = parent.get_or("CC_TAGS", "");
+        env.set("CC_TAGS", &if tags.is_empty() { "ephemeral".into() } else { format!("{tags},ephemeral") });
+        env.set("CC_CREATOR", config.creator);
+        env.set("AMUX_BOARD_DELEGATION", "0");
+        env.set("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "1");
+        let base_flags = if config.provider == "claude" {
+            format!("--dangerously-skip-permissions {}", config.flags)
+        } else { config.flags.to_string() };
+        let flags = session_verbs::route_model_to_env(&mut env, config.provider, config.model, base_flags.trim());
+        env.set("CC_FLAGS", &flags);
+        if let Some(criteria) = child.acceptance_criteria.as_deref() {
+            env.set("CC_ACCEPTANCE_CRITERIA", criteria);
+        }
+        env.set("CC_DESC", &format!("Ephemeral worker for: {}", child.title.chars().take(120).collect::<String>()));
+        env.write(&path).map_err(|e| format!("env write: {e}"))?;
+    }
+    session_verbs::set_initial_instructions(name, &super::orchestrations::child_instructions(config.parent));
+    drop(provisioning);
+    let (ok, detail) = session_verbs::start_session(state, name, "", true).await;
+    if ok {
+        tracing::info!(session = name, card = %child.id, parent = config.parent,
+            verdict = "ephemeral_started", "canonical ephemeral provisioner started worker");
+        Ok(())
+    } else {
+        tracing::warn!(session = name, card = %child.id, error = %detail,
+            verdict = "ephemeral_start_failed", "ephemeral assignment retained for retry");
+        Err(detail)
+    }
+}
+
+#[derive(Deserialize)]
+struct FanOutBody {
+    model: Option<String>,
+    provider: Option<String>,
+    flags: Option<String>,
+}
+
+/// POST /api/board/{id}/fan-out — spin up ephemeral workers for an epic's children.
 ///
-/// The assignment notifications tell every session to run `amux board claim
-/// <id>`, and the CLI has always POSTed here — but the route was never mounted,
-/// so the call hit the GET-only SPA catch-all (405), the CLI printed a good
-/// message and (pre-fix) exited 0, and the card was untouched (AMUX-3131, the
-/// AMUX-2140 class one layer down: the sanctioned instruction was theatre). It
-/// now runs the SAME operation auto-pickup uses (`claim_card_from`:
-/// compare-and-swap ->doing, assign the claimer, emit `task.claimed` for the
-/// 24h re-claim cooldown), so a manual claim and an auto-pickup are one
-/// mechanism. Backlog is claimable HERE only (AMUX-3450): the CLI help always
-/// promised todo/backlog and a peer handover relied on it, but auto-pickup's
-/// CAS stays todo-only so parking a card mid-race still defeats the pickup.
+/// The epic must already be decomposed (have children). For each non-terminal
+/// child card, the handler: (1) creates a session env file with CC_WORKTREE=1,
+/// CC_EPHEMERAL=1, and self-containment flags, (2) reassigns the child card's
+/// session to the ephemeral worker, (3) starts the worker. The epic card tracks
+/// overall progress; `complete_finished_epics` in board_drive auto-completes it
+/// when all children reach terminal status; the reaper tears down the ephemeral
+/// workers afterward.
+async fn fan_out_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FanOutBody>,
+) -> Response {
+    let (_, actor) = actor_from_headers(&headers);
+    if actor == "api-anonymous" {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "fan-out requires X-Amux-Worker or X-Amux-Session attribution"}),
+        );
+    }
+
+    // Phase 1: DB read+write (reassign child sessions) inside write_async
+    #[derive(Debug)]
+    enum Out {
+        Missing,
+        NotEpic,
+        NoChildren,
+        NoIndependentWork,
+        WrongOwner(String),
+        Fanned {
+            epic: Box<IssueRow>,
+            children: Vec<(IssueRow, String)>,
+        },
+    }
+
+    let model = body.model.unwrap_or_else(|| "haiku".into());
+    let provider = body.provider.unwrap_or_else(|| "claude".into());
+    let extra_flags = body.flags.unwrap_or_default();
+    let id_w = id.clone();
+    let actor_w = actor.clone();
+    let model_w = model.clone();
+    let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(parent) = bs::get_issue(conn, &id_w)? else {
+                return finish(&slot_w, Out::Missing, no_write());
+            };
+            if parent.item_type != "epic" {
+                return finish(&slot_w, Out::NotEpic, no_write());
+            };
+            if parent
+                .session
+                .as_deref()
+                .is_some_and(|owner| owner != actor_w)
+            {
+                return finish(
+                    &slot_w,
+                    Out::WrongOwner(parent.session.clone().unwrap_or_default()),
+                    no_write(),
+                );
+            }
+
+            let child_ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY created,id",
+                )?;
+                let ids = stmt.query_map(rusqlite::params![id_w], |r| r.get::<_, String>(0))?
+                    .flatten()
+                    .collect::<Vec<_>>();
+                ids
+            };
+            if child_ids.is_empty() {
+                return finish(&slot_w, Out::NoChildren, no_write());
+            }
+
+            let now = now_secs();
+            let stamp = chrono::Local::now().format("%H:%M").to_string();
+            let mut events = Vec::new();
+            let mut children = Vec::new();
+
+            for cid in &child_ids {
+                let Some(mut child) = bs::get_issue(conn, cid)? else { continue };
+                if bs::execution_is_terminal(&child.status, &child.item_type) { continue; }
+                let existing_assignment = child.callback_session.as_deref() == Some(actor_w.as_str())
+                    && child.session.as_deref().is_some_and(|owner| owner != actor_w);
+                if existing_assignment {
+                    let owner = child.session.clone().expect("checked above");
+                    children.push((child, owner));
+                    continue;
+                }
+                if child.session.as_deref().is_some_and(|owner| owner != actor_w) {
+                    tracing::warn!(card = %child.id, owner = ?child.session,
+                        verdict = "fan_out_foreign_child_skipped", "epic link does not authorize taking another worker's assignment");
+                    continue;
+                }
+                // Only independent ready work fans out. Other states retain their
+                // owner and gates; no worker starts merely to wait on a sibling.
+                if !matches!(child.status.as_str(), "todo" | "backlog")
+                    || child.blocked_on.as_deref().is_some_and(|v| !v.trim().is_empty())
+                    || child.depends_on.iter().any(|id| !bs::dependency_resolved(conn, id).unwrap_or(false)) {
+                    tracing::info!(card = %child.id, verdict = "fan_out_not_ready", "child retained on owner board until its gates clear");
+                    continue;
+                }
+                let eph_name = format!("{}-eph-{}", slugify_name(&actor_w, 30), cid);
+                let dependents = bs::foreign_dependents(conn, cid, Some(&eph_name))?;
+                if !dependents.is_empty() {
+                    tracing::info!(card = %child.id, dependents = ?dependents, measured = true,
+                        n_considered = dependents.len(), verdict = "fan_out_connected_work_retained",
+                        "prerequisite retained with its dependent tasks on the owner board");
+                    continue;
+                }
+                if !child.depends_on.is_empty() {
+                    // Ready dependencies are completed inputs now. Retain their
+                    // provenance without creating cross-worker execution edges.
+                    child.log = Some(bs::append_log(child.log.as_deref(), &stamp,
+                        &format!("fan-out: completed prerequisites consumed before assignment: {}", child.depends_on.join(", "))));
+                    child.depends_on.clear();
+                }
+                child.session = Some(eph_name.clone());
+                child.callback_session = Some(actor_w.clone());
+                child.callback_prompt = Some(ephemeral_completion_notice(cid, &eph_name));
+                child.callback_state = Some("armed".into());
+                if child.status == "backlog" {
+                    child.status = "todo".into();
+                }
+                child.updated = now;
+                child.rev += 1;
+                child.version += 1;
+                child.log = Some(bs::append_log(
+                    child.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "fan-out: assigned to ephemeral worker {eph_name} (model={model_w}) by {actor_w}",
+                    ),
+                ));
+                bs::save_patched(conn, &mut child)?;
+                events.push(ev_snap(&child, MutationKind::Updated));
+                children.push((child, eph_name));
+            }
+
+            if children.is_empty() {
+                return finish(&slot_w, Out::NoIndependentWork, no_write());
+            }
+
+            // Log on the epic itself
+            let mut epic = parent;
+            if !events.is_empty() {
+                epic.updated = now;
+                epic.rev += 1;
+                epic.version += 1;
+                epic.log = Some(bs::append_log(
+                    epic.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "fan-out: {} ephemeral worker(s) created by {actor_w} (model={model_w})",
+                        children.len(),
+                    ),
+                ));
+                bs::save_patched(conn, &mut epic)?;
+                events.push(ev_snap(&epic, MutationKind::Updated));
+            }
+
+            finish(
+                &slot_w,
+                Out::Fanned {
+                    epic: Box::new(epic),
+                    children,
+                },
+                WriteOutcome {
+                    applied: !events.is_empty(),
+                    events,
+                },
+            )
+        })
+        .await;
+
+    if let Err(e) = write {
+        return internal(e);
+    }
+
+    let outcome = slot.lock().expect("fan-out slot poisoned").take();
+    match outcome {
+        Some(Out::Missing) => not_found(&id),
+        Some(Out::NotEpic) => err(
+            StatusCode::CONFLICT,
+            json!({"error": "card is not an epic; decompose it first", "item": id}),
+        ),
+        Some(Out::NoChildren) => err(
+            StatusCode::CONFLICT,
+            json!({"error": "epic has no non-terminal children to fan out", "item": id}),
+        ),
+        Some(Out::NoIndependentWork) => err(
+            StatusCode::CONFLICT,
+            json!({"code":"fan_out_no_independent_work", "error":"no independent ready outcomes to fan out; connected or gated tasks remain on their owner board", "item":id}),
+        ),
+        Some(Out::WrongOwner(owner)) => err(
+            StatusCode::FORBIDDEN,
+            json!({"error": "epic belongs to another worker", "item": id, "owner": owner, "caller": actor}),
+        ),
+        Some(Out::Fanned { epic, children }) => {
+            // Phase 2: async work (env files + start sessions)
+            let mut started = Vec::new();
+            let mut failed = Vec::new();
+            let creator = format!("fan-out:{actor}");
+            let config = EphemeralConfig { parent: &actor, provider: &provider, model: &model,
+                flags: &extra_flags, creator: &creator };
+            for (child, name) in &children {
+                match provision_ephemeral(&state, child, name, &config).await {
+                    Ok(()) => started.push(name.clone()),
+                    Err(error) => failed.push(json!({"name": name, "error": error})),
+                }
+            }
+
+            tracing::info!(
+                target: "amux::board",
+                epic = %epic.id,
+                workers_started = started.len(),
+                workers_failed = failed.len(),
+                model = %model,
+                parent = %actor,
+                verdict = "fan_out_complete",
+                measured = true,
+                n_considered = children.len(),
+                "board epic fan-out completed"
+            );
+
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "epic": id,
+                    "model": model,
+                    "workers_started": started.len(),
+                    "workers_failed": failed.len(),
+                    "started": started,
+                    "failed": failed,
+                    "measured": true,
+                    "n_considered": children.len(),
+                })),
+            )
+                .into_response()
+        }
+        None => internal("fan-out produced no outcome"),
+    }
+}
+
+// ---- One-shot launch: priorities -> epic -> children -> fan-out -----------
+
+#[derive(Deserialize, Serialize)]
+struct LaunchPriority {
+    text: Option<String>,
+    /// Worker name override. If omitted, derived from text.
+    name: Option<String>,
+    /// Optional per-worker overrides of the fan-out defaults.
+    profile: Option<LaunchProfile>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum PriorityEntry {
+    Plain(String),
+    Structured(LaunchPriority),
+}
+
+impl PriorityEntry {
+    fn text(&self) -> &str {
+        match self {
+            PriorityEntry::Plain(s) => s.as_str(),
+            PriorityEntry::Structured(p) => p.text.as_deref().unwrap_or(""),
+        }
+    }
+    fn profile(&self) -> Option<&LaunchProfile> {
+        match self { Self::Plain(_) => None, Self::Structured(p) => p.profile.as_ref() }
+    }
+    fn name_override(&self) -> Option<&str> {
+        match self {
+            PriorityEntry::Plain(_) => None,
+            PriorityEntry::Structured(p) => p.name.as_deref(),
+        }
+    }
+}
+
+fn slugify_name(text: &str, max_len: usize) -> String {
+    let slug: String = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed: String = slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-");
+    if trimmed.len() > max_len {
+        trimmed[..max_len].trim_end_matches('-').to_string()
+    } else {
+        trimmed
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct LaunchProfile {
+    provider: Option<String>,
+    model: Option<String>,
+    flags: Option<String>,
+}
+
+impl LaunchProfile {
+    fn resolve(&self, defaults: &(String, String, String)) -> Result<(String, String, String), String> {
+        let provider = self.provider.clone().unwrap_or_else(|| defaults.0.clone());
+        if !crate::api::session_verbs::SESSION_PROVIDERS.contains(&provider.as_str()) || provider == "iterm2" {
+            return Err(format!("unsupported worker provider: {provider}"));
+        }
+        let model = self.model.clone().unwrap_or_else(|| if provider == defaults.0 { defaults.1.clone() } else { String::new() });
+        // Models are open identifiers, not shell fragments. A provider catalog is
+        // guidance; newly released model IDs remain usable without a server edit.
+        let model = super::session_verbs::validate_model_name(&json!(model))?;
+        let flags = self.flags.clone().unwrap_or_else(|| if provider == defaults.0 { defaults.2.clone() } else { String::new() });
+        if flags.len() > 2048 || flags.contains(['\n', '\r']) || flags.contains("--model") {
+            return Err("put the model in its profile model field; flags must be a single line".into());
+        }
+        Ok((provider, model, flags))
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct LaunchBody {
+    /// Stable across transport retries; a fresh intentional launch gets a new ID.
+    launch_id: Option<String>,
+    /// Human-readable title for the epic (defaults to "Priorities")
+    title: Option<String>,
+    /// Each entry becomes one child card with its own ephemeral worker.
+    /// Accepts plain strings or {text, name} objects.
+    priorities: Vec<PriorityEntry>,
+    /// Workspace source; without an orchestrator profile, also the coordinator.
+    parent_session: String,
+    /// Model for ephemeral workers (default "haiku").
+    model: Option<String>,
+    /// Provider for ephemeral workers (default "claude").
+    provider: Option<String>,
+    /// Extra CC_FLAGS passed to each worker.
+    flags: Option<String>,
+    /// A dedicated coordinator; omission preserves existing-worker API callers.
+    orchestrator: Option<LaunchProfile>,
+}
+
+/// POST /api/board/launch
+///
+/// Takes plain-text priorities and does the full create-epic, create-children,
+/// fan-out pipeline in one call. Each priority becomes a child card assigned to
+/// its own ephemeral worker with CC_WORKTREE=1, CC_EPHEMERAL=1 and
+/// self-containment flags.
+async fn launch_priorities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LaunchBody>,
+) -> Response {
+    use crate::api::session_verbs::env_path;
+
+    let (_, actor) = actor_from_headers(&headers);
+    if actor == "api-anonymous" {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "launch requires X-Amux-Session attribution"}),
+        );
+    }
+
+    if body.launch_id.as_ref().is_some_and(|id| id.len() > 80 || !crate::api::session_verbs::valid_session_name(id)) {
+        return err(StatusCode::BAD_REQUEST,json!({"error":"invalid launch_id"}));
+    }
+    if body.priorities.is_empty() || body.priorities.len() > 20 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "provide 1 to 20 priorities"}),
+        );
+    }
+    for (i, p) in body.priorities.iter().enumerate() {
+        if p.name_override().is_some_and(|name| !crate::api::session_verbs::valid_session_name(name)) {
+            return err(StatusCode::BAD_REQUEST, json!({"error":"invalid worker name", "priority":i+1}));
+        }
+        if p.text().trim().is_empty() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("priority {} is empty", i + 1)}),
+            );
+        }
+    }
+
+    let parent_session = body.parent_session.clone();
+    if actor != parent_session && !super::org::is_verified_local_member(&headers) {
+        tracing::warn!(caller = %actor, requested_owner = %parent_session,
+            verdict = "cross_board_launch_forbidden", "worker launch must remain on its own board");
+        return err(StatusCode::FORBIDDEN, json!({
+            "code":"cross_board_launch_forbidden", "caller":actor, "requested_owner":parent_session,
+            "error":"workers may launch outcomes only on their own board"
+        }));
+    }
+    let parent_env_path = env_path(&parent_session);
+    if !parent_env_path.exists() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "parent_session has no env file", "session": parent_session}),
+        );
+    }
+
+    let parent_env = crate::api::session_verbs::parse_env(&parent_session);
+    if ["CC_PAUSED", "CC_ARCHIVED", "CC_ISOLATED"].iter().any(|key| parent_env.get(key) == Some("1")) {
+        return err(StatusCode::CONFLICT, json!({"error":"workspace worker is paused, archived or isolated; no orchestration created"}));
+    }
+    let defaults = ("claude".to_string(), "haiku".to_string(), String::new());
+    let profile = LaunchProfile { provider: body.provider.clone(), model: body.model.clone(), flags: body.flags.clone() };
+    let worker_profile = match profile.resolve(&defaults) {
+        Ok(profile) => profile,
+        Err(error) => return err(StatusCode::BAD_REQUEST,json!({"error":error})),
+    };
+    let child_profiles = match body.priorities.iter().map(|p| p.profile().cloned().unwrap_or_default().resolve(&worker_profile)).collect::<Result<Vec<_>,_>>() {
+        Ok(profiles) => profiles,
+        Err(error) => return err(StatusCode::BAD_REQUEST,json!({"error":error})),
+    };
+    let dedicated = body.orchestrator.is_some();
+    let coordinator_profile = match body.orchestrator.as_ref().map(|p| p.resolve(&("claude".into(), "opus".into(), String::new()))).transpose() {
+        Ok(profile) => profile,
+        Err(error) => return err(StatusCode::BAD_REQUEST,json!({"error":error})),
+    };
+    let mut parent_session = parent_session;
+    if let Some(profile) = coordinator_profile.as_ref() {
+        use sha2::Digest as _;
+        let key = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&body).expect("launch serializes")));
+        let coordinator = format!("orchestrator-{}-{}", slugify_name(body.title.as_deref().unwrap_or_else(|| body.priorities[0].text()), 20), &key[..16]);
+        if body.priorities.iter().any(|p| p.name_override() == Some(&coordinator)) {
+            return err(StatusCode::BAD_REQUEST,json!({"error":"a fan-out worker cannot use the coordinator name"}));
+        }
+        if let Err(error) = super::orchestrations::prepare_coordinator(&parent_session, &coordinator, &key, profile).await {
+            return err(StatusCode::CONFLICT,json!({"error":error,"code":"orchestrator_provision_refused"}));
+        }
+        parent_session = coordinator;
+    }
+    let (provider, model, extra_flags) = worker_profile;
+    let epic_title = body.title.clone().unwrap_or_else(|| "Priorities".into());
+
+    // Phase 1: create epic + children in one transaction
+    #[derive(Debug)]
+    struct Created {
+        epic: IssueRow,
+        children: Vec<(IssueRow, String)>, // (card, ephemeral_name)
+        reused: bool,
+    }
+
+    let priorities = body.priorities;
+    let parent_session_w = parent_session.clone();
+    let actor_w = actor.clone();
+    let model_w = model.clone();
+    let slot: Arc<Mutex<Option<Created>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let now = now_secs();
+            let stamp = chrono::Local::now().format("%H:%M").to_string();
+
+            // Create the epic
+            let epic_desc = priorities
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("{}. {}", i + 1, p.text().trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let previous: Option<String> = conn.query_row(
+                "SELECT id FROM issues WHERE session=?1 AND source='launch' AND type='epic' \
+                 AND deleted IS NULL \
+                 AND (?4 OR (title=?2 AND desc=?3 AND COALESCE(archived,0)=0 AND status IN ('doing','todo','backlog','review'))) ORDER BY created DESC LIMIT 1",
+                rusqlite::params![parent_session_w, epic_title, format!("**Prompt:** {epic_desc}"), dedicated], |r| r.get(0),
+            ).optional()?;
+            if let Some(id) = previous {
+                let epic = bs::get_issue(conn, &id)?.expect("selected epic exists in transaction");
+                let ids = conn.prepare("SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0 ORDER BY created,id")?
+                    .query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut children = Vec::new();
+                for id in ids {
+                    if let Some(row) = bs::get_issue(conn, &id)? {
+                        if let Some(owner) = row.session.clone() { children.push((row, owner)); }
+                    }
+                }
+                children.sort_by_key(|(row, _)| row.tags.iter()
+                    .find_map(|t| t.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()))
+                    .unwrap_or(usize::MAX));
+                tracing::info!(epic = %epic.id, verdict = "launch_reused", "identical launch reused durable graph");
+                *slot_w.lock().expect("launch slot poisoned") = Some(Created { epic, children, reused: true });
+                return Ok(no_write());
+            }
+            let epic_new = bs::NewIssue {
+                title: epic_title,
+                desc: format!("**Prompt:** {epic_desc}"),
+                status: "doing".into(),
+                session: Some(parent_session_w.clone()),
+                item_type: "epic".into(),
+                creator: actor_w.clone(),
+                owner_type: "agent".into(),
+                due: None,
+                due_time: None,
+                reviewer: None,
+                shepherd: None,
+                gate: Vec::new(),
+                depends_on: Vec::new(),
+                tags: vec!["launch".into()],
+                ask_type: None,
+                next_action: None,
+                acceptance_criteria: None,
+                ask_question: None,
+                ask_unblocks: None,
+                ask_actor: None,
+                source: Some("launch".into()),
+                requested_by: Some(actor_w.clone()),
+                callback_session: None,
+                callback_prompt: None,
+            };
+            let mut epic = bs::create_issue(conn, &epic_new, now)?;
+            epic.log = Some(bs::append_log(
+                epic.log.as_deref(),
+                &stamp,
+                &format!(
+                    "launched by {actor_w}: {} priorities, fan-out model={model_w}",
+                    priorities.len(),
+                ),
+            ));
+            bs::save_patched(conn, &mut epic)?;
+            let mut events = vec![ev_snap(&epic, MutationKind::Created)];
+
+            // Create child cards
+            let mut children = Vec::with_capacity(priorities.len());
+            let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (idx, priority) in priorities.iter().enumerate() {
+                let trimmed = priority.text().trim();
+                let base_name = if let Some(name) = priority.name_override() {
+                    name.to_string()
+                } else {
+                    format!("{}-{}-{}", slugify_name(trimmed, 24), epic.id.to_ascii_lowercase(), idx + 1)
+                };
+                let mut eph_name = base_name.clone();
+                if used_names.contains(&eph_name) || eph_name.is_empty() {
+                    eph_name = format!("{eph_name}-{}", idx + 1);
+                }
+                used_names.insert(eph_name.clone());
+
+                let child_new = bs::NewIssue {
+                    title: trimmed.to_string(),
+                    desc: trimmed.to_string(),
+                    status: "todo".into(),
+                    session: Some(eph_name.clone()),
+                    item_type: "code".into(),
+                    creator: actor_w.clone(),
+                    owner_type: "agent".into(),
+                    due: None,
+                    due_time: None,
+                    reviewer: None,
+                    shepherd: None,
+                    gate: Vec::new(),
+                    depends_on: Vec::new(),
+                    tags: vec![format!("p{}", idx)],
+                    ask_type: None,
+                    next_action: Some(format!("Investigate and implement: {trimmed}")),
+                    acceptance_criteria: Some(
+                        serde_json::to_string(&[format!("{trimmed}: implemented and verified")])
+                            .expect("single-element array always serializes"),
+                    ),
+                    ask_question: None,
+                    ask_unblocks: None,
+                    ask_actor: None,
+                    source: Some("launch".into()),
+                    requested_by: Some(actor_w.clone()),
+                    callback_session: Some(parent_session_w.clone()),
+                    callback_prompt: None,
+                };
+                let mut child = bs::create_issue(conn, &child_new, now)?;
+                child.epic = Some(epic.id.clone());
+                child.callback_prompt = Some(ephemeral_completion_notice(&child.id, &eph_name));
+                child.callback_state = Some("armed".into());
+                child.log = Some(bs::append_log(
+                    child.log.as_deref(),
+                    &stamp,
+                    &format!(
+                        "launched: assigned to ephemeral worker {eph_name} (model={model_w}) by {actor_w}",
+                    ),
+                ));
+                child.updated = now;
+                child.rev += 1;
+                child.version += 1;
+                bs::save_patched(conn, &mut child)?;
+                events.push(ev_snap(&child, MutationKind::Created));
+                children.push((child, eph_name));
+            }
+
+            *slot_w.lock().expect("launch slot poisoned") = Some(Created {
+                epic,
+                children,
+                reused: false,
+            });
+            Ok(WriteOutcome {
+                applied: true,
+                events,
+            })
+        })
+        .await;
+
+    if let Err(e) = write {
+        return internal(e);
+    }
+
+    let created = match slot.lock().expect("launch slot poisoned").take() {
+        Some(c) => c,
+        None => return internal("launch produced no outcome"),
+    };
+
+    // Phase 2: write env files and start sessions (outside the DB transaction)
+    let mut started = Vec::new();
+    let mut failed = Vec::new();
+    let creator = format!("launch:{actor}");
+    let complete = bs::execution_is_terminal(&created.epic.status, &created.epic.item_type);
+    let coordinator = if complete {
+        json!({"name":parent_session,"role":"orchestrator","profile":super::orchestrations::worker_profile(&parent_session),
+            "started":false,"complete":true,"error":null})
+    } else { super::orchestrations::start_coordinator(&state, &parent_session, &created.epic.id, dedicated).await };
+    for (child, name) in &created.children {
+        let index = child.tags.iter().find_map(|t| t.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()));
+        let selected = index.and_then(|i| child_profiles.get(i));
+        let (p, m, f) = selected.map(|(p,m,f)| (p.as_str(),m.as_str(),f.as_str())).unwrap_or((&provider,&model,&extra_flags));
+        let config = EphemeralConfig { parent: &parent_session, provider: p, model: m, flags: f, creator: &creator };
+        if complete || bs::execution_is_terminal(&child.status, &child.item_type) { continue; }
+        match provision_ephemeral(&state, child, name, &config).await {
+            Ok(()) => started.push(name.clone()),
+            Err(error) => failed.push(json!({"name": name, "error": error})),
+        }
+    }
+
+    tracing::info!(
+        target: "amux::board",
+        epic = %created.epic.id,
+        workers_started = started.len(),
+        workers_failed = failed.len(),
+        model = %model,
+        parent = %parent_session,
+        caller = %actor,
+        verdict = "launch_complete",
+        measured = true,
+        n_considered = created.children.len(),
+        "board launch completed"
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "epic": created.epic.id,
+            "idempotent": created.reused,
+            "complete": complete,
+            "orchestrator": coordinator,
+            "model": model,
+            "priorities": created.children.len(),
+            "workers_started": started.len(),
+            "workers_failed": failed.len(),
+            "started": started,
+            "failed": failed,
+            "children": created.children.iter().map(|(c, eph)| json!({
+                "id": c.id,
+                "title": c.title,
+                "worker": eph,
+                "profile": super::orchestrations::worker_profile(eph),
+            })).collect::<Vec<_>>(),
+            "measured": true,
+            "n_considered": created.children.len(),
+        })),
+    )
+        .into_response()
+}
+
+// Claim endpoint context continues below the self-contained overlap subsystem.
+// ---- Durable semantic-overlap reconciliation (ATE-93) --------------------
+
+/// The durable source record for a concern-level work election.  This is not a
+/// new work primitive: it is a board relation between existing cards.  The
+/// coordination id is stable across retries, process restart, and
+/// provider/model switches, so a late reply can converge on the same record.
+#[derive(Debug, Clone, Serialize)]
+struct OverlapRecord {
+    coordination_id: String,
+    semantic_key: String,
+    concern: String,
+    owner_card_id: String,
+    owner_session: String,
+    resolution: String,
+    resolution_note: Option<String>,
+    resolved_by_card_id: Option<String>,
+    resolved_by_session: Option<String>,
+    resolved_at: Option<i64>,
+    role: String,
+    relation: String,
+    newly_elected: bool,
+    newly_linked: bool,
+    participants: Vec<OverlapParticipant>,
+    evidence: Vec<String>,
+    assets: Vec<String>,
+    callback: Option<OverlapCallback>,
+    callbacks: Vec<OverlapCallback>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OverlapParticipant {
+    self_reported: bool,
+    card_id: String,
+    session: String,
+    base_commit: String,
+    head_commit: String,
+    worktree: String,
+    intent: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OverlapCallback {
+    target_session: String,
+    message_id: String,
+    state: String,
+    error: Option<String>,
+}
+
+/// Kept raw until the handler derives `session` from its server-stamped
+/// header.  Letting a body nominate the claimant would re-create the exact
+/// ownership ambiguity this endpoint is supposed to settle.
+#[derive(Debug, Clone, Deserialize)]
+struct OverlapBody {
+    semantic_key: String,
+    concern: String,
+    card_id: String,
+    peer_card_id: String,
+    peer_session: String,
+    base_commit: String,
+    head_commit: String,
+    worktree: String,
+    intent: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    assets: Vec<String>,
+    /// Only the elected owner may resolve a concern.  `scope-split` is the
+    /// explicit escape that permits the linked peer to complete its now
+    /// separate concern; `merged` deliberately does not permit a second Done.
+    #[serde(default)]
+    resolution: Option<String>,
+    #[serde(default)]
+    resolution_note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OverlapInput {
+    semantic_key: String,
+    concern: String,
+    card_id: String,
+    session: String,
+    peer_card_id: String,
+    peer_session: String,
+    base_commit: String,
+    head_commit: String,
+    worktree: String,
+    intent: String,
+    evidence: Vec<String>,
+    assets: Vec<String>,
+    resolution: Option<String>,
+    resolution_note: Option<String>,
+}
+
+fn overlap_text(field: &str, raw: &str, min: usize, max: usize) -> Result<String, String> {
+    let value = raw.trim();
+    if value.len() < min || value.len() > max || value.chars().any(char::is_control) {
+        return Err(format!("{field} must be {min}..={max} printable bytes"));
+    }
+    Ok(value.to_string())
+}
+
+fn overlap_refs(field: &str, refs: &[String]) -> Result<Vec<String>, String> {
+    if refs.len() > 32 {
+        return Err(format!("{field} accepts at most 32 references"));
+    }
+    let mut out = Vec::new();
+    for reference in refs {
+        let clean = overlap_text(field, reference, 1, 512)?;
+        if !out.contains(&clean) {
+            out.push(clean);
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_overlap(body: OverlapBody, session: String) -> Result<OverlapInput, String> {
+    let semantic_key =
+        overlap_text("semantic_key", &body.semantic_key, 3, 240)?.to_ascii_lowercase();
+    let concern = overlap_text("concern", &body.concern, 3, 160)?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let card_id = overlap_text("card_id", &body.card_id, 3, 80)?;
+    let peer_card_id = overlap_text("peer_card_id", &body.peer_card_id, 3, 80)?;
+    if card_id == peer_card_id {
+        return Err("card_id and peer_card_id must name distinct cards".into());
+    }
+    let peer_session = overlap_text("peer_session", &body.peer_session, 1, 160)?;
+    let base_commit = overlap_text("base_commit", &body.base_commit, 7, 64)?;
+    let head_commit = overlap_text("head_commit", &body.head_commit, 7, 64)?;
+    for (name, sha) in [("base_commit", &base_commit), ("head_commit", &head_commit)] {
+        if !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{name} must be a commit-shaped hexadecimal id"));
+        }
+    }
+    let resolution = body
+        .resolution
+        .as_deref()
+        .map(|v| overlap_text("resolution", v, 3, 32))
+        .transpose()?;
+    if let Some(ref value) = resolution {
+        if !matches!(value.as_str(), "merged" | "scope-split" | "released") {
+            return Err("resolution must be one of merged, scope-split, released".into());
+        }
+    }
+    let resolution_note = match (resolution.as_deref(), body.resolution_note.as_deref()) {
+        (Some(_), Some(note)) => Some(overlap_text("resolution_note", note, 3, 1_000)?),
+        (Some(_), None) => return Err("resolution_note is required when resolving an overlap".into()),
+        (None, _) => None,
+    };
+    Ok(OverlapInput {
+        semantic_key,
+        concern,
+        card_id,
+        session,
+        peer_card_id,
+        peer_session,
+        base_commit,
+        head_commit,
+        worktree: overlap_text("worktree", &body.worktree, 1, 512)?,
+        intent: overlap_text("intent", &body.intent, 3, 2_000)?,
+        evidence: overlap_refs("evidence", &body.evidence)?,
+        assets: overlap_refs("assets", &body.assets)?,
+        resolution,
+        resolution_note,
+    })
+}
+
+fn overlap_coordination_id(semantic_key: &str, concern: &str) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(semantic_key.as_bytes());
+    digest.update([0]);
+    digest.update(concern.as_bytes());
+    format!("OVL-{}", &format!("{:x}", digest.finalize())[..16])
+}
+
+fn overlap_row(
+    conn: &rusqlite::Connection,
+    coordination_id: &str,
+    caller_card_id: &str,
+    newly_elected: bool,
+    newly_linked: bool,
+    callback_target: Option<&str>,
+) -> rusqlite::Result<Option<OverlapRecord>> {
+    let header: Option<(String, String, String, String, String)> = conn
+        .query_row(
+            "SELECT semantic_key, concern, owner_card_id, owner_session, resolution \
+             FROM board_overlap_coordination WHERE coordination_id=?1",
+            [coordination_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((semantic_key, concern, owner_card_id, owner_session, resolution)) = header else {
+        return Ok(None);
+    };
+    let (resolution_note, resolved_by_card_id, resolved_by_session, resolved_at) = conn.query_row(
+        "SELECT resolution_note, resolved_by_card_id, resolved_by_session, resolved_at \
+         FROM board_overlap_coordination WHERE coordination_id=?1",
+        [coordination_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let mut members = conn.prepare(
+        "SELECT card_id, session, base_commit, head_commit, worktree, intent, self_reported \
+         FROM board_overlap_members WHERE coordination_id=?1 ORDER BY created_at, card_id",
+    )?;
+    let participants = members
+        .query_map([coordination_id], |r| {
+            Ok(OverlapParticipant {
+                self_reported: r.get(6)?,
+                card_id: r.get(0)?,
+                session: r.get(1)?,
+                base_commit: r.get(2)?,
+                head_commit: r.get(3)?,
+                worktree: r.get(4)?,
+                intent: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut refs = conn.prepare(
+        "SELECT kind, ref_value FROM board_overlap_refs WHERE coordination_id=?1 \
+         ORDER BY kind, created_at, ref_value",
+    )?;
+    let mut evidence = Vec::new();
+    let mut assets = Vec::new();
+    for row in refs.query_map([coordination_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (kind, value) = row?;
+        let values = if kind == "evidence" { &mut evidence } else { &mut assets };
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    // GET must expose the same durable callback lineage as POST. A delivered
+    // steering receipt outranks the enqueue-time cache on the coordination.
+    let mut callback_rows = conn.prepare(
+        "SELECT target_session, message_id, \
+                CASE WHEN EXISTS (SELECT 1 FROM steering_history h WHERE h.id=c.message_id) \
+                     THEN 'delivered' ELSE c.state END, error \
+         FROM board_overlap_callbacks c WHERE coordination_id=?1 ORDER BY target_session",
+    )?;
+    let callbacks = callback_rows.query_map([coordination_id], |r| {
+        Ok(OverlapCallback {
+            target_session: r.get(0)?, message_id: r.get(1)?, state: r.get(2)?, error: r.get(3)?,
+        })
+    })?.collect::<Result<Vec<_>, _>>()?;
+    let callback = callbacks.iter()
+        .find(|c| Some(c.target_session.as_str()) == callback_target).cloned();
+    let role = if caller_card_id.is_empty() {
+        "observer"
+    } else if owner_card_id == caller_card_id {
+        "owner"
+    } else {
+        "peer"
+    };
+    // Different concern names are not proof of an agreed scope split.
+    let relation = match resolution.as_str() {
+        "scope-split" | "merged" | "released" => resolution.clone(),
+        _ if role == "owner" => "elected".into(),
+        _ => "duplicate-linked".into(),
+    };
+    Ok(Some(OverlapRecord {
+        coordination_id: coordination_id.to_string(),
+        semantic_key,
+        concern,
+        owner_card_id,
+        owner_session,
+        resolution,
+        resolution_note,
+        resolved_by_card_id,
+        resolved_by_session,
+        resolved_at,
+        role: role.to_string(),
+        relation,
+        newly_elected,
+        newly_linked,
+        participants,
+        evidence,
+        assets,
+        callback,
+        callbacks,
+    }))
+}
+
+fn append_overlap_log(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    line: &str,
+    assets: &[String],
+    now: i64,
+    events: &mut Vec<PendingEvent>,
+) -> rusqlite::Result<()> {
+    let Some(mut card) = bs::get_issue(conn, card_id)? else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    card.log = Some(bs::append_log(card.log.as_deref(), &hhmm(), line));
+    card.updated = now;
+    card.rev += 1;
+    card.version += 1;
+    bs::save_patched(conn, &mut card)?;
+    events.push(ev_snap(&card, MutationKind::Updated));
+    for artifact in crate::db::artifact_store::insert_captured_refs(
+        conn,
+        card_id,
+        assets.to_vec(),
+        "durable board-overlap reconciliation asset",
+        now,
+    )? {
+        events.push(PendingEvent {
+            entity_type: EntityType::Other("artifact".into()),
+            entity_id: artifact.id,
+            mutation: MutationKind::Created,
+            payload: None,
+        });
+    }
+    Ok(())
+}
+
+/// The same predicate backs the friendly HTTP refusal, the deployment permit,
+/// and migration 0057's trigger.  The trigger is the last line of defense;
+/// this helper is what lets a caller see the elected concern, cards, and exit
+/// instead of a raw SQLite abort.
+#[derive(Debug, Clone, Serialize)]
+struct OverlapCompletionBlocker {
+    coordination_id: String,
+    semantic_key: String,
+    concern: String,
+    owner_card_id: String,
+    owner_session: String,
+    resolution: String,
+}
+
+fn overlap_completion_blockers(
+    conn: &rusqlite::Connection,
+    card_id: Option<&str>,
+    session: Option<&str>,
+) -> rusqlite::Result<Vec<OverlapCompletionBlocker>> {
+    let mut query = "SELECT c.coordination_id, c.semantic_key, c.concern, c.owner_card_id, c.owner_session, c.resolution \
+                     FROM board_overlap_members m \
+                     JOIN board_overlap_coordination c ON c.coordination_id=m.coordination_id \
+                     WHERE m.card_id <> c.owner_card_id \
+                       AND c.resolution NOT IN ('scope-split','released')".to_string();
+    let mut params: Vec<String> = Vec::new();
+    if let Some(card_id) = card_id {
+        query.push_str(" AND m.card_id=?");
+        params.push(card_id.to_string());
+    }
+    if let Some(session) = session {
+        query.push_str(" AND m.session=?");
+        params.push(session.to_string());
+    }
+    query.push_str(" ORDER BY c.created_at, c.coordination_id");
+    let mut statement = conn.prepare(&query)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok(OverlapCompletionBlocker {
+                coordination_id: r.get(0)?,
+                semantic_key: r.get(1)?,
+                concern: r.get(2)?,
+                owner_card_id: r.get(3)?,
+                owner_session: r.get(4)?,
+                resolution: r.get(5)?,
+            })
+        })?;
+    let blockers = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(blockers)
+}
+
+/// The one-writer transaction is the election.  A concurrent request can only
+/// observe the elected header and become a linked peer; it cannot replace the
+/// owner, erase provenance, or turn a late discovery into a second deploy.
+fn record_overlap_on_conn(
+    conn: &rusqlite::Connection,
+    input: &OverlapInput,
+    now: i64,
+) -> rusqlite::Result<(OverlapRecord, Vec<PendingEvent>)> {
+    let coordination_id = overlap_coordination_id(&input.semantic_key, &input.concern);
+    let newly_elected = conn.execute(
+        "INSERT OR IGNORE INTO board_overlap_coordination \
+         (coordination_id, semantic_key, concern, owner_card_id, owner_session, created_at, updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?6)",
+        rusqlite::params![
+            coordination_id,
+            input.semantic_key,
+            input.concern,
+            input.card_id,
+            input.session,
+            now,
+        ],
+    )? > 0;
+    let newly_linked = conn.execute(
+        "INSERT INTO board_overlap_members \
+         (coordination_id, card_id, session, base_commit, head_commit, worktree, intent, self_reported, created_at, last_seen_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,1,?8,?8) \
+         ON CONFLICT(coordination_id, card_id) DO UPDATE SET \
+            session=excluded.session, base_commit=excluded.base_commit, head_commit=excluded.head_commit, \
+            worktree=excluded.worktree, intent=excluded.intent, self_reported=1, last_seen_at=excluded.last_seen_at \
+         WHERE board_overlap_members.self_reported=0",
+        rusqlite::params![
+            coordination_id,
+            input.card_id,
+            input.session,
+            input.base_commit,
+            input.head_commit,
+            input.worktree,
+            input.intent,
+            now,
+        ],
+    )? > 0;
+    // Link the other card now, even when its worker is gone. Its provenance is
+    // deliberately provisional until that worker self-reports; the callback
+    // and the completion/deployment guard must not wait for a live provider.
+    conn.execute(
+        "INSERT OR IGNORE INTO board_overlap_members \
+         (coordination_id, card_id, session, base_commit, head_commit, worktree, intent, self_reported, created_at, last_seen_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?8)",
+        rusqlite::params![
+            coordination_id,
+            input.peer_card_id,
+            input.peer_session,
+            input.base_commit,
+            input.head_commit,
+            input.worktree,
+            format!("peer identity linked by {}; self-report pending", input.session),
+            now,
+        ],
+    )?;
+    for (kind, refs) in [("evidence", &input.evidence), ("asset", &input.assets)] {
+        for reference in refs {
+            conn.execute(
+                "INSERT OR IGNORE INTO board_overlap_refs \
+                 (coordination_id, kind, ref_value, card_id, created_at) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![coordination_id, kind, reference, input.card_id, now],
+            )?;
+        }
+    }
+    let callback_target = (input.peer_session != input.session).then(|| input.peer_session.clone());
+    if let Some(target) = &callback_target {
+        let message_id = format!("overlap:{}:{}", coordination_id, target);
+        conn.execute(
+            "INSERT OR IGNORE INTO board_overlap_callbacks \
+             (coordination_id, target_session, message_id, state, updated_at) VALUES (?1,?2,?3,'pending',?4)",
+            rusqlite::params![coordination_id, target, message_id, now],
+        )?;
+    }
+
+    let resolution_changed = if let Some(resolution) = &input.resolution {
+        conn.execute(
+            "UPDATE board_overlap_coordination \
+             SET resolution=?1, resolution_note=?2, resolved_by_card_id=?3, \
+                 resolved_by_session=?4, resolved_at=?5, updated_at=?5 \
+             WHERE coordination_id=?6 AND owner_card_id=?3 AND owner_session=?4 \
+               AND resolution <> ?1",
+            rusqlite::params![
+                resolution,
+                input.resolution_note,
+                input.card_id,
+                input.session,
+                now,
+                coordination_id,
+            ],
+        )? > 0
+    } else {
+        false
+    };
+
+    crate::api::session_verbs::ensure_fleet_tables(conn)?;
+    let elected = overlap_row(conn, &coordination_id, &input.card_id,
+        newly_elected, newly_linked, callback_target.as_deref())?
+        .expect("the election was inserted or already existed");
+    let owner_label = format!("elected owner [{}] ({})", elected.owner_card_id, elected.owner_session);
+    let prefix = format!("overlap coordination {coordination_id}:");
+    // Refresh old, misleading lineage on an ordinary retry. Append, never
+    // rewrite history; subsequent retries are idempotent.
+    let mut stale_lineage = false;
+    for id in [&input.card_id, &input.peer_card_id] {
+        let card = bs::get_issue(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if let Some(line) = card.log.as_deref().unwrap_or("").lines().rev().find(|line| line.contains(&prefix)) {
+            stale_lineage |= !line.contains(&owner_label) || !line.contains("; reporter [");
+        }
+    }
+    let mut events = Vec::new();
+    if newly_linked || resolution_changed || stale_lineage {
+        let line = format!(
+            "{prefix} concern={}; semantic={}; {owner_label}; reporter [{}] ({}) — linked [{}] ({}) — callback={}; base={} head={}; intent: {}; resolution: {}; resolution note: {}; evidence: {}; assets: {}",
+            elected.concern,
+            elected.semantic_key,
+            input.card_id,
+            input.session,
+            input.peer_card_id,
+            input.peer_session,
+            callback_target
+                .as_deref()
+                .map(|target| format!("overlap:{coordination_id}:{target}"))
+                .unwrap_or_else(|| "(same worker)".into()),
+            input.base_commit,
+            input.head_commit,
+            input.intent,
+            elected.resolution,
+            elected.resolution_note.as_deref().unwrap_or("(pending)"),
+            if elected.evidence.is_empty() { "(none)".into() } else { elected.evidence.join(", ") },
+            if elected.assets.is_empty() { "(none)".into() } else { elected.assets.join(", ") },
+        );
+        append_overlap_log(conn, &input.card_id, &line, &elected.assets, now, &mut events)?;
+        append_overlap_log(conn, &input.peer_card_id, &line, &elected.assets, now, &mut events)?;
+        tracing::info!(marker = "board_overlap_lineage_recorded", coordination = %coordination_id,
+            owner_card = %elected.owner_card_id, owner_session = %elected.owner_session,
+            reporter_card = %input.card_id, resolution = %elected.resolution,
+            "board overlap lineage records the durable election and the reporting worker separately");
+        if stale_lineage {
+            tracing::warn!(marker = "board_overlap_lineage_refreshed", coordination = %coordination_id,
+                owner_card = %elected.owner_card_id, reporter_card = %input.card_id,
+                "appended corrected overlap lineage; prior history mislabeled the reporter as owner or omitted attribution");
+        }
+    }
+    crate::api::session_verbs::ensure_fleet_tables(conn)?;
+    for (session, card_id) in [
+        (&input.session, &input.card_id),
+        (&input.peer_session, &input.peer_card_id),
+    ] {
+        conn.execute(
+            "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+             VALUES (?1,?2,'board.overlap',?3,?4,'board-overlap')",
+            rusqlite::params![
+                now as f64,
+                session,
+                json!({"coordination_id": coordination_id, "card_id": card_id, "semantic_key": input.semantic_key, "concern": input.concern}).to_string(),
+                format!("overlap:{coordination_id}:{card_id}"),
+            ],
+        )?;
+    }
+    conn.execute(
+        "UPDATE board_overlap_coordination SET updated_at=?1 WHERE coordination_id=?2",
+        rusqlite::params![now, coordination_id],
+    )?;
+    let record = overlap_row(
+        conn,
+        &coordination_id,
+        &input.card_id,
+        newly_elected,
+        newly_linked,
+        callback_target.as_deref(),
+    )?
+    .expect("overlap header was inserted or already existed");
+    Ok((record, events))
+}
+
+async fn update_overlap_callback(
+    state: &AppState,
+    coordination_id: &str,
+    target_session: &str,
+    next_state: &str,
+    error: Option<String>,
+) {
+    let (coordination_id, target_session, next_state) = (
+        coordination_id.to_string(),
+        target_session.to_string(),
+        next_state.to_string(),
+    );
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "UPDATE board_overlap_callbacks SET state=?1, error=?2, updated_at=?3 \
+                 WHERE coordination_id=?4 AND target_session=?5",
+                rusqlite::params![
+                    next_state,
+                    error,
+                    now_secs(),
+                    coordination_id,
+                    target_session
+                ],
+            )?;
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .await;
+}
+
+async fn reconcile_overlap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<OverlapBody>,
+) -> Response {
+    let (_, session) = actor_from_headers(&headers);
+    if session == "api-anonymous" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "overlap reconciliation needs X-Amux-Session; ownership cannot be elected anonymously"})),
+        )
+            .into_response();
+    }
+    let input = match normalize_overlap(body, session.clone()) {
+        Ok(v) => v,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    let ownership = {
+        let conn = match state.store.read() {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        match (
+            bs::get_issue(&conn, &input.card_id),
+            bs::get_issue(&conn, &input.peer_card_id),
+        ) {
+            (Ok(Some(own)), Ok(Some(peer))) => (
+                own.session.unwrap_or_default() == input.session,
+                peer.session.unwrap_or_default() == input.peer_session,
+            ),
+            (Ok(None), _) | (_, Ok(None)) => return not_found("card_id or peer_card_id"),
+            (Err(e), _) | (_, Err(e)) => return internal(e),
+        }
+    };
+    if !ownership.0 {
+        tracing::warn!(
+            marker = "board_overlap_owner_refused",
+            card = %input.card_id,
+            caller = %input.session,
+            "board overlap reconciliation refused: caller does not own its source card"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "caller must own card_id; peer cards are linked but never claimed"})),
+        )
+            .into_response();
+    }
+    if !ownership.1 {
+        tracing::warn!(
+            marker = "board_overlap_peer_refused",
+            card = %input.card_id,
+            peer_card = %input.peer_card_id,
+            claimed_peer = %input.peer_session,
+            "board overlap reconciliation refused: peer card owner does not match peer_session"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "peer_session must match peer_card_id's current owner; reconciliation never fabricates a peer callback target",
+                "code": "board_overlap_peer_owner_mismatch",
+            })),
+        )
+            .into_response();
+    }
+    if input.resolution.is_some() {
+        let coordination_id = overlap_coordination_id(&input.semantic_key, &input.concern);
+        let conn = match state.store.read() {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        let elected: Option<(String, String)> = match conn
+            .query_row(
+                "SELECT owner_card_id, owner_session FROM board_overlap_coordination WHERE coordination_id=?1",
+                [&coordination_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        if let Some((owner_card, owner_session)) = elected {
+            if owner_card != input.card_id || owner_session != input.session {
+                tracing::warn!(
+                    marker = "board_overlap_resolution_refused",
+                    coordination = %coordination_id,
+                    caller_card = %input.card_id,
+                    caller = %input.session,
+                    owner_card,
+                    owner_session,
+                    "only the elected overlap owner may release or scope-split the concern"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "only the elected owner may reconcile this overlap",
+                        "code": "board_overlap_resolution_owner_required",
+                        "coordination_id": coordination_id,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let record_slot = Arc::new(Mutex::new(None));
+    let record_slot_w = record_slot.clone();
+    let input_w = input.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let (record, events) = record_overlap_on_conn(conn, &input_w, now_secs())?;
+            *record_slot_w.lock().expect("overlap result slot poisoned") = Some(record);
+            Ok(WriteOutcome {
+                applied: true,
+                events,
+            })
+        })
+        .await;
+    if let Err(e) = write {
+        tracing::warn!(
+            marker = "board_overlap_record_failed",
+            card = %input.card_id,
+            peer_card = %input.peer_card_id,
+            error = %e,
+            "board overlap reconciliation was not persisted; no completion/deploy claim is valid"
+        );
+        return internal(e);
+    }
+    let mut record = record_slot
+        .lock()
+        .expect("overlap result slot poisoned")
+        .clone()
+        .expect("overlap transaction produced a result");
+    if record.newly_elected {
+        tracing::info!(
+            marker = "board_overlap_elected",
+            coordination = %record.coordination_id,
+            semantic = %record.semantic_key,
+            concern = %record.concern,
+            owner_card = %record.owner_card_id,
+            owner_session = %record.owner_session,
+            "board overlap ownership elected atomically"
+        );
+    } else if record.newly_linked {
+        tracing::warn!(
+            marker = "board_overlap_peer_linked",
+            coordination = %record.coordination_id,
+            owner_card = %record.owner_card_id,
+            peer_card = %input.card_id,
+            "late-discovered overlapping work linked to existing owner; peer must not independently complete/deploy"
+        );
+    }
+    let mut delivery = "not-needed".to_string();
+    if let Some(callback) = record.callback.clone() {
+        if matches!(callback.state.as_str(), "pending" | "retryable") {
+            let notice = format!(
+                "[Board overlap {}] semantic concern `{}` is {}. Owner: [{}] / {}. Linked cards: [{}] and [{}]. Base {}, head {}. Intent: {}. Evidence: {}. Assets: {}. Reconcile before completion or deployment; this durable callback survives provider/model changes.",
+                record.coordination_id,
+                record.concern,
+                record.relation,
+                record.owner_card_id,
+                record.owner_session,
+                input.card_id,
+                input.peer_card_id,
+                input.base_commit,
+                input.head_commit,
+                input.intent,
+                if record.evidence.is_empty() { "(none)".into() } else { record.evidence.join(", ") },
+                if record.assets.is_empty() { "(none)".into() } else { record.assets.join(", ") },
+            );
+            match crate::api::session_verbs::steer_enqueue_idempotent(
+                &state,
+                &callback.target_session,
+                &notice,
+                &format!("board-overlap:{}", record.coordination_id),
+                &input.session,
+                &callback.message_id,
+            )
+            .await
+            {
+                Ok(_) => {
+                    update_overlap_callback(
+                        &state,
+                        &record.coordination_id,
+                        &callback.target_session,
+                        "queued",
+                        None,
+                    )
+                    .await;
+                    delivery = "queued".into();
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        marker = "board_overlap_callback_retryable",
+                        coordination = %record.coordination_id,
+                        target = %callback.target_session,
+                        reason,
+                        "board overlap is durable but its peer callback was not queued; retry this request after the peer is recoverable"
+                    );
+                    update_overlap_callback(
+                        &state,
+                        &record.coordination_id,
+                        &callback.target_session,
+                        "retryable",
+                        Some(reason.to_string()),
+                    )
+                    .await;
+                    delivery = "retryable".into();
+                }
+            }
+            let conn = match state.store.read() {
+                Ok(v) => v,
+                Err(e) => return internal(e),
+            };
+            record = match overlap_row(
+                &conn,
+                &record.coordination_id,
+                &input.card_id,
+                record.newly_elected,
+                record.newly_linked,
+                Some(&callback.target_session),
+            ) {
+                Ok(Some(v)) => v,
+                Ok(None) => return internal("overlap record disappeared after callback update"),
+                Err(e) => return internal(e),
+            };
+        } else {
+            delivery = callback.state;
+        }
+    }
+    let status = if delivery == "retryable" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(json!({"ok": true, "coordination": record, "delivery": delivery})),
+    )
+        .into_response()
+}
+
+async fn get_overlap(
+    State(state): State<AppState>,
+    Path(coordination_id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    match overlap_row(&conn, &coordination_id, "", false, false, None) {
+        Ok(Some(record)) => Json(json!({"ok": true, "coordination": record})).into_response(),
+        Ok(None) => not_found(&coordination_id),
+        Err(e) => internal(e),
+    }
+}
+
+/// Builder/push preflight.  The actor is the committing worker named by the
+/// commit trailer, not the process that happens to run the builder, so a stale
+/// shared-checkout head cannot deploy a linked peer's concern under another
+/// session's identity.  `measured` travels with the result: an unavailable
+/// preflight must not be mistaken for permission by the caller.
+async fn overlap_deployment_permit(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let session = q.get("session").map(String::as_str).unwrap_or("").trim();
+    if session.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "session query parameter required", "measured": false})),
+        )
+            .into_response();
+    }
+    let conn = match state.store.read() {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": e.to_string(), "measured": false})),
+            )
+                .into_response()
+        }
+    };
+    match overlap_completion_blockers(&conn, None, Some(session)) {
+        Ok(blockers) if blockers.is_empty() => Json(json!({
+            "allowed": true,
+            "measured": true,
+            "session": session,
+            "blockers": [],
+        }))
+        .into_response(),
+        Ok(blockers) => {
+            tracing::warn!(
+                marker = "board_overlap_deploy_refused",
+                session,
+                blockers = blockers.len(),
+                coordination = %blockers[0].coordination_id,
+                "deployment preflight refused: worker is a linked non-owner on an unreconciled concern"
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "allowed": false,
+                    "measured": true,
+                    "session": session,
+                    "blockers": blockers,
+                    "how_to_fix": "The elected owner must record a scope-split or released reconciliation on /api/board/overlap before this worker independently deploys.",
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": e.to_string(), "measured": false, "session": session})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod overlap_reconciliation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn store() -> crate::db::SharedStore {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::db::Store::open(&dir.path().join("overlap.db")).unwrap());
+        // The writer and read pool outlive this helper.  The OS cleans the test
+        // directory, but the Store must retain a valid path for this test.
+        std::mem::forget(dir);
+        store
+    }
+
+    fn state(store: crate::db::SharedStore) -> AppState {
+        AppState {
+            store,
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn new_card(session: &str) -> bs::NewIssue {
+        bs::NewIssue {
+            acceptance_criteria: None,
+            next_action: None,
+            title: format!("overlap card for {session}"),
+            desc: "durable semantic overlap test card".into(),
+            status: "doing".into(),
+            session: Some(session.into()),
+            item_type: "code".into(),
+            creator: session.into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            depends_on: vec![],
+            gate: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            ask_actor: None,
+            source: Some("agent".into()),
+            requested_by: None,
+            callback_session: None,
+            callback_prompt: None,
+        }
+    }
+
+    fn seed_card(store: &crate::db::SharedStore, session: &str) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let card = new_card(session);
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(conn, &card, 1_700_000_000)?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    fn input(
+        card_id: String,
+        session: &str,
+        peer_card_id: String,
+        peer_session: &str,
+        concern: &str,
+    ) -> OverlapInput {
+        OverlapInput {
+            semantic_key: "deployment:31768303d1d8:7c6f7b802f5a".into(),
+            concern: concern.into(),
+            card_id,
+            session: session.into(),
+            peer_card_id,
+            peer_session: peer_session.into(),
+            base_commit: "31768303d1d89d8db9d51aa728e8deb80ca884c5".into(),
+            head_commit: "7c6f7b802f5af15cb9f4e4c4848a8329e1b72c7b".into(),
+            worktree: "/tmp/overlap-fixture".into(),
+            intent:
+                "reconcile a divergent stale-base deployment without overwriting either concern"
+                    .into(),
+            evidence: vec!["git show --name-only 7c6f7b80".into()],
+            assets: vec!["crates/amux-server/src/runtime_jobs/board_drive.rs".into()],
+            resolution: None,
+            resolution_note: None,
+        }
+    }
+
+    async fn record(store: crate::db::SharedStore, input: OverlapInput) -> OverlapRecord {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        store
+            .write_async(move |conn| {
+                let (record, events) = record_overlap_on_conn(conn, &input, 1_700_000_001)?;
+                *slot_w.lock().unwrap() = Some(record);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events,
+                })
+            })
+            .await
+            .unwrap();
+        let result = slot.lock().unwrap().clone().unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn collision_31768303_vs_7c6f7b80_elects_one_owner_atomically() {
+        let db = store();
+        let left = seed_card(&db, "handoff-producer-0907");
+        let right = seed_card(&db, "handoff-consumer-0907");
+        let (a, b) = tokio::join!(
+            record(
+                db.clone(),
+                input(
+                    left.clone(),
+                    "handoff-producer-0907",
+                    right.clone(),
+                    "handoff-consumer-0907",
+                    "deployment adoption"
+                ),
+            ),
+            record(
+                db.clone(),
+                input(
+                    right,
+                    "handoff-consumer-0907",
+                    left,
+                    "handoff-producer-0907",
+                    "deployment adoption"
+                ),
+            ),
+        );
+        assert_ne!(
+            a.newly_elected, b.newly_elected,
+            "exactly one writer wins the SQLite election"
+        );
+        assert_eq!(a.coordination_id, b.coordination_id);
+        assert_eq!(a.owner_card_id, b.owner_card_id);
+        assert_eq!(a.owner_session, b.owner_session);
+        assert_eq!(
+            a.participants.len(),
+            2,
+            "both late-discovered workers remain visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_concerns_keep_independent_elections_until_explicit_resolution() {
+        let db = store();
+        let a = seed_card(&db, "runtime-owner");
+        let b = seed_card(&db, "invariant-owner");
+        let runtime = record(
+            db.clone(),
+            input(
+                a.clone(),
+                "runtime-owner",
+                b.clone(),
+                "invariant-owner",
+                "runtime truth and recovery",
+            ),
+        )
+        .await;
+        let invariants = record(
+            db,
+            input(
+                b,
+                "invariant-owner",
+                a,
+                "runtime-owner",
+                "invariant measured truth",
+            ),
+        )
+        .await;
+        assert_eq!(runtime.relation, "elected");
+        assert_eq!(invariants.relation, "elected");
+        assert_ne!(runtime.coordination_id, invariants.coordination_id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_cards_evidence_and_assets_converge_without_overwrite() {
+        let db = store();
+        let a = seed_card(&db, "first-worker");
+        let b = seed_card(&db, "second-worker");
+        let first = record(
+            db.clone(),
+            input(
+                a.clone(),
+                "first-worker",
+                b.clone(),
+                "second-worker",
+                "same deploy concern",
+            ),
+        )
+        .await;
+        let mut second_input = input(b, "second-worker", a, "first-worker", "same deploy concern");
+        second_input.evidence = vec!["git merge-base --is-ancestor 31768303 7c6f7b80 -> 1".into()];
+        second_input.assets = vec!["crates/amux-server/src/invariants/checks.rs".into()];
+        let second = record(db, second_input).await;
+        assert_eq!(second.coordination_id, first.coordination_id);
+        assert_eq!(second.role, "peer");
+        assert_eq!(second.participants.len(), 2);
+        assert!(second
+            .evidence
+            .iter()
+            .any(|v| v.contains("show --name-only")));
+        assert!(second.evidence.iter().any(|v| v.contains("merge-base")));
+        assert!(second.assets.iter().any(|v| v.ends_with("board_drive.rs")));
+        assert!(second.assets.iter().any(|v| v.ends_with("checks.rs")));
+    }
+
+    #[tokio::test]
+    async fn late_peer_log_names_the_elected_owner_not_the_reporting_peer() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        record(db.clone(), input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern")).await;
+        let result = record(db.clone(), input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern")).await;
+        assert_eq!(result.owner_card_id, owner);
+        let conn = db.read().unwrap();
+        for card in [&owner, &peer] {
+            let row = bs::get_issue(&conn, card).unwrap().unwrap();
+            let log = row.log.unwrap();
+            let latest = log.lines().last().unwrap();
+            assert!(latest.contains(&format!("elected owner [{owner}] (first-worker)")), "lineage contradicts election: {latest}");
+            assert!(latest.contains(&format!("reporter [{peer}] (second-worker)")), "reporter attribution lost: {latest}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readback_keeps_resolution_provenance_and_both_durable_callbacks() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        let mut report = input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern");
+        let elected = record(db.clone(), report.clone()).await;
+        let consumer = input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern");
+        record(db.clone(), consumer.clone()).await;
+        report.resolution = Some("scope-split".into());
+        report.resolution_note = Some("first-worker owns server; second-worker owns dashboard".into());
+        record(db.clone(), report.clone()).await;
+        let app = Router::new().nest("/api/board", routes()).with_state(state(db.clone()));
+        let (status, body) = call(&app, "GET", &format!("/api/board/overlap/{}", elected.coordination_id), "first-worker", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &body["coordination"];
+        assert_eq!(row["resolution_note"], report.resolution_note.unwrap());
+        assert_eq!(row["resolved_by_card_id"], owner);
+        assert_eq!(row["relation"], "scope-split");
+        assert_eq!(row["callbacks"].as_array().unwrap().len(), 2);
+        let refs = row["evidence"].as_array().unwrap();
+        assert_eq!(refs.len(), consumer.evidence.len(), "shared references are a union, with provenance retained in storage");
+        assert_eq!(row["participants"][0]["self_reported"], true);
+        // Independent concern names are not evidence that a split was agreed.
+        let other = record(db.clone(), input(peer, "second-worker", owner, "first-worker", "another concern")).await;
+        assert_eq!(other.resolution, "pending");
+        assert_ne!(other.relation, "scope-split");
+    }
+
+    #[tokio::test]
+    async fn retry_appends_one_correction_to_legacy_lineage_without_rewriting_history() {
+        let db = store();
+        let owner = seed_card(&db, "first-worker");
+        let peer = seed_card(&db, "second-worker");
+        let owner_report = input(owner.clone(), "first-worker", peer.clone(), "second-worker", "same concern");
+        let peer_report = input(peer.clone(), "second-worker", owner.clone(), "first-worker", "same concern");
+        let elected = record(db.clone(), owner_report).await;
+        record(db.clone(), peer_report.clone()).await;
+        let wrong = format!("overlap coordination {}: elected owner [{}] (second-worker)", elected.coordination_id, peer);
+        let wrong_w = wrong.clone();
+        let cards = [owner.clone(), peer.clone()];
+        db.write(move |conn| {
+            for id in cards {
+                conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![wrong_w, id])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        record(db.clone(), peer_report.clone()).await;
+        let corrected = bs::get_issue(&db.read().unwrap(), &peer).unwrap().unwrap().log.unwrap();
+        assert!(corrected.starts_with(&wrong), "legacy history must remain intact");
+        // AF-470: `wrong` predates the date-separator convention (no `` `YYYY-MM-DD` ``
+        // line), so append_log's first append after it inserts one -- correction line
+        // count is 2 (separator + the actual correction), not 1.
+        assert_eq!(corrected.lines().count(), 3, "retry must append a correction");
+        assert!(corrected.lines().last().unwrap().contains(&format!("elected owner [{owner}] (first-worker)")));
+        record(db.clone(), peer_report).await;
+        for id in [owner, peer] {
+            assert_eq!(bs::get_issue(&db.read().unwrap(), &id).unwrap().unwrap().log.unwrap(), corrected,
+                "replay must correct both cards exactly once");
+        }
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        session: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-amux-session", session);
+        let payload = if let Some(body) = body {
+            request = request.header("content-type", "application/json");
+            axum::body::Body::from(body.to_string())
+        } else {
+            axum::body::Body::empty()
+        };
+        let response = app
+            .clone()
+            .oneshot(request.body(payload).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post(app: &Router, session: &str, body: Value) -> (StatusCode, Value) {
+        call(app, "POST", "/api/board/overlap", session, Some(body)).await
+    }
+
+    #[tokio::test]
+    async fn vanished_peer_and_model_switch_keep_the_handoff_callback_recoverable() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let db = store();
+        let producer = seed_card(&db, "handoff-producer-0907");
+        let consumer = seed_card(&db, "handoff-consumer-0907");
+        let app = Router::new()
+            .nest("/api/board", routes())
+            .with_state(state(db.clone()));
+        let payload = json!({
+                "semantic_key": "controlled-handoff-0907",
+                "concern": "deployment adoption",
+                "card_id": producer,
+                "peer_card_id": consumer,
+                "peer_session": "handoff-consumer-0907",
+                "base_commit": "31768303d1d89d8db9d51aa728e8deb80ca884c5",
+                "head_commit": "7c6f7b802f5af15cb9f4e4c4848a8329e1b72c7b",
+                "worktree": "/tmp/handoff-producer-0907",
+                "intent": "controlled producer to consumer handoff",
+                "evidence": ["producer evidence"],
+                "assets": ["crates/amux-server/src/api/board.rs"]
+            });
+        let mut mismatched_peer = payload.clone();
+        mismatched_peer["peer_session"] = json!("wrong-worker");
+        let (forbidden, rejected) = post(&app, "handoff-producer-0907", mismatched_peer).await;
+        assert_eq!(forbidden, StatusCode::FORBIDDEN);
+        assert_eq!(rejected["code"], "board_overlap_peer_owner_mismatch");
+
+        // Missing worker state is a durable retry, never a fabricated delivery.
+        let (missing, pending) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(missing, StatusCode::ACCEPTED);
+        assert_eq!(pending["coordination"]["callback"]["state"], "retryable");
+        assert_eq!(pending["coordination"]["callback"]["error"], "no-env-file");
+        // Supply the fixture's own persisted identity; never depend on a real
+        // worker's env file or whichever AMUX_HOME another test selected.
+        std::fs::write(home.path().join("sessions/handoff-consumer-0907.env"), "CC_TAGS=\"test\"\n").unwrap();
+        let (status, reply) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a recovered consumer is a durable queued handoff: {reply}"
+        );
+        assert_eq!(reply["delivery"], "queued");
+        assert_eq!(
+            reply["coordination"]["callback"]["target_session"],
+            "handoff-consumer-0907"
+        );
+        let message_id = reply["coordination"]["callback"]["message_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let conn = db.read().unwrap();
+        let queued: String = conn
+            .query_row(
+                "SELECT id FROM steering_queue WHERE id=?1 AND session='handoff-consumer-0907'",
+                [&message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            queued, message_id,
+            "callback is keyed by durable worker name, not provider/model process state"
+        );
+        let (retry_status, retry) = post(&app, "handoff-producer-0907", payload).await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(retry["coordination"]["callback"]["message_id"], message_id);
+        let callbacks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE id=?1 AND session='handoff-consumer-0907'",
+                [&message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(callbacks, 1, "a retry/model switch refreshes one stable callback, never duplicates delivery");
+    }
+
+    #[tokio::test]
+    async fn linked_peer_cannot_complete_or_deploy_until_owner_scope_splits() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for worker in ["handoff-producer-0907", "handoff-consumer-0907"] {
+            std::fs::write(home.path().join(format!("sessions/{worker}.env")), "CC_TAGS=\"test\"\n").unwrap();
+        }
+        let db = store();
+        let producer = seed_card(&db, "handoff-producer-0907");
+        let consumer = seed_card(&db, "handoff-consumer-0907");
+        let app = Router::new()
+            .nest("/api/board", routes())
+            .with_state(state(db));
+        let payload = json!({
+            "semantic_key": "controlled-handoff-0907",
+            "concern": "deployment adoption",
+            "card_id": producer,
+            "peer_card_id": consumer,
+            "peer_session": "handoff-consumer-0907",
+            "base_commit": "31768303d1d89d8db9d51aa728e8deb80ca884c5",
+            "head_commit": "7c6f7b802f5af15cb9f4e4c4848a8329e1b72c7b",
+            "worktree": "/tmp/handoff-producer-0907",
+            "intent": "controlled producer to consumer handoff",
+            "evidence": ["git merge-base --is-ancestor 31768303 7c6f7b80 -> 1"],
+            "assets": ["crates/amux-server/src/api/board.rs"]
+        });
+        let (created, overlap) = post(&app, "handoff-producer-0907", payload.clone()).await;
+        assert_eq!(created, StatusCode::OK);
+        let coordination_id = overlap["coordination"]["coordination_id"].as_str().unwrap();
+        let producer_card = payload["card_id"].as_str().unwrap().to_string();
+        let consumer_card = payload["peer_card_id"].as_str().unwrap().to_string();
+        // Both cards carry the same durable coordination, reciprocal card id,
+        // source callback id, and merged asset text.  This pins the UI-facing
+        // links rather than only the hidden election rows.
+        for (card, peer) in [
+            (producer_card.as_str(), consumer_card.as_str()),
+            (consumer_card.as_str(), producer_card.as_str()),
+        ] {
+            let (status, detail) = call(
+                &app,
+                "GET",
+                &format!("/api/board/{card}"),
+                "handoff-producer-0907",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let text = detail.to_string();
+            assert!(text.contains(coordination_id), "card must link the coordination: {text}");
+            assert!(text.contains(peer), "card must link its peer card: {text}");
+            assert!(text.contains("overlap:"), "card must link the durable callback/message: {text}");
+            assert!(text.contains("board.rs"), "card must surface the merged asset reference: {text}");
+        }
+
+        let (blocked, completion) = call(
+            &app,
+            "PATCH",
+            &format!("/api/board/{consumer_card}"),
+            "handoff-consumer-0907",
+            Some(json!({"status":"done", "force":true, "reason":"must not bypass overlap"})),
+        )
+        .await;
+        assert_eq!(blocked, StatusCode::CONFLICT);
+        assert_eq!(completion["code"], "board_overlap_completion_blocked");
+
+        let (blocked_verified, verified_completion) = call(
+            &app,
+            "PATCH",
+            &format!("/api/board/{consumer_card}"),
+            "handoff-consumer-0907",
+            Some(json!({"status":"verified", "force":true, "reason":"must not bypass overlap"})),
+        )
+        .await;
+        assert_eq!(blocked_verified, StatusCode::CONFLICT);
+        assert_eq!(
+            verified_completion["code"],
+            "board_overlap_completion_blocked"
+        );
+
+        let (deployment, permit) = call(
+            &app,
+            "GET",
+            "/api/board/overlap/deployment-permit?session=handoff-consumer-0907",
+            "handoff-consumer-0907",
+            None,
+        )
+        .await;
+        assert_eq!(deployment, StatusCode::CONFLICT);
+        assert_eq!(permit["allowed"], false);
+        assert_eq!(permit["blockers"][0]["coordination_id"], overlap["coordination"]["coordination_id"]);
+
+        let mut resolve = payload;
+        resolve["resolution"] = json!("scope-split");
+        resolve["resolution_note"] = json!("consumer owns a distinct deployment concern after explicit review");
+        let (resolved, _) = post(&app, "handoff-producer-0907", resolve).await;
+        assert_eq!(resolved, StatusCode::OK, "only the elected owner can release the peer");
+
+        let (allowed, completion) = call(
+            &app,
+            "PATCH",
+            &format!("/api/board/{consumer_card}"),
+            "handoff-consumer-0907",
+            Some(json!({"status":"done", "force":true, "reason":"explicit scope split"})),
+        )
+        .await;
+        assert_eq!(allowed, StatusCode::OK, "scope split clears the trigger and the HTTP gate: {completion}");
+
+        let (permit_status, permit) = call(
+            &app,
+            "GET",
+            "/api/board/overlap/deployment-permit?session=handoff-consumer-0907",
+            "handoff-consumer-0907",
+            None,
+        )
+        .await;
+        assert_eq!(permit_status, StatusCode::OK);
+        assert_eq!(permit["allowed"], true);
+    }
+}
+
+/// Record the causal runtime marker for work the owning lane explicitly moved
+/// into `doing`. `amux board doing` and `amux board claim` are both documented
+/// ways to start work; only the latter used to write this marker, leaving the
+/// sessions API with a live Doing card and an unrelated older claim.
+///
+/// The state-entry timestamp makes this idempotent per Doing lifecycle. That
+/// matters because `/claim` on an already-owned Doing card is the sanctioned
+/// repair path, and repeated repairs must not inflate the repeat-offer ledger.
+fn ensure_owner_doing_claim(
+    conn: &Connection,
+    row: &IssueRow,
+    actor: &str,
+    source: &str,
+    from: &str,
+) -> rusqlite::Result<bool> {
+    if row.status != "doing" || row.session.as_deref() != Some(actor) {
+        return Ok(false);
+    }
+    let entered = row.entered_state_at.map(|at| at as f64).unwrap_or(0.0);
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events \
+         WHERE session=?1 AND type='task.claimed' AND ts>=?2 \
+         AND json_extract(data,'$.issue')=?3)",
+        rusqlite::params![actor, entered, row.id],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO session_events (ts,session,type,data,source) VALUES (?,?,?,?,?)",
+        rusqlite::params![
+            crate::config::now_f64(),
+            actor,
+            "task.claimed",
+            json!({"issue": row.id, "status": "doing", "from": from}).to_string(),
+            source,
+        ],
+    )?;
+    tracing::info!(
+        target: "amux::board",
+        marker = "owner_doing_claim_recorded",
+        task = %row.id,
+        worker = actor,
+        %source,
+        %from,
+        measured = true,
+        n_considered = 1,
+        "owner-started Doing work now has an exact runtime/board claim marker"
+    );
+    Ok(true)
+}
+
+async fn repair_owned_doing_claim(
+    state: &AppState,
+    session: &str,
+    card: &str,
+) -> anyhow::Result<bool> {
+    let repaired = Arc::new(Mutex::new(false));
+    let repaired_w = repaired.clone();
+    let session = session.to_string();
+    let card = card.to_string();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(row) = bs::get_issue(conn, &card)? else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            let inserted = ensure_owner_doing_claim(
+                conn,
+                &row,
+                &session,
+                "board-claim-repair",
+                "doing",
+            )?;
+            *repaired_w.lock().expect("claim repair result slot poisoned") = inserted;
+            Ok(WriteOutcome { applied: inserted, events: vec![] })
+        })
+        .await?;
+    let inserted = *repaired.lock().expect("claim repair result slot poisoned");
+    debug_assert_eq!(write.applied, inserted);
+    Ok(inserted)
+}
+
+/// POST /api/board/{id}/claim — atomically take a `todo` or `backlog` card and
+/// start it. The CLI and auto-pickup share its compare-and-swap ->doing,
+/// assignment, and `task.claimed` event. Backlog remains claimable here while
+/// auto-pickup stays todo-only, so a peer handover cannot race a parked card.
 pub async fn claim_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -4461,7 +8808,7 @@ pub async fn claim_item(
     // 409 the caller cannot act on.
     let store = state.store.clone();
     let key = id.clone();
-    let row = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let row = match crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         Ok(bs::get_issue(&conn, &key)?)
     })
@@ -4491,35 +8838,64 @@ pub async fn claim_item(
                 )
                     .into_response();
             }
-            if crate::runtime_jobs::board_drive::claim_card_from(&state, &session, &id, from).await
+            match crate::runtime_jobs::board_drive::claim_card_from_outcome(
+                &state, &session, &id, from,
+            )
+            .await
             {
-                (
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::Claimed => (
                     StatusCode::OK,
                     Json(json!({
                         "ok": true, "id": id, "status": "doing", "session": session, "claimed": true,
                     })),
                 )
-                    .into_response()
-            } else {
-                // Raced out of the status we read between the read above and
-                // the swap (owner closed it, or a peer claimed first).
-                (
+                    .into_response(),
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::DependencyBlocked(blocking) => (
                     StatusCode::CONFLICT,
                     Json(json!({
-                        "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
+                        "error": "card has unfinished dependencies and cannot be claimed yet",
+                        "code": "dependency_blocked",
+                        "ok": false,
+                        "blocked": true,
                         "id": id,
+                        "status": from,
+                        "session": owner,
+                        "depends_on": row.depends_on,
+                        "blocking": blocking,
+                        "measured": true,
+                        "n_considered": row.depends_on.len(),
+                        "how_to_fix": "finish or explicitly resolve the blocking tasks; board-drive promotes a dependency-backed backlog card after every dependency is done or verified",
                     })),
                 )
-                    .into_response()
+                    .into_response(),
+                crate::runtime_jobs::board_drive::ClaimCardOutcome::NotApplied => {
+                // Raced out of the status we read between the read above and
+                // the swap (owner closed it, or a peer claimed first).
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
+                            "id": id,
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
-        "doing" if owner == session => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true, "id": id, "status": "doing", "session": session, "already": true,
-            })),
-        )
-            .into_response(),
+        "doing" if owner == session => {
+            let attribution_repaired = match repair_owned_doing_claim(&state, &session, &id).await {
+                Ok(v) => v,
+                Err(e) => return internal(e),
+            };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true, "id": id, "status": "doing", "session": session,
+                    "already": true, "attribution_repaired": attribution_repaired,
+                })),
+            )
+                .into_response()
+        }
         other => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -4623,7 +8999,11 @@ fn discarded_by_refusal(map: &serde_json::Map<String, Value>) -> Vec<String> {
         .filter(|k| k.as_str() != "status")
         .filter(|k| {
             PATCH_WRITABLE.contains(&k.as_str())
-                || matches!(k.as_str(), "desc_append" | "callback")
+                // `folded_into` joins them: it carries CONTENT (the server
+                // writes a log line from it) and a caller who is told nothing
+                // changed cannot tell a registered fold from an ignored field,
+                // which is the failure this whole thread is about.
+                || matches!(k.as_str(), "desc_append" | "callback" | "folded_into" | "archive_outcome")
         })
         .cloned()
         .collect();
@@ -4730,6 +9110,148 @@ mod af413_discarded_tests {
                             "force": true, "reason": "why"})).is_empty());
     }
 
+    /// A gate refusal must not send the reader after a lever that cannot move.
+    ///
+    /// AF-586, tubescience: four forced closes in one day on a lane whose
+    /// WORKER-scope done gate is ["Implemented and merged", "Tests / lint pass",
+    /// "Peer reviewed"], applied to research and ops cards. One refusal site
+    /// branched on retype_would_help(); the other hardcoded "fix the type" for
+    /// everyone, so the caller retyped, got the identical refusal, and was left
+    /// with --force.
+    #[test]
+    fn a_refusal_only_blames_the_type_when_the_type_is_the_lever() {
+        use crate::db::board_store::GateSource;
+
+        // The one case where retyping IS the fix.
+        let from_type = retype_hint_for(Some(&GateSource::TypeDefault));
+        assert!(from_type.contains("the TYPE is wrong"), "{from_type}");
+
+        // Every scope that IGNORES the type must say so instead, and must not
+        // tell the reader to retype.
+        for src in [
+            GateSource::Worker("tubescience".into()),
+            GateSource::Group("amux".into()),
+            GateSource::Column,
+            GateSource::Card,
+        ] {
+            let hint = retype_hint_for(Some(&src));
+            assert_ne!(hint, from_type, "{src:?} must not get the type-default advice");
+            assert!(
+                !hint.contains("the TYPE is wrong"),
+                "{src:?} names a lever that cannot move: {hint}"
+            );
+        }
+
+        // The three that are scoped ALSO say retyping will not help, in words.
+        for src in [
+            GateSource::Worker("tubescience".into()),
+            GateSource::Group("amux".into()),
+            GateSource::Column,
+        ] {
+            let hint = retype_hint_for(Some(&src));
+            assert!(
+                hint.to_lowercase().contains("retyping will not change it"),
+                "{src:?} should say retyping will not change it: {hint}"
+            );
+        }
+
+        // CONTROL. With no resolved source we cannot claim the type is not the
+        // lever either, so the default advice stands. Without this, returning
+        // the scoped explanation unconditionally would pass everything above.
+        assert_eq!(retype_hint_for(None), from_type);
+    }
+
+    /// `folded_into` is a control key and must be listed, or a hand-rolled fold
+    /// lands in `ignored_fields` and the caller is told nothing changed while
+    /// the summary keeps rendering the four not-recorded clauses.
+    /// NO RUN OF SPACES IN ANY CALLBACK SENTENCE. Second instance of this
+    /// class in three cards, which is why the guard is over the REGION and not
+    /// over one literal.
+    ///
+    /// Rust joins a string across lines with a trailing backslash. Drop it and
+    /// the source still compiles, the compiler says nothing, and the sentence
+    /// renders with the indentation baked in. AF-621 shipped
+    /// "the          condition" into a CLI help surface; AF-634 then shipped
+    /// "not a request              and owed you nothing" into the terminal
+    /// callback, and I only saw it because a peer's discard notice came back to
+    /// me with the gap in it. A test scoped to one function did not generalise,
+    /// so this one reads every literal in the block that builds the callback.
+    #[test]
+    fn no_callback_sentence_renders_a_run_of_spaces() {
+        let src = include_str!("board.rs");
+        let start = src
+            .find("let folded = bs::folded_into_detail(")
+            .expect("the callback text block exists");
+        let end = src[start..]
+            .find("let guard = format!(\"task-callback:")
+            .expect("the block ends at the delivery guard")
+            + start;
+        let block = &src[start..end];
+        // COMMENTS ARE NOT SENTENCES. `split('"')` cannot tell a literal from a
+        // quoted phrase inside a `//` comment, so a comment that QUOTES the
+        // wording it is explaining reads as a literal whose newline and leading
+        // `//` become the run of spaces this guards against. That is exactly
+        // what happened: AMUX-4558 deleted a callback branch and left a comment
+        // saying its old text ("owed you nothing") used to live there, and this
+        // test failed over prose no reader will ever see.
+        //
+        // Whole-line comments only, and the same rule
+        // `tests/nudge_commands_exist.rs` already applies for the same reason: a
+        // trailing comment cannot be cut without risking a `//` inside a real
+        // literal, which would corrupt the thing being measured.
+        let block: String = block
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = block.as_str();
+
+        // APPLY RUST'S OWN CONTINUATION RULE FIRST. A backslash at end of line
+        // eats the newline AND the next line's leading whitespace, so the raw
+        // source of a CORRECTLY continued literal is full of spaces that never
+        // reach the reader. Checking the raw text flags every well-formed
+        // multi-line string, which is what the first cut of this test did.
+        let strip_continuations = |lit: &str| -> String {
+            let mut out = String::new();
+            let mut rest = lit;
+            while let Some(i) = rest.find("\\\n") {
+                out.push_str(&rest[..i]);
+                rest = rest[i + 2..].trim_start_matches([' ', '\t']);
+            }
+            out.push_str(rest);
+            out
+        };
+        let mut offenders: Vec<String> = Vec::new();
+        for lit in block.split('"').skip(1).step_by(2) {
+            let rendered = strip_continuations(lit);
+            if rendered.contains("   ") {
+                offenders.push(rendered.chars().take(90).collect());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a dropped line-continuation leaves the indentation in the rendered \
+             sentence: {offenders:?}"
+        );
+
+        // POSITIVE CONTROL: the scrape must actually be reading literals. Without
+        // it, a `find` that silently matched nothing gives an empty block and an
+        // empty offender list, which is the most reassuring output a dead check
+        // can produce.
+        let lits = block.split('"').skip(1).step_by(2).count();
+        assert!(
+            lits >= 5,
+            "only {lits} literal(s) scanned; the block moved and this check is blind"
+        );
+    }
+
+    #[test]
+    fn folded_into_is_a_control_key_and_not_a_writable_column() {
+        assert!(!PATCH_WRITABLE.contains(&"folded_into"), "it names no column");
+        assert!(PATCH_CONTROL.contains(&"folded_into"), "and it must not be ignored");
+        assert_eq!(keys(json!({"status": "discarded", "folded_into": "MS-1370"})), ["folded_into"]);
+    }
+
     /// ...except `desc_append`, the one control key that carries CONTENT. It is
     /// the sanctioned way to add to a card someone else is also writing, so
     /// dropping an append silently is the same loss as dropping a desc.
@@ -4747,10 +9269,28 @@ mod af413_discarded_tests {
     }
 }
 
-const PATCH_CONTROL: [&str; 10] = [
+// Archive validation and mutation must interpret the same flag. The API has
+// always accepted string spellings as well as JSON booleans/numbers; checking
+// only true/1 in the outcome guard rejected requests the mutation accepted.
+fn patch_archived_value(value: &Value) -> i64 {
+    let raw = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    i64::from(matches!(raw.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+const PATCH_CONTROL: [&str; 13] = [
+    // Persisted in the attributed archive log, not a standalone column.
+    "archive_outcome",
+    // The lane ASSERTS that this card was folded into another. It is not read
+    // from prose: the caller names the target and the SERVER writes the
+    // canonical `capture folded into <ID>` line that `folded_into()` parses.
+    "folded_into",
     "expect_rev",
     "gate_ack",
     "gate_checked",
+    "reverify",
     "force",
     "reason",
     "authorized_by",
@@ -4999,28 +9539,21 @@ fn criterion_wants_a_name(c: &str) -> bool {
     c.to_lowercase().contains("name them")
 }
 
-/// The exit for a card whose WORK belongs to another lane (AF-506).
-///
-/// Reported by `backend`, hit live on MI-4155 during autonomous backlog triage.
-/// A lane holding a card that is not its work has no honest state to move it to:
-/// `backlog` re-feeds that same lane's auto-pickup, `todo` re-queues after a
-/// cooldown, `needsyou` reads as blocked on Ethan rather than on a peer, and
-/// `review` — which the DISPATCHER's own card text recommends — gates on acking
-/// "Implemented and self-tested" / "Diff / PR is up", which a card you are
-/// ROUTING AWAY cannot truthfully claim. Every move is a lie or a loop, which is
-/// ethos rule 3: a legitimate state with no truthful path forward.
-///
-/// The gate is RIGHT to refuse; what was missing is that the refusal knew only
-/// one way out. Reassignment is not a bypass and is deliberately kept out of the
-/// `or_force` family: it does not skip the gate, it moves the card to whoever
-/// the gate is asking about, and that lane satisfies it honestly.
-///
-/// Two wordings because two different things are true. When the caller is not
-/// the owner, the owner can be NAMED. When the caller IS the owner — backend's
-/// case, since the pickup had already assigned it to them — nothing here can
-/// tell whether the work belongs elsewhere, so it is stated as a conditional
-/// and the loop is spelled out. Neither wording asserts the card is misassigned
-/// (AF-169: a hint that cannot apply must not print as though it does).
+/// AF-345. A criterion asking whether the peer verified the claim THEMSELVES,
+/// as opposed to merely being named (that half is [`criterion_wants_a_name`],
+/// AF-160). Matches this board's own current `group:amux.verified` wording
+/// ("That peer verified it themselves rather than taking the author's word")
+/// and the shorter form used in tests and other scopes, so a reworded gate
+/// with the same intent still trips it.
+fn criterion_wants_peer_verification(c: &str) -> bool {
+    let l = c.to_lowercase();
+    l.contains("verified it themselves") || l.contains("rather than taking the author's word")
+}
+
+/// Ownership-aware recovery beside gate refusals (AF-506, CLA-3).
+/// A peer's existing card remains theirs. An owned or unassigned card gets a
+/// local completion path; a missing gate must not manufacture a peer wait.
+/// The legacy response key is retained for client compatibility.
 fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
     let owner = owner.map(str::trim).filter(|o| !o.is_empty());
     let mine = owner.is_none_or(|o| o == caller);
@@ -5029,16 +9562,29 @@ fn reassign_exit(card: &str, owner: Option<&str>, caller: &str) -> Value {
             "when": format!(
                 "This card is owned by {o:?}, not by you. If the work is theirs, you do not need to satisfy this gate at all — hand it back."
             ),
-            "how": format!("amux board assign {card} {o} && amux board todo {card}"),
-            "effect": format!("dispatches to {o}, not to you"),
-            "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+            // NOT `board assign {o}` (AMUX-4678). The card already belongs to
+            // {o}; re-stating that owner is still a cross-board write from
+            // where you stand, and this server refuses it 403
+            // cross_board_reassignment_forbidden. Only the STATUS moves here,
+            // which is all that is needed: the card is already theirs.
+            // The lane is named IN the command line, not only in `effect`:
+            // board_api.rs requires the exit to name the owner it could see, so
+            // a reader can judge the advice without another call. Moving that
+            // name out while removing the assign broke it, and the test was
+            // right to fail.
+            "how": format!("amux board todo {card} (it is already {o}'s card, this returns it to their queue)"),
+            "effect": format!("returns it to {o}'s queue. Do NOT try `amux board assign {card} {o}` — a worker may set an owner only to its own lane, and that is refused."),
+            "not_a_bypass": "this does not skip the gate; it puts the card back in front of the lane the gate is asking about, and they satisfy it honestly",
         });
     }
+    // The owner must satisfy its own outcome. Suggesting a peer reviewer or
+    // textual wait here recreates the outside dependency refused by storage.
+    // Keep the response key for clients, but teach local completion, not handoff.
     json!({
-        "when": "If this card's WORK belongs to another lane, hand it over instead of acking a criterion you cannot truthfully claim. You own it right now, so nothing here can tell whether that is the case — only you can.",
-        "how": format!("amux board assign {card} <owning-lane> && amux board todo {card}"),
-        "effect": "dispatches to THEM, not back to you. Moving it to `backlog` or `todo` while you still own it re-feeds your own auto-pickup and it returns.",
-        "not_a_bypass": "this does not skip the gate; it moves the card to the lane the gate is asking about, and they satisfy it honestly",
+        "when": "When a gate remains unsatisfied on your card, own the missing implementation, review or verification on this board.",
+        "how": format!("GET /api/board/contract?card={card}; inspect the resolved criteria, reuse available artifacts, and complete the missing work locally before acknowledging it."),
+        "effect": "The card stays on this board. Do not create a cross-worker dependency or move the wait into reviewer, shepherd, source_ref, blocked_on, next_action or gate prose. A peer's paused state or card status is not a prerequisite. Preserve actual access restrictions and required spend/customer-outbound approvals.",
+        "not_a_bypass": "this does not skip the gate; satisfy it with actual local work and evidence. Record any genuine missing permission precisely while completing independent work",
     })
 }
 
@@ -5053,28 +9599,53 @@ mod reassign_exit_tests {
     fn a_card_owned_by_a_peer_names_that_peer_in_the_command() {
         let v = reassign_exit("MI-4155", Some("mvs-infra"), "backend");
         assert!(v["when"].as_str().unwrap().contains("\"mvs-infra\""), "{v:#}");
+        // AMUX-4678: it used to print `amux board assign MI-4155 mvs-infra`,
+        // which this server refuses for a worker (403
+        // cross_board_reassignment_forbidden — an owner may only ever be your
+        // own lane). The advice a gate refusal gives has to be runnable by the
+        // lane reading it, so only the STATUS moves; the card is already theirs.
         assert!(
-            v["how"].as_str().unwrap() == "amux board assign MI-4155 mvs-infra && amux board todo MI-4155",
+            v["how"].as_str().unwrap().starts_with("amux board todo MI-4155")
+                && v["how"].as_str().unwrap().contains("mvs-infra"),
             "{v:#}"
         );
-        assert!(v["effect"].as_str().unwrap().contains("dispatches to mvs-infra"), "{v:#}");
+        assert!(v["effect"].as_str().unwrap().contains("mvs-infra's queue"), "{v:#}");
+        assert!(
+            !v["how"].as_str().unwrap().contains("assign"),
+            "a gate refusal must not hand a worker a cross-board assign: {v:#}"
+        );
     }
 
-    /// THE REPORTED CASE. The pickup had already assigned MI-4155 to backend, so
-    /// they OWNED the card they needed to hand away. Nothing here can tell
-    /// whether the work belongs elsewhere, so it must be a conditional the
-    /// reader resolves — and it must name the loop, which is the part that cost
-    /// them two round trips.
+    /// THE WHOLE POINT, as a rule rather than one string: nothing this function
+    /// prints may tell a worker to run `board assign` at a lane that is not its
+    /// own, because the server answers that 403. Checked across BOTH arms, since
+    /// each carried the same promise in a different shape and fixing one is the
+    /// obvious way to leave the other.
     #[test]
-    fn a_card_you_already_own_states_the_condition_and_names_the_loop() {
+    fn no_arm_tells_a_worker_to_assign_across_boards() {
+        for (owner, caller) in [(Some("mvs-infra"), "backend"), (None, "backend"), (Some("backend"), "backend")] {
+            let v = reassign_exit("MI-4155", owner, caller);
+            let how = v["how"].as_str().unwrap_or_default().to_string();
+            assert!(
+                !how.contains("board assign"),
+                "arm owner={owner:?} caller={caller} still prints a cross-board assign: {how}"
+            );
+        }
+    }
+
+    /// Gate refusal must not teach the owner to recreate a rejected outside
+    /// dependency as a reviewer, shepherd or prose wait.
+    #[test]
+    fn a_card_you_already_own_teaches_local_completion() {
         let v = reassign_exit("MI-4155", Some("backend"), "backend");
-        assert!(v["when"].as_str().unwrap().starts_with("If this card's WORK belongs"), "{v:#}");
-        assert!(v["when"].as_str().unwrap().contains("only you can"), "{v:#}");
+        assert!(v["how"].as_str().unwrap().contains("/api/board/contract?card=MI-4155"), "{v:#}");
+        assert!(v["how"].as_str().unwrap().contains("complete the missing work locally"), "{v:#}");
         assert!(
-            v["effect"].as_str().unwrap().contains("re-feeds your own auto-pickup"),
-            "the loop that sent the card back twice is not named: {v:#}"
+            v["effect"].as_str().unwrap().contains("Do not create a cross-worker dependency"),
+            "gate refusal must reinforce the same-board policy: {v:#}"
         );
-        assert!(v["how"].as_str().unwrap().contains("<owning-lane>"), "{v:#}");
+        assert!(!v.to_string().contains("<owning-lane>"), "{v:#}");
+        assert!(!v.to_string().contains("until they act"), "{v:#}");
     }
 
     /// An unowned card behaves like one you own: amux cannot name a peer, so it
@@ -5085,7 +9656,7 @@ mod reassign_exit_tests {
         for owner in [None, Some(""), Some("   ")] {
             let v = reassign_exit("AF-1", owner, "amux-frustrations");
             assert!(
-                v["how"].as_str().unwrap().contains("<owning-lane>"),
+                v["how"].as_str().unwrap().contains("complete the missing work locally"),
                 "owner {owner:?} produced a named command: {v:#}"
             );
         }
@@ -5333,6 +9904,33 @@ pub(crate) fn desc_replace_destroys_peer_prose(
     !lines.any(|l| new.contains(l))
 }
 
+/// The "is the TYPE the lever?" hint for a gate refusal, in ONE place.
+///
+/// Retyping only changes the gate when the gate CAME from the type. A worker-,
+/// group-, column- or card-scoped gate ignores the type entirely, so telling
+/// that caller to fix the type names a lever that cannot move: they retype, get
+/// the identical refusal, and are left with --force.
+///
+/// It lives here because two refusal sites answered this question differently.
+/// One branched on `GateSource::retype_would_help()`; the other hardcoded "the
+/// TYPE is wrong, fix the type" for every caller. tubescience hit the second on
+/// 2026-09-08, four forced closes in one day on a lane whose WORKER-scope done
+/// gate is ["Implemented and merged", "Tests / lint pass", "Peer reviewed"],
+/// applied to research and ops cards (AF-586). Two copies of one rule is how
+/// they came apart, so there is one copy now.
+///
+/// Whether those criteria SHOULD apply to a research card is a separate and
+/// still-open decision. This only stops a refusal sending the reader after a fix
+/// that cannot work.
+pub(crate) fn retype_hint_for(gate_source: Option<&bs::GateSource>) -> String {
+    match gate_source {
+        Some(src) if !src.retype_would_help() => src.explain(),
+        _ => "If these criteria don't fit the work, the TYPE is wrong, so fix the type \
+              rather than the truth."
+            .to_string(),
+    }
+}
+
 pub async fn patch_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -5345,6 +9943,17 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global()) {
+        if map.contains_key("session") {
+            let target = body_str(&map, "session").unwrap_or_default();
+            if target.is_empty() || !scope.allows_worker(&target) {
+                return scoped_board_forbidden(
+                    &scope,
+                    if target.is_empty() { "unassigned card" } else { &target },
+                );
+            }
+        }
+    }
     // AF-413: computed HERE, before `map` moves into the write closure, because
     // the refusal that needs it is built inside that closure and answered after
     // it. Cheap (a key scan) and unconditional: a value only read on the refusal
@@ -5413,15 +10022,54 @@ pub async fn patch_item(
         );
     }
     let force_actor = actor_name.clone();
+    // AF-701: a VERIFIED local member (Ethan, from the dashboard) is always
+    // allowed and stays exempt from the cross-lane archive guard below —
+    // captured separately from `caller_lane` so the exemption survives while
+    // the next comment's bug does not.
+    let is_local_member = super::org::is_verified_local_member(&headers);
     // Python `_hdr_worker`: "" when the header is absent — the cross-lane
-    // archive guard only fires for a NAMED caller (AMUX-2492).
-    let caller_lane = if actor_name == "api-anonymous" {
+    // archive guard used to ALSO exempt a truly anonymous caller this way
+    // (AMUX-2492's original text: "only fires for a NAMED caller"), which
+    // reads as a design choice and was actually the hole: an unnamed caller
+    // is the one that most needs the guard, not the one that should skip it.
+    // Measured by mixpeek-orchestrator 2026-09-10/11: a 62-card anonymous
+    // PATCH sweep (zero X-Amux-Session/Worker header, 14-15 byte bodies,
+    // one card per request over 6 minutes) archived cards across at least
+    // seven OTHER lanes' namespaces with no resistance, because `caller_lane`
+    // was empty and the guard below only checked `!caller_lane.is_empty()`.
+    // Fixed at the guard site (AF-701), not here: `caller_lane` still needs
+    // to read "" for every other caller (notify targets, log lines) that
+    // legitimately treats an anonymous/local-member caller as unnamed.
+    let caller_lane = if actor_name == "api-anonymous" || is_local_member {
         String::new()
     } else {
         actor_name.clone()
     };
 
     let slot: Arc<Mutex<Option<PatchOut>>> = Arc::new(Mutex::new(None));
+    // Measure integration outside the writer. The revision/owner check inside
+    // the transaction prevents a concurrent reassignment from borrowing this
+    // observation. Gate acknowledgements and force cannot invent a merge.
+    let workspace_verification = if body_str(&map, "status").as_deref().and_then(bs::parse_status) == Some(TaskStatus::Verified) {
+        let lookup = id.clone();
+        let row = match state.store.read_async(move |conn| Ok(bs::get_issue(conn, &lookup)?)).await {
+            Ok(row) => row,
+            Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, json!({"error":e.to_string()})),
+        };
+        if let Some(row) = row {
+            // Use the same nullable-field semantics as the transaction below.
+            // The dashboard submits session:"" for an unassigned card. Measuring
+            // Some("") here but writing None falsely reports an ownership race.
+            let owner = body_opt_str(&map, "session")
+                .map(|value| value.filter(|name| !name.trim().is_empty()))
+                .unwrap_or_else(|| row.session.clone());
+            let verdict = match owner.as_deref() {
+                Some(name) => crate::fanout_workspace::verification_ready(name).await,
+                None => Ok(()),
+            };
+            Some((row.rev, owner, verdict))
+        } else { None }
+    } else { None };
     let slot_w = slot.clone();
     let id_w = id.clone();
     let caller_for_notify = caller_lane.clone();
@@ -5458,13 +10106,29 @@ pub async fn patch_item(
                 }
             }
 
-            let ignored: Vec<String> = map
+            let mut ignored: Vec<String> = map
                 .keys()
                 .filter(|k| {
                     !PATCH_WRITABLE.contains(&k.as_str()) && !PATCH_CONTROL.contains(&k.as_str())
                 })
                 .cloned()
                 .collect();
+            if !ignored.is_empty() {
+                tracing::warn!(target: "amux::board", verdict="patch_fields_ignored", item=%id_w,
+                    fields=?ignored, measured=true, n_considered=ignored.len(), "board PATCH contains ignored fields");
+            }
+            if let Some(outcome) = map.get("archive_outcome") {
+                let archiving = map.get("archived").is_some_and(|v| patch_archived_value(v) == 1);
+                let reason = outcome.as_str().filter(|s| !s.trim().is_empty());
+                if !archiving || reason.is_none() {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::BAD_REQUEST,
+                        json!({"error":"archive_outcome requires archived=true and a nonempty string", "item":row.id})), no_write());
+                }
+                if row.archived == 1 {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        json!({"error":"card is already archived; unarchive before recording another archive_outcome", "item":row.id})), no_write());
+                }
+            }
             // Filled by the source_ref arm below when a trigger is rerouted to
             // the card body. Empty on every other write.
             let mut diverted: Vec<Value> = Vec::new();
@@ -5487,10 +10151,78 @@ pub async fn patch_item(
             let mut changed: Vec<String> = Vec::new();
             let mut tags_change: Option<Vec<String>> = None;
 
+            // A worker cannot create on its own board and then move the card
+            // onto a peer's board through PATCH. Administrative callers remain
+            // able to reassign, while a verified worker may only name itself as
+            // the destination. Peer collaboration belongs in reviewer,
+            // shepherd, and evidence references instead of cross-board ownership or dependency edges.
+            if !caller_lane.is_empty() && map.contains_key("session") {
+                let requested_owner = body_opt_str(&map, "session")
+                    .flatten()
+                    .filter(|owner| !owner.trim().is_empty());
+                if requested_owner.as_deref() != Some(caller_lane.as_str()) {
+                    tracing::warn!(
+                        caller = %caller_lane,
+                        card = %id_w,
+                        requested_owner = ?requested_owner,
+                        "cross-board card reassignment refused"
+                    );
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::FORBIDDEN,
+                            json!({
+                                "error": "workers may assign board items only to their own board",
+                                "code": "cross_board_reassignment_forbidden",
+                                "caller": caller_lane,
+                                "requested_owner": requested_owner,
+                                "how_to_fix": "keep the outcome on your own board, implement missing components there, and reference peer evidence without creating a cross-worker dependency",
+                            }),
+                        ),
+                        no_write(),
+                    );
+                }
+            }
+
             if let Some(t) = body_str(&map, "title") {
                 if t != next.title {
                     next.title = t;
                     changed.push("title".into());
+                    // AF-703: a title correction lands on the card you edited
+                    // and never on the cards that CITE it — gtm-engine measured
+                    // three same-evening instances (a cost overstated in one
+                    // title, a count understated in another, a third card's
+                    // `blocked_on` quoting the first FIGURE an hour after it was
+                    // corrected). Surfacing every citing card at edit time is
+                    // the cheapest fix named: it does not rewrite anyone else's
+                    // text (ethos rule 8 — whose data is this), it lets the
+                    // author of the change see what they just orphaned.
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT id, title FROM issues WHERE deleted IS NULL AND id != ?1 \
+                         AND (title LIKE '%'||?1||'%' OR \"desc\" LIKE '%'||?1||'%' \
+                         OR COALESCE(blocked_on,'') LIKE '%'||?1||'%') LIMIT 20",
+                    ) {
+                        if let Ok(rows) = stmt.query_map(rusqlite::params![&next.id], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        }) {
+                            let citing: Vec<Value> = rows
+                                .flatten()
+                                .map(|(cid, ctitle)| json!({ "id": cid, "title": ctitle }))
+                                .collect();
+                            if !citing.is_empty() {
+                                advisories.push(json!({
+                                    "field": "title",
+                                    "why": format!(
+                                        "{} card(s) mention {} in their own title/desc/blocked_on \
+                                         — a correction here may need to reach them too",
+                                        citing.len(),
+                                        next.id
+                                    ),
+                                    "citing_cards": citing,
+                                }));
+                            }
+                        }
+                    }
                 }
             }
             // `desc_append` appends instead of the destructive replace (Python
@@ -5531,6 +10263,46 @@ pub async fn patch_item(
                     }
                 }
             };
+            // A HAND-ROLLED FOLD MUST BE AS READABLE AS A PEER-DRIVEN ONE.
+            //
+            // b3db93fd taught the terminal summary and the task callback to
+            // recognise a fold, by reading the `capture folded into <ID>` line
+            // that the peer-fold path writes. mixpeek-frustrations then measured
+            // the gap that leaves, on their own cards:
+            //
+            //   MS-1369  discarded   server fold line present: True
+            //   SP-713   discarded   present: True
+            //   MF-888   discarded   present: FALSE
+            //   MF-890   discarded   present: FALSE
+            //   MF-893   discarded   present: FALSE
+            //
+            // The last three were folded BY HAND (`board progress` then `board
+            // discard`), which authors no such line, so they still rendered with
+            // the four not-recorded clauses this fix exists to remove. The
+            // predicate was right and its input was not always written.
+            //
+            // So the caller names the target and the server writes the line.
+            // That is an assertion a lane makes about its OWN action, which is
+            // categorically different from inferring a fold out of a free-text
+            // progress note — the classifier both reporters explicitly ruled
+            // out, because guessing intent from prose fails open in the
+            // expensive direction.
+            if let Some(target) = body_str(&map, "folded_into")
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            {
+                // A card folded into ITSELF is nonsense and would make the
+                // summary point at the shell the reader is already looking at.
+                if target != next.id {
+                    let old_log = next.log.as_deref().unwrap_or("").trim_end().to_string();
+                    let line = format!("capture folded into {target}");
+                    next.log = Some(if old_log.is_empty() {
+                        line
+                    } else {
+                        format!("{old_log}\n{line}")
+                    });
+                }
+            }
             // Nullable epoch seconds. An explicit null CLEARS (re-arming a
             // trigger for re-verification); absent leaves it alone.
             if let Some(v) = map.get("last_verified_at") {
@@ -5740,14 +10512,108 @@ pub async fn patch_item(
             set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
             set_opt("ask_actor", &mut next.ask_actor, &mut changed);
             set_opt("next_action", &mut next.next_action, &mut changed);
-            set_opt("last_result", &mut next.last_result, &mut changed);
+            // Once a terminal transition has recorded the authoritative
+            // board summary, a replaying provider payload must not replace it
+            // with stale prose and turn an idempotent retry into a second
+            // applied write. A new terminal entry still flows through the
+            // normal setter and save_patched replaces it atomically.
+            let reopening_terminal_card = bs::is_terminal_status(&row.status)
+                && map
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(bs::parse_status)
+                    .is_some_and(|target| {
+                        !bs::is_terminal_status(bs::db_status_spelling(target))
+                    });
+            let terminal_summary_locked = bs::is_terminal_status(&row.status)
+                && !reopening_terminal_card
+                && row
+                    .last_result
+                    .as_deref()
+                    .is_some_and(|summary| summary.starts_with("Final outcome:"));
+            if terminal_summary_locked && map.contains_key("last_result") {
+                ignored.push("last_result".into());
+            } else {
+                set_opt("last_result", &mut next.last_result, &mut changed);
+            }
             set_opt("unresolved", &mut next.unresolved, &mut changed);
             set_opt("blocked_on", &mut next.blocked_on, &mut changed);
-            set_opt("acceptance_criteria", &mut next.acceptance_criteria, &mut changed);
+            // AF-711: acceptance_criteria used to route through `set_opt` like a
+            // plain nullable string column, via `body_opt_str`'s
+            // `Some(v) => Some(v.as_str().map(str::to_string))`. An incoming
+            // JSON ARRAY (the shape `board decompose` itself writes, and the
+            // shape every caller of a field literally named "criteria, plural"
+            // would reasonably send) makes `Value::as_str()` return `None` —
+            // INDISTINGUISHABLE from an explicit null-clears-the-field request
+            // in that same match arm. The write proceeded as a silent CLEAR,
+            // not a no-op: it destroyed seven tubescience cards' and three
+            // mixpeek-general cards' acceptance criteria in two separate
+            // incidents before this was caught, with the response still
+            // reporting `applied:true`.
+            //
+            // Fixed by encoding whatever the caller sent (string or array of
+            // strings) as JSON before storing, matching the encoding
+            // `board decompose` already uses — so a plain string PATCH also
+            // reads back as the identical string, not silently unrenderable
+            // (see `parse_json_or_raw_string` on the read side) — and
+            // rejecting any other JSON shape outright rather than coercing it
+            // into a clear.
+            if let Some(v) = map.get("acceptance_criteria") {
+                match encode_acceptance_criteria(v) {
+                    Ok(encoded) => {
+                        if next.acceptance_criteria != encoded {
+                            next.acceptance_criteria = encoded;
+                            changed.push("acceptance_criteria".into());
+                        }
+                    }
+                    Err(msg) => {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": msg, "item": row.id}),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+            }
             set_opt("decision_question", &mut next.decision_question, &mut changed);
             set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
             set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
-            set_opt("waiting_on", &mut next.waiting_on, &mut changed);
+            // AF-930: was plain `set_opt`, same defect AF-711 fixed for
+            // acceptance_criteria a few lines above -- see encode_waiting_on's
+            // own doc comment for why a JSON object silently cleared instead
+            // of being rejected or stored.
+            if let Some(v) = map.get("waiting_on") {
+                match encode_waiting_on(v) {
+                    Ok(encoded) => {
+                        if next.waiting_on != encoded {
+                            next.waiting_on = encoded;
+                            changed.push("waiting_on".into());
+                        }
+                    }
+                    Err(msg) => {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": msg, "item": row.id}),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+            }
+            if next.epic != row.epic {
+                if let Some(parent) = next.epic.as_deref() {
+                    if let Some(cycle) = bs::epic_cycle(conn, &row.id, parent)? {
+                        return finish(&slot_w, PatchOut::Refused(StatusCode::BAD_REQUEST,
+                            json!({"error":format!("circular epic: {}",cycle.join(" -> ")),
+                                "code":"lineage_cycle", "cycle":cycle})), no_write());
+                    }
+                }
+            }
             if let Some(spec) = map.get("callback") {
                 if caller_lane.is_empty() {
                     return finish(
@@ -5940,54 +10806,30 @@ pub async fn patch_item(
                     }
                     _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
                 }
-                // A TRIGGER WITH NO VERIFICATION TIME RE-DRAINS FOREVER, SILENTLY.
-                //
-                // board_drive's idle-drain gate is
-                //   COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < now-24h
-                // so a card parked with a source_ref and NO last_verified_at reads as
-                // "trigger nobody has re-checked" on every tick and is offered again,
-                // forever. `amux board <status> --trigger` stamps both. A raw PATCH —
-                // which is the shape ~/.claude/CLAUDE.md's board recipes teach — sets
-                // only the one field, and nothing said so.
-                //
-                // Measured 2026-09-04 by ts-gke, on themselves. They parked TG-3239 by
-                // raw PATCH and eleven other cards with the CLI. The drain served
-                // TG-3239 four times in one session while the eleven stayed quiet, and
-                // they filed a dispatch-ORDERING report against amux on the strength of
-                // it: wrong population, wrong conclusion, wrong recommendation, sent to
-                // a peer. The two calls do the same visible thing and only one stamps.
-                //
-                // TELL THE CALLER, not just the card (AMUX-3791, same reasoning as the
-                // autofix diversion above): the operator saw a 200 and a card that
-                // looked parked. This is the only signal that reaches the person who
-                // can fix it, at the moment they can.
-                if changed.iter().any(|c| c == "source_ref")
-                    && next.source_ref.as_deref().is_some_and(|v| !v.trim().is_empty())
-                    && !map.contains_key("last_verified_at")
+                // An explicit trigger write is the same parking action through
+                // PATCH as through `amux board backlog --trigger`. Requiring the
+                // caller to know about a second field made a successful park
+                // immediately drain again (AMUX-4168). Stamp the action here,
+                // including reasserting the same trigger and autofix diversions.
+                // Explicit timestamps/null still win; unrelated edits never
+                // refresh a trigger and cannot keep a backlog parked forever.
+                if body_str(&map, "source_ref").is_some_and(|v| {
+                    !v.trim().is_empty() && !v.starts_with("autofix:")
+                }) && !map.contains_key("last_verified_at")
                 {
-                    // ITS OWN FIELD, NOT `diverted`. A diversion means "the key
-                    // you named is deliberately not the key that changed"
-                    // (AMUX-3791). Nothing was diverted here: source_ref landed
-                    // exactly where the caller asked. This is an ADVISORY about a
-                    // companion field they did not send.
-                    //
-                    // Overloading `diverted` cost a real regression the same day:
-                    // a_trigger_cannot_overwrite_an_autofix_signature_but_can_
-                    // replace_a_trigger carries a CONTROL asserting an ordinary
-                    // trigger write reports NO diversion, written precisely so
-                    // "a version that emitted the advisory on every source_ref
-                    // write would pass every cell above and train readers to
-                    // ignore a line that cries wolf". It caught this, correctly,
-                    // and the control was right.
+                    next.last_verified_at = Some(now_secs());
+                    if !changed.iter().any(|c| c == "last_verified_at") {
+                        changed.push("last_verified_at".into());
+                    }
+                    tracing::warn!(
+                        card = %next.id,
+                        verdict = "trigger_timestamp_repaired",
+                        "board: explicit trigger write supplied no timestamp; recorded parking time to prevent immediate re-drain"
+                    );
                     advisories.push(json!({
                         "field": "last_verified_at",
-                        "not_set": true,
-                        "why": "source_ref was set without last_verified_at, so board-drive \
-                                reads this card as a trigger nobody has re-checked and will \
-                                re-offer it on every idle tick. `amux board <status> <id> \
-                                --trigger \"...\"` stamps both; a raw PATCH sets only \
-                                source_ref. Send last_verified_at (unix seconds) alongside \
-                                it, or park with the CLI.",
+                        "set_to": next.last_verified_at,
+                        "why": "Recorded the explicit trigger write's parking time, as the CLI does, so auto-drain waits for the trigger recheck window.",
                     }));
                 }
             }
@@ -6022,15 +10864,7 @@ pub async fn patch_item(
             // every view and autonomy loop, a termination in effect.
             // UN-archiving is never gated, or the un-do is unreachable.
             if let Some(v) = map.get("archived") {
-                let raw = match v {
-                    Value::String(s) => s.clone(),
-                    Value::Bool(b) => if *b { "true".into() } else { "false".into() },
-                    other => other.to_string(),
-                };
-                let arc_v: i64 = i64::from(matches!(
-                    raw.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                ));
+                let arc_v = patch_archived_value(v);
                 if arc_v == 1 {
                     let owner = row.session.clone().unwrap_or_default().trim().to_string();
                     let authorized = map
@@ -6038,9 +10872,19 @@ pub async fn patch_item(
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .unwrap_or("");
-                    if !caller_lane.is_empty() && !owner.is_empty() && owner != caller_lane
+                    // AF-701: `is_local_member` outranks the identity check — a
+                    // verified local member (Ethan) is always allowed, same as
+                    // before. What changed is that a caller who is NEITHER named
+                    // NOR the local member (a truly anonymous request) no longer
+                    // gets waved through just because `caller_lane` reads "".
+                    // That emptiness used to mean "skip the check"; it now means
+                    // "cannot possibly equal `owner`", which is the same rule
+                    // this block already applies to every named non-owner.
+                    if !is_local_member && !owner.is_empty() && owner != caller_lane
                         && authorized.is_empty()
                     {
+                        let caller_desc =
+                            if caller_lane.is_empty() { "An anonymous caller" } else { &caller_lane };
                         return finish(
                             &slot_w,
                             PatchOut::Refused(
@@ -6048,7 +10892,7 @@ pub async fn patch_item(
                                 json!({
                                     "error": "cross-lane destruction requires authorized_by",
                                     "why": format!(
-                                        "{caller_lane} is archiving {}, which belongs to {owner}. \
+                                        "{caller_desc} is archiving {}, which belongs to {owner}. \
                                          Archiving hides it from every board view AND every \
                                          autonomy loop, so it is a termination in effect even \
                                          though the status is untouched.",
@@ -6056,7 +10900,10 @@ pub async fn patch_item(
                                     ),
                                     "how": format!(
                                         "add {{\"authorized_by\": \"<who asked>\"}}, or use \
-                                         `amux board archive {} --authorized-by \"<who>\"`",
+                                         `amux board archive {} --authorized-by \"<who>\"`. An \
+                                         anonymous caller (no X-Amux-Session/X-Amux-Worker header) \
+                                         must send this header or authorized_by — there is no \
+                                         exemption for an unnamed caller.",
                                         row.id
                                     ),
                                     "card_owner": owner,
@@ -6065,10 +10912,106 @@ pub async fn patch_item(
                             no_write(),
                         );
                     }
+                    // AF-701: archiving a card that is still `needsyou` hides an
+                    // unanswered ask instead of resolving it — measured fleet-wide
+                    // by mixpeek-orchestrator at 98 such cards, most weeks old,
+                    // several with no attributable actor at all.
+                    //
+                    // AF-712 generalizes this from needsyou alone to every
+                    // non-terminal status: measured fleet-wide at 885
+                    // archived+non-terminal rows (todo/doing/backlog/blocked/
+                    // needsyou), UP from AF-555's 785-of-2133 baseline two weeks
+                    // earlier — new instances kept forming because only needsyou
+                    // was ever gated. `survives_archive()` (amux-core::board)
+                    // still names needsyou as the one status that is DESIGNED to
+                    // stay non-terminal while archived (the ask is still owed);
+                    // every other non-terminal status has no such design intent,
+                    // it is just a card nobody closed before hiding it.
+                    //
+                    // NOT gated on "the same request also changes status": tried
+                    // that first, and `next.archived` is set (a few lines below)
+                    // before the status-transition code runs later in this same
+                    // function, which reads `apply_transition`'s own archived-
+                    // check against a task that this request has already marked
+                    // archived — so a combined {"archived":true,"status":"x"} PATCH
+                    // was refused ArchivedTaskImmutable regardless of what this
+                    // gate did. That escape never worked; documenting it as a
+                    // valid path would have been the ethos-rule-3 lie this fix
+                    // exists to remove. The real two-step path (change status
+                    // to a terminal one in one request, archive in the next)
+                    // still works and needs no help from this gate.
+                    if !bs::is_terminal_status(&row.status) {
+                        let outcome = map
+                            .get("archive_outcome")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .unwrap_or("");
+                        if outcome.is_empty() {
+                            let why = if row.status == "needsyou" {
+                                format!(
+                                    "{} is in needsyou, which means someone is still owed \
+                                     an answer. Archiving it removes it from the owner's \
+                                     queue and every autonomy loop without answering the \
+                                     ask, which is how it goes quiet instead of getting \
+                                     resolved.",
+                                    row.id
+                                )
+                            } else {
+                                format!(
+                                    "{} is still {}, not a terminal status (done/verified/\
+                                     discarded). Archiving it removes it from every board \
+                                     view and autonomy loop while the work is still open, \
+                                     which is how an archived-but-unfinished card accumulates \
+                                     silently instead of ever getting resolved (AF-712).",
+                                    row.id, row.status
+                                )
+                            };
+                            let how = if row.status == "needsyou" {
+                                "add \
+                                 {\"archive_outcome\": \"<answered|withdrawn|discarded, and why>\"} \
+                                 to archive it while recording why, or first PATCH \
+                                 `status` away from needsyou in its own request (the \
+                                 ask was answered or the card is done), then archive \
+                                 it in a second request."
+                            } else {
+                                "add \
+                                 {\"archive_outcome\": \"<why this is being hidden while still open>\"} \
+                                 to archive it while recording why, or first PATCH \
+                                 `status` to done/verified/discarded in its own request, \
+                                 then archive it in a second request."
+                            };
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::BAD_REQUEST,
+                                    json!({
+                                        "error": "archiving a non-terminal card requires an outcome",
+                                        "why": why,
+                                        "how": how,
+                                        "status": row.status,
+                                        "item": row.id,
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
                 }
                 if arc_v != next.archived {
                     next.archived = arc_v;
                     changed.push("archived".into());
+                    if arc_v == 1 {
+                        if let Some(o) = map.get("archive_outcome").and_then(Value::as_str) {
+                            let o = o.trim();
+                            if !o.is_empty() {
+                                next.log = Some(bs::append_log(
+                                    next.log.as_deref(),
+                                    &hhmm(),
+                                    &format!("{actor_name}: archive_outcome: {o}"),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             if let Some(t) = body_str(&map, "type") {
@@ -6172,6 +11115,27 @@ pub async fn patch_item(
                     changed.push("depends_on".into());
                 }
             }
+            let requested = body_str(&map, "status").unwrap_or_else(|| next.status.clone());
+            let requested = bs::parse_status(&requested)
+                .map(|status| bs::status_to_db(status, &next.status)).unwrap_or(requested);
+            let reopened = bs::execution_is_terminal(&row.status, &row.item_type)
+                && !bs::execution_is_terminal(&requested, &next.item_type);
+            if map.contains_key("depends_on") || map.contains_key("session") || reopened {
+                let foreign = bs::foreign_dependencies(conn, next.session.as_deref(), &next.depends_on)?;
+                if !foreign.is_empty() {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        foreign_dependency_refusal(&foreign)), no_write());
+                }
+            }
+            if next.session != row.session {
+                let dependents = bs::foreign_dependents(conn, &row.id, next.session.as_deref())?;
+                if !dependents.is_empty() {
+                    let mut refusal = foreign_dependency_refusal(&dependents);
+                    refusal["relation"] = json!("incoming_dependents");
+                    refusal["how_to_fix"] = json!("Keep this prerequisite and its dependent tasks on the same board. Fan out independent outcomes; consume verified inputs with evidence before moving work.");
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT, refusal), no_write());
+                }
+            }
             if let Some(v) = map.get("tags") {
                 let tags = match body_str_list(v) {
                     Ok(l) => l,
@@ -6197,8 +11161,27 @@ pub async fn patch_item(
                 }
             }
 
+            if let Some((observed_rev, owner, verdict)) = &workspace_verification {
+                if row.rev != *observed_rev || next.session.as_deref() != owner.as_deref() {
+                    tracing::warn!(target: "amux::verification", card = %row.id,
+                        observed_rev, current_rev = row.rev, observed_owner = ?owner,
+                        current_owner = ?next.session, verdict = "verification_observation_stale",
+                        "card changed after workspace verification was measured");
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        json!({"error":"card changed during verification; re-read and retry", "code":"verification_observation_stale", "item":row.id})), no_write());
+                }
+                if let Err(detail) = verdict {
+                    return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
+                        fanout_verification_refusal(&row.id, next.session.as_deref(), detail)), no_write());
+                }
+            }
+
             // ---- status transition through the core state machine --------
             let mut status_event: Option<(String, String)> = None;
+            // Declared out here beside `status_event`, for the same reason: it
+            // is SET inside the status branch and READ at the response, which
+            // are different scopes (AMUX-4860).
+            let mut target_adjusted_from: Option<&'static str> = None;
 
             // ---- user-created columns (AMUX-2609) ------------------------
             //
@@ -6413,8 +11396,130 @@ pub async fn patch_item(
                         no_write(),
                     );
                 };
+                // AMUX-4860, the patch half of the create guard. Same reason:
+                // board_drive skips isolated lanes, so moving a card INTO
+                // `todo` on one makes a claim no tick can honour, and
+                // board.todo_is_reachable_by_dispatch is what reports it.
+                //
+                // Adjusted HERE, immediately after the parse, because
+                // `target_raw` is derived from `target` further down and the
+                // gate trail, the WIP cap and the write all read it. Adjusting
+                // later would leave those disagreeing about the target status.
+                //
+                // Defaulted rather than refused, and via the shared
+                // `session_is_isolated` predicate, for the reasons recorded on
+                // the create side.
+                let mut target = target;
+                if todo_unreachable_on_isolated_lane(
+                    target == TaskStatus::Todo,
+                    next.session.as_deref().unwrap_or(""),
+                    &|l| crate::api::session_verbs::session_is_isolated(l),
+                ) {
+                    tracing::info!(
+                        target: "amux::board",
+                        marker = "todo_defaulted_to_backlog",
+                        verdict = "isolated_lane_cannot_be_dispatched",
+                        card = %next.id,
+                        session = %next.session.as_deref().unwrap_or("(none)"),
+                        measured = true,
+                        n_considered = 1,
+                        "board patch: todo requested for an isolated lane, stored as backlog"
+                    );
+                    target_adjusted_from = Some("todo");
+                    target = TaskStatus::Backlog;
+                }
                 let from = bs::parse_status(&next.status);
-                if from != Some(target) {
+                // MOVING ANOTHER LANE'S CARD OUT OF `needsyou` IS A CROSS-LANE
+                // HIDE, and requires the same `authorized_by` the archive guard
+                // above already demands (AMUX-4316).
+                //
+                // Measured 2026-09-15: a caller identifying as `amux-3`, which
+                // is not a registered fleet session, PATCHed 181 needsyou cards
+                // to `todo` in one pass at 13:48, spanning at least 12 owning
+                // teams. Nothing refused it. The owning lanes could not notice
+                // either, because a card that leaves `needsyou` leaves the view
+                // they would have noticed it in.
+                //
+                // THE PRECEDENT IS TWELVE HUNDRED LINES UP IN THIS SAME
+                // FUNCTION. AF-701 already gates ARCHIVING a `needsyou` card,
+                // in its own words, because it "hides an unanswered ask instead
+                // of resolving it". This hides the identical ask by a different
+                // verb, and was ungated only because nobody had reached for
+                // that verb yet. So this is the existing rule applied
+                // consistently, not a new policy.
+                //
+                // NARROW ON PURPOSE. `needsyou` is the one status that means a
+                // human still owes an answer; every other transition stays open
+                // so board-drive, promotion and reassignment keep working
+                // unchanged. The exemptions match the archive guard exactly: the
+                // owning lane, and a verified local member (Ethan, from the
+                // dashboard). `authorized_by` is the truthful path for a lane
+                // that legitimately answers another team's ask (ethos rule 3),
+                // and it is the same key, so there is one thing to learn.
+                if from == Some(TaskStatus::NeedsYou) && target != TaskStatus::NeedsYou {
+                    let owner = row.session.clone().unwrap_or_default().trim().to_string();
+                    let authorized = map
+                        .get("authorized_by")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if !is_local_member
+                        && !owner.is_empty()
+                        && owner != caller_lane
+                        && authorized.is_empty()
+                    {
+                        let caller_desc = if caller_lane.is_empty() {
+                            "An anonymous caller"
+                        } else {
+                            &caller_lane
+                        };
+                        // Named marker: a 400 here would otherwise group with
+                        // every other board-PATCH 400 in /api/logs/analyze, and
+                        // "who is still sweeping other lanes' asks" is exactly
+                        // the question the 181-card pass went unasked for.
+                        tracing::warn!(
+                            marker = "cross_lane_needsyou_move",
+                            card = %row.id,
+                            actor = %actor_name,
+                            owner = %owner,
+                            target = ?target,
+                            "refused: a foreign caller tried to move a needsyou card out of \
+                             needsyou without authorized_by (AMUX-4316)"
+                        );
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({
+                                    "error": "cross-lane needsyou move requires authorized_by",
+                                    "why": format!(
+                                        "{caller_desc} is moving {} out of needsyou, and it \
+                                         belongs to {owner}. needsyou means a human still owes \
+                                         an answer; moving it out removes it from the view where \
+                                         that answer is tracked, so the ask is hidden rather than \
+                                         resolved. 181 cards across 12+ teams were hidden this \
+                                         way in one pass on 2026-09-15.",
+                                        row.id
+                                    ),
+                                    "how": format!(
+                                        "answer the ask and let {owner} move it, or add \
+                                         {{\"authorized_by\": \"<who asked>\"}} if you are acting \
+                                         on their behalf. An anonymous caller (no \
+                                         X-Amux-Session/X-Amux-Worker header) must send that \
+                                         header or authorized_by — there is no exemption for an \
+                                         unnamed caller."
+                                    ),
+                                    "card_owner": owner,
+                                    "attempted_status": target_in,
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+                let rechecking_verified = from == Some(TaskStatus::Verified) && target == TaskStatus::Verified
+                    && map.get("reverify").and_then(Value::as_bool) == Some(true);
+                if from != Some(target) || rechecking_verified {
                     let Some(from) = from else {
                         return finish(
                             &slot_w,
@@ -6452,6 +11557,125 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // RR-0052 Invariant 2: ONLY THE HOLDER MOVES A LEASED CARD.
+                    //
+                    // The first cut handed core an Actor::Worker only for NAMED,
+                    // non-Force transitions, and core's holder_guard sits in six of
+                    // those arms. So with enforcement on, another lane could still
+                    // release (doing->todo), park (doing->backlog, a pair PATCH maps
+                    // to Force), discard or quarantine a card mid-attempt. The guard
+                    // is asked HERE for every status move, with core's own predicate
+                    // (not a second copy of it). An explicit `force` stays the
+                    // override: it already requires attribution and a reason, and
+                    // it is audited. Humans and anonymous callers are not workers.
+                    //
+                    // FIRST, before every other refusal on this path: a non-holder
+                    // told "gate not acknowledged" would ack the gate and only then
+                    // learn the card is not theirs to move.
+                    let caller_wid = (!caller_lane.is_empty())
+                        .then(|| crate::orchestrator::runtime::foreign_worker_id(&caller_lane));
+                    if let (Some(wid), false) = (&caller_wid, force) {
+                        let as_worker = Actor::Worker { id: wid.clone() };
+                        if amux_core::board::holder_guard(&task, &as_worker).is_err() {
+                            if bs::lease_enforcement_enabled() {
+                                tracing::warn!(
+                                    target: "amux::board", card = %next.id, caller = %caller_lane,
+                                    holder = next.lease_owner.as_deref().unwrap_or(""),
+                                    from = %next.status, to = %bs::status_to_db(target, &next.status),
+                                    measured = true, n_considered = 1, verdict = "lease_held_refused",
+                                    "board: refused a non-holder status move on a leased card (RR-0052 Invariant 2)"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        lease_held_409(&next, &caller_lane, &bs::status_to_db(target, &next.status), chrono::Utc::now().timestamp()),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            tracing::info!(
+                                target: "amux::board", card = %next.id,
+                                caller = %caller_lane, measured = true, n_considered = 1,
+                                verdict = "lease_would_refuse",
+                                "ledger: lease would-refuse (AMUX_LEASE_ENFORCE off): cross-lane transition on a leased card (AMUX-4498/RR-0052)"
+                            );
+                        }
+                    }
+                    // A CAPTURE IS AN ENVELOPE, NOT A PARKABLE UNIT OF WORK
+                    // (MR-174, mvs-research, 2026-09-09).
+                    //
+                    // The server already has exactly three honest exits for an
+                    // auto-captured prompt: discard it when it is not work,
+                    // reshape its body into one self-contained task, or
+                    // decompose it atomically into an epic and ordered children.
+                    // The board-drive nudge teaches those exits and exempts the
+                    // untouched envelope from WIP for the same reason. The PATCH
+                    // transition path nevertheless allowed a fourth exit:
+                    // `doing -> backlog` (or `todo`) while the body was still
+                    // the captured prompt.
+                    //
+                    // MR-174 walked that hole exactly. `status-update` claimed
+                    // the direct human command as doing, the worker recorded a
+                    // material status and an artifact, then the same command
+                    // envelope moved back to backlog with a 14-day revisit and
+                    // a prose trigger. The Messages link and history were all
+                    // correct; the current board still erased the active-work
+                    // disposition and the drive loop quite correctly treated
+                    // the fresh trigger as parked. That is a state-machine
+                    // contradiction, not a polling problem.
+                    //
+                    // Refuse only the retreat of an UNRESHAPED capture. A real
+                    // task whose author rewrites `desc` in this same atomic
+                    // PATCH no longer matches `is_capture_shell` and may be
+                    // parked normally. New captures may still start in backlog,
+                    // terminal dispositions still work, and an attributed,
+                    // reasoned force remains the audited escape. This improves
+                    // with the model: it requires the model to make the semantic
+                    // judgment the harness cannot make, then preserves it.
+                    if from == TaskStatus::Doing
+                        && matches!(target, TaskStatus::Backlog | TaskStatus::Todo)
+                        && bs::is_capture_shell(&next)
+                        && !force
+                    {
+                        tracing::warn!(
+                            target: "amux::board",
+                            marker = "capture_requeue_refused",
+                            card = %next.id,
+                            worker = %next.session.as_deref().unwrap_or("-"),
+                            actor = %actor_name,
+                            from = %next.status,
+                            to = %bs::db_status_spelling(target),
+                            measured = true,
+                            "worked capture envelope refused requeue without a semantic disposition"
+                        );
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::CONFLICT,
+                                json!({
+                                    "error": "captured command requires a disposition before requeue",
+                                    "code": "capture_requeue_requires_disposition",
+                                    "ok": false,
+                                    "blocked": true,
+                                    "measured": true,
+                                    "item": next.id,
+                                    "attempted_status": bs::db_status_spelling(target),
+                                    "preserved_status": next.status,
+                                    "why": "This card is still the auto-captured human command envelope. It was already claimed as active work; putting the unchanged envelope back in a queue loses the command's disposition and makes completed, delegated, and blocked work indistinguishable.",
+                                    "how_to_fix": {
+                                        "not_work": format!("amux board discard {} --outcome-stdin", next.id),
+                                        "one_task": format!("amux board retitle {} \"<standalone task title>\" --desc-stdin", next.id),
+                                        "several_tasks": format!("amux board decompose {} --stdin", next.id),
+                                        "work_finished": "move the envelope to review/done with its outcome and evidence",
+                                        "still_actively_working": "leave it in doing and post status/next_action/unresolved",
+                                        "audited_escape": format!("amux board {} {} --force \"<why the capture itself must be requeued>\"", bs::db_status_spelling(target), next.id),
+                                    },
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
                     // ONE-DOING-PER-SESSION (AMUX-1707 parity). Python's WIP
                     // filters verbatim: archived cards and dormant types
                     // (tripwire/watch) do not hold WIP — both were real
@@ -6468,21 +11692,9 @@ pub async fn patch_item(
                         && !override_doing
                     {
                         if let Some(sess) = next.session.as_deref().filter(|s| !s.is_empty()) {
-                            let holding: Vec<String> = conn
-                                .prepare(
-                                    "SELECT id FROM issues WHERE session = ?1 \
-                                     AND status = 'doing' AND id != ?2 \
-                                     AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-                                     AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-                                     ORDER BY id",
-                                )
-                                .and_then(|mut st| {
-                                    st.query_map(rusqlite::params![sess, next.id], |r| {
-                                        r.get::<_, String>(0)
-                                    })
-                                    .map(|rows| rows.filter_map(Result::ok).collect())
-                                })
-                                .unwrap_or_default();
+                            let holding = crate::runtime_jobs::board_drive::wip_holding_ids(
+                                conn, sess, Some(&next.id),
+                            )?;
                             if !holding.is_empty() {
                                 return finish(
                                     &slot_w,
@@ -6563,6 +11775,165 @@ pub async fn patch_item(
                     let gates = bs::core_gates(&eff_gate, target);
                     let target_raw = bs::status_to_db(target, &next.status);
 
+                    // ACCEPTANCE PREFLIGHT (AMUX-4526, RR-0052). Before this, a card
+                    // could be moved to review or done while a card it depends on
+                    // was still open, or while its own epic children were: nothing
+                    // on this path looked (measured 2026-09-14: 24 of 2469 cards
+                    // closed in 7 days still had an unresolved dependency, 3 epics
+                    // had open children). And every other refusal answers ONE
+                    // criterion per round trip, so a worker learns what is missing
+                    // by failing repeatedly. This lists everything at once, using
+                    // the same resolution rule dispatch uses
+                    // (`bs::dependency_resolved`) and the same evidence verdict the
+                    // done gate below uses. Force stays the audited override.
+                    // Claims must use the same readiness rule as pickup and
+                    // auto-parking. Otherwise a gate ACK returns success, then
+                    // the next tick silently undoes it while the worker runs
+                    // (TubeScience TUBES-2461, 2026-09-17).
+                    if !force && matches!(target, TaskStatus::Doing | TaskStatus::Review | TaskStatus::Done) {
+                        let mut missing: Vec<Value> = Vec::new();
+                        if target == TaskStatus::Doing {
+                            if let Some(reason) = next.blocked_on.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                                missing.push(json!({
+                                    "check": "blocked_on",
+                                    "reason": reason,
+                                    "fix": "resolve the recorded blocker, or clear it with evidence if it is obsolete; keep an independently executable next step on this card",
+                                }));
+                            }
+                        }
+                        for dep in &next.depends_on {
+                            // A dependency that names no card (deleted, or never
+                            // existed) cannot be finished by anyone, so it is
+                            // listed and does not block: refusing would strand
+                            // the card with no truthful move. Dispatch stays
+                            // conservative and does not promote over it.
+                            // TYPE comes back with status, in the one query, and
+                            // the predicate is then evaluated from those two
+                            // values rather than re-read (AMUX-4786). The
+                            // message explaining a refusal and the rule
+                            // producing it now read the SAME row, so they cannot
+                            // describe different cards.
+                            let dep_state: Option<(String, String)> = match conn.query_row(
+                                "SELECT status, COALESCE(type, '') FROM issues WHERE id=?1 AND deleted IS NULL",
+                                [dep],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            ) {
+                                Ok(v) => Some(v),
+                                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                                Err(e) => return Err(e),
+                            };
+                            match dep_state {
+                                None => missing.push(json!({
+                                    "check": "dependency_exists",
+                                    "blocking": target == TaskStatus::Doing,
+                                    "card": dep,
+                                    "fix": format!("{dep} names no card; remove it from depends_on with a reason"),
+                                })),
+                                Some((status, item_type)) if !bs::dependency_is_resolved(&status, &item_type) => {
+                                    // NAMED, not hardcoded. This parenthetical
+                                    // read "code-type work completes at
+                                    // verified" for every dependency, including
+                                    // the ops and blocker cards the same rule
+                                    // covers, so the sentence described a card
+                                    // it had never looked at.
+                                    //
+                                    // A wrong type here is expensive out of
+                                    // proportion to its size, because the two
+                                    // reactions it invites are both wrong and
+                                    // one is destructive: re-type the
+                                    // dependency until the sentence fits, or
+                                    // conclude the board has the wrong type
+                                    // recorded. The `wrong_type?` hint that
+                                    // rides on the same response object
+                                    // actively points at the first.
+                                    //
+                                    // Resolved through `core_item_type`, the
+                                    // same normalisation `dependency_is_resolved`
+                                    // applies, so an unset or unrecognised type
+                                    // is named as what the rule actually treated
+                                    // it as rather than as something a reader
+                                    // would have to look up.
+                                    let named = bs::core_item_type(&item_type).as_str();
+                                    missing.push(json!({
+                                        "check": "dependency_resolved",
+                                        "card": dep,
+                                        "status": status,
+                                        "type": named,
+                                        "fix": format!("finish {dep} ({named} work completes at verified), or remove it from depends_on with a reason if {} does not need it", next.id),
+                                    }))
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                        let open_children: Vec<(String, String)> = if target == TaskStatus::Doing {
+                            // Starting a parent does not claim its children
+                            // are complete. Only its own required inputs gate it.
+                            Vec::new()
+                        } else {
+                            let mut st = conn.prepare(
+                                "SELECT id, status FROM issues WHERE epic=?1 AND deleted IS NULL \
+                                 AND COALESCE(archived,0)=0 \
+                                 AND status NOT IN ('done','verified','discarded','quarantined') \
+                                 ORDER BY created, id",
+                            )?;
+                            let rows = st.query_map([&next.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                            rows.collect::<rusqlite::Result<_>>()?
+                        };
+                        for (child, child_status) in &open_children {
+                            missing.push(json!({
+                                "check": "children_terminal",
+                                "card": child,
+                                "status": child_status,
+                                "fix": format!("finish or discard {child} first; an epic is complete when its children are"),
+                            }));
+                        }
+                        if target == TaskStatus::Done && bs::done_evidence_required(next.session.as_deref()) {
+                            let verdict = bs::evidence_verdict(next.evidence.as_deref().unwrap_or(""));
+                            if verdict != bs::EvidenceVerdict::Ok {
+                                missing.push(json!({
+                                    "check": "evidence",
+                                    "verdict": format!("{verdict:?}"),
+                                    "fix": "name what was run or produced: --evidence with a command, repo path, URL, sha or #PR, or `none: <reason>`",
+                                }));
+                            }
+                        }
+                        let blocking = missing
+                            .iter()
+                            .filter(|m| m["check"] != "evidence" && m["blocking"] != json!(false))
+                            .count();
+                        if blocking > 0 {
+                            tracing::warn!(
+                                target: "amux::board", card = %next.id, to = %target_raw,
+                                caller = %caller_lane, missing = missing.len(), blocking,
+                                measured = true, n_considered = missing.len(),
+                                verdict = "acceptance_checks_failed",
+                                "board: transition refused with the full list of unmet readiness/acceptance checks"
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "acceptance checks failed",
+                                        "code": "acceptance_checks_failed",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "missing": missing,
+                                        "why": if target == TaskStatus::Doing {
+                                            "Doing requires available inputs and no recorded blocker, using the same rule as automatic pickup; resolve or correct the listed prerequisites before claiming so a successful claim is not immediately parked"
+                                        } else {
+                                            "review and done claim the work is complete; a card whose dependency or epic child is still open is not, so every unmet check is listed here in one answer"
+                                        },
+                                        "override": "an explicit, attributed force with a reason still moves it, and is audited",
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
                     // Global done-link constraint (Ethan, 2026-08-17): a card
                     // cannot enter `done` without pointing at the artifact it
                     // produced. It sits ALONGSIDE the ack gate, not inside it, so
@@ -6591,23 +11962,37 @@ pub async fn patch_item(
                         // a reproducible command, but a command is not a
                         // produced asset. Keep the documented honest no-asset
                         // escape, and otherwise require an actual pointer.
-                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
-                            bs::has_asset_link(e)
-                                || (e.trim().to_ascii_lowercase().starts_with("none:")
-                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
-                        });
                         // The explicit artifact registry is the canonical
                         // structured path. Requiring its ref to be duplicated
                         // in prose made a successful `amux board artifact`
                         // write insufficient to close its own task.
-                        let registered_artifact = crate::db::artifact_store::list_for_task(
-                            conn,
-                            &next.id,
-                        )?
-                        .iter()
-                        .any(|a| !a.ref_value.trim().is_empty());
-                        let has_link = bs::has_asset_link(&next.desc)
-                            || next.log.as_deref().is_some_and(bs::has_asset_link)
+                        let registered_artifacts =
+                            crate::db::artifact_store::list_for_task(conn, &next.id)?;
+                        let retired_refs: HashSet<&str> = registered_artifacts
+                            .iter()
+                            .filter(|a| crate::db::artifact_store::is_retired_state(&a.state))
+                            .map(|a| a.ref_value.as_str())
+                            .collect();
+                        let text_has_active_asset = |text: &str| {
+                            bs::asset_refs(text)
+                                .iter()
+                                .any(|reference| !retired_refs.contains(reference.as_str()))
+                        };
+                        // A durable invalid/superseded disposition must apply
+                        // everywhere evidence is consumed, not only in the UI.
+                        // Otherwise the retired ref can still satisfy this
+                        // gate by being repeated in --evidence.
+                        let evidence_names_artifact = next.evidence.as_deref().is_some_and(|e| {
+                            text_has_active_asset(e)
+                                || (e.trim().to_ascii_lowercase().starts_with("none:")
+                                    && bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok)
+                        });
+                        let registered_artifact = registered_artifacts.iter().any(|a| {
+                            !a.ref_value.trim().is_empty()
+                                && !crate::db::artifact_store::is_retired_state(&a.state)
+                        });
+                        let has_link = text_has_active_asset(&next.desc)
+                            || next.log.as_deref().is_some_and(text_has_active_asset)
                             || evidence_names_artifact
                             || registered_artifact;
                         if !has_link {
@@ -6678,25 +12063,36 @@ pub async fn patch_item(
                     // with no artifact anywhere still gets the older, broader
                     // message it has always got, and this narrower one fires
                     // only once that has been satisfied.
+                    // AMUX-4657: `verified` carries the same rule. It bound `done`
+                    // only, so a card moved straight to verified skipped it:
+                    // mixpeek-homepage-claude saw done refuse MHC-844..847 for
+                    // missing evidence, then moved the same cards from backlog to
+                    // verified with evidence still null. Verified is the stronger
+                    // claim, so it cannot need less recorded proof.
                     let evidence_required = !force
-                        && target == TaskStatus::Done
+                        && matches!(target, TaskStatus::Done | TaskStatus::Verified)
                         && bs::done_evidence_required(next.session.as_deref());
                     if evidence_required {
                         let ev = next.evidence.clone().unwrap_or_default();
                         let verdict = bs::evidence_verdict(&ev);
                         if verdict != bs::EvidenceVerdict::Ok {
+                            let to_verified = target == TaskStatus::Verified;
                             let (why, code) = match verdict {
+                                bs::EvidenceVerdict::Missing if to_verified => (
+                                    "This card records nothing that was run or produced, and `verified` says the work holds in production. A card that never passed `done` never met its evidence rule, so verified applies it: name the command, the URL exercised, the screenshot path, or the commit.",
+                                    "verified_requires_evidence",
+                                ),
                                 bs::EvidenceVerdict::Missing => (
                                     "This card records nothing that was run or produced. `done` is where work stops on this board (3302 done against 3631 verified), so closing one has to name the proof: the command, the URL exercised, the screenshot path, the commit.",
                                     "done_requires_evidence",
                                 ),
                                 bs::EvidenceVerdict::NoArtifact => (
                                     "The evidence on this card is prose with nothing in it to check. Name the artifact: a command in backticks, a repo path, a URL, a commit sha, or a #PR.",
-                                    "done_evidence_has_no_artifact",
+                                    if to_verified { "verified_evidence_has_no_artifact" } else { "done_evidence_has_no_artifact" },
                                 ),
                                 bs::EvidenceVerdict::UnexplainedNone => (
                                     "`none:` is the honest answer when a card genuinely produced no artifact, but it needs the reason after it — that text is what makes the escape countable instead of a blind spot.",
-                                    "done_evidence_none_unexplained",
+                                    if to_verified { "verified_evidence_none_unexplained" } else { "done_evidence_none_unexplained" },
                                 ),
                                 bs::EvidenceVerdict::Ok => unreachable!(),
                             };
@@ -6704,8 +12100,9 @@ pub async fn patch_item(
                             // server-rs.log, and the structured `code` splits
                             // these from other 409s in /api/logs/analyze.
                             tracing::warn!(
-                                "done_evidence_gate: blocked {} -> done for session {} (verdict {:?})",
+                                "done_evidence_gate: blocked {} -> {} for session {} (verdict {:?})",
                                 next.id,
+                                bs::db_status_spelling(target),
                                 next.session.as_deref().unwrap_or("-"),
                                 verdict
                             );
@@ -6714,7 +12111,7 @@ pub async fn patch_item(
                                 PatchOut::Refused(
                                     StatusCode::CONFLICT,
                                     json!({
-                                        "error": "done requires evidence of what was run",
+                                        "error": format!("{} requires evidence of what was run", bs::db_status_spelling(target)),
                                         "code": code,
                                         "ok": false,
                                         "blocked": true,
@@ -6735,7 +12132,7 @@ pub async fn patch_item(
                                             &next.id, next.session.as_deref(), &caller_lane,
                                         ),
                                         "how_to_fix": {
-                                            "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
+                                            "cli": format!("amux board {} {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", bs::db_status_spelling(target), next.id),
                                             "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
                                             "accepted": [
                                                 "a command, in backticks or on a `$ ` line",
@@ -6898,6 +12295,66 @@ pub async fn patch_item(
                     // The gate is on the TRANSITION, never on the 445 already
                     // there: a retroactive sweep would be this same guess made
                     // once more, at scale, by the party least able to check it
+                    // A force may bypass a workflow gate with an attributed
+                    // audit trail. It must NOT let a linked peer publish a
+                    // second completion: overlap ownership is work identity,
+                    // not a checklist preference. Migration 0057 repeats this
+                    // predicate for alternate writers; this branch supplies an
+                    // actionable 409 instead of a raw SQLite error.
+                    if matches!(target, TaskStatus::Done | TaskStatus::Verified) {
+                        match overlap_completion_blockers(conn, Some(&next.id), None) {
+                            Ok(blockers) if !blockers.is_empty() => {
+                                let blocker = &blockers[0];
+                                tracing::warn!(
+                                    marker = "board_overlap_completion_refused",
+                                    card = %next.id,
+                                    attempted = %bs::db_status_spelling(target),
+                                    coordination = %blocker.coordination_id,
+                                    owner_card = %blocker.owner_card_id,
+                                    owner_session = %blocker.owner_session,
+                                    "linked non-owner completion refused before an independent Done/Verified declaration"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "overlap reconciliation blocks independent completion",
+                                            "code": "board_overlap_completion_blocked",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "item": next.id,
+                                            "attempted_status": bs::db_status_spelling(target),
+                                            "overlap": blocker,
+                                            "how_to_fix": "Do not force this. Ask the elected owner to record an explicit scope-split or released reconciliation; merged work remains owned by the elected card.",
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    marker = "board_overlap_completion_unmeasured",
+                                    card = %next.id,
+                                    error = %e,
+                                    "completion refused because overlap ownership could not be measured"
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        json!({
+                                            "error": "overlap ownership could not be measured; refusing completion rather than guessing",
+                                            "code": "board_overlap_completion_unmeasured",
+                                            "measured": false,
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                        }
+                    }
                     // (ethos rule 8). They drain by being re-asked.
                     // THE CONTINUATION GATE, on the same door and by the same
                     // shape (AMUX-3946). A card entering `doing` must say what
@@ -7121,6 +12578,29 @@ pub async fn patch_item(
                                 })
                                 .collect();
                             if !missing.is_empty() {
+                                // ASK THE SAME QUESTION THE SIBLING SITE ASKS (AF-586).
+                                //
+                                // This refusal told every caller "the TYPE is wrong, fix the
+                                // type" unconditionally, which is only true when the gate came
+                                // FROM the type. A worker-, group- or column-scoped gate ignores
+                                // the type, so the advice names a lever that cannot move: the
+                                // caller retypes, gets the identical refusal, and is left with
+                                // --force.
+                                //
+                                // Reported by tubescience 2026-09-08, four forced closes in one
+                                // day on a lane whose WORKER-scope done gate is ["Implemented and
+                                // merged", "Tests / lint pass", "Peer reviewed"], applied to
+                                // research and ops cards. GateSource::retype_would_help() exists
+                                // for exactly this question and the other refusal site already
+                                // calls it; this one never did.
+                                //
+                                // Whether those criteria SHOULD apply to a research card is a
+                                // separate decision and still open. This only stops the refusal
+                                // sending the reader after a fix that cannot work.
+                                //
+                                // Bound before the json! because a `match` used as a macro value
+                                // breaks its delimiter parsing.
+                                let retype_hint = retype_hint_for(gate_src.as_ref());
                                 return finish(
                                     &slot_w,
                                     PatchOut::Refused(
@@ -7140,7 +12620,7 @@ pub async fn patch_item(
                                                 "or_gate_ack": true,
                                                 "or_force": "true (explicit bypass; logged)",
                                                 "contract": format!("GET /api/board/contract?card={} (the RESOLVED gate for this card — the bare contract lists only type defaults, AF-112)", next.id),
-                                                "wrong_type?": "If these criteria don't fit the work, the TYPE is wrong — fix the type, not the truth.",
+                                                "wrong_type?": retype_hint,
                                             },
                                         }),
                                     ),
@@ -7256,6 +12736,11 @@ pub async fn patch_item(
                         }
                     }
 
+                    if target == TaskStatus::NeedsYou && !bs::approval_type_allowed(next.session.as_deref(), next.ask_type.as_deref().unwrap_or("")) {
+                        tracing::warn!(card=%next.id,verdict="approval_category_refused","needsyou is outside the standing authorization policy");
+                        return finish(&slot_w,PatchOut::Refused(StatusCode::CONFLICT,json!({"error":"needsyou is reserved for the configured authorization categories","code":"needsyou_outside_approval_policy","allowed":bs::approval_types(next.session.as_deref()),"how_to_fix":"Continue ordinary decisions; record capability failures as operational blockers with an attempted remedy."})),no_write());
+                    }
+
                     // A GATE THAT SAYS "NAME THEM" MUST COLLECT THE NAME (AF-160).
                     //
                     // Acking the criterion asserts a peer reviewed it. Nothing
@@ -7342,6 +12827,93 @@ pub async fn patch_item(
                         }
                     }
 
+                    // A GATE THAT SAYS THE PEER VERIFIED IT THEMSELVES MUST BE
+                    // ACTED ON BY THE PEER (AF-345).
+                    //
+                    // AF-160, just above, fixed the adjacent criterion: a
+                    // reviewer must be named and cannot be the card's own
+                    // owner. It left this one alone on purpose -- naming
+                    // someone and that person having actually re-derived the
+                    // claim are different facts. Nothing before this point
+                    // stops the OWNER from setting `reviewer: <peer>`
+                    // themselves and then, still acting as the owner, checking
+                    // off "that peer verified it themselves" on the peer's
+                    // behalf -- an assertion about another agent's internal
+                    // process the owner cannot know (ethos rule 3), which is
+                    // exactly the gap this criterion exists to close.
+                    //
+                    // The fix is ONE primitive, not two. AF-160's own framing
+                    // -- "the peer signing off IS the one acting" -- is
+                    // enforced here rather than merely assumed: the CALLER
+                    // performing this transition must equal the recorded
+                    // reviewer. EVIDENCE is deliberately NOT re-checked here:
+                    // AF-321's evidence_verdict already runs, unconditionally,
+                    // on every done/verified transition (`done_evidence_gate`,
+                    // above), so requiring it again here would be the
+                    // redundant-coverage shape ethos rule 7 warns about --
+                    // confirmed live, not assumed: forcing this block's own
+                    // evidence check to always pass left the test suite fully
+                    // green, because the earlier, general check was already
+                    // catching every case it covered. Where the general check
+                    // is deliberately disabled for a session
+                    // (AMUX_DONE_EVIDENCE_REQUIRED=0), this criterion is
+                    // narrower than it looks: the caller must still be the
+                    // reviewer, but nothing here re-demands evidence that
+                    // session opted out of everywhere else.
+                    if !force && eff_gate.iter().any(|c| criterion_wants_peer_verification(c)) {
+                        let reviewer = next.reviewer.as_deref().unwrap_or("").trim().to_string();
+                        let bad = if reviewer.is_empty() {
+                            Some("no reviewer is recorded on this card".to_string())
+                        } else if caller_lane.is_empty() || !caller_lane.eq_ignore_ascii_case(&reviewer) {
+                            Some(format!(
+                                "the caller acting on this transition ({}) is not the recorded \
+                                 reviewer ({reviewer}), so \"verified it themselves\" would be the \
+                                 owner asserting it on the reviewer's behalf",
+                                if caller_lane.is_empty() { "unattributed" } else { &caller_lane }
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some(why) = bad {
+                            tracing::warn!(
+                                "verified_requires_peer_actor: blocked {} -> verified for session {} ({why})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-")
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": format!("gate asks the peer to verify it themselves, and {why}"),
+                                        "code": "verified_requires_peer_actor",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": row.id,
+                                        "attempted_status": target_raw,
+                                        "criterion": eff_gate.iter().find(|c| criterion_wants_peer_verification(c)),
+                                        "reviewer": next.reviewer,
+                                        "caller": if caller_lane.is_empty() { None } else { Some(caller_lane.clone()) },
+                                        "why": "acking \"verified it themselves\" is an assertion about \
+                                                another agent's internal process the owner cannot know \
+                                                (AF-345); it is checkable only when the reviewer performs \
+                                                the transition themselves",
+                                        "how_to_fix": {
+                                            "cli": format!(
+                                                "as the reviewer session: amux board {} {} --checked ...",
+                                                target_raw, row.id
+                                            ),
+                                            "rule": "the caller performing this transition must be the \
+                                                     recorded reviewer, not the card's owner",
+                                            "force": "true with a reason (explicit bypass; logged and attributed)",
+                                        },
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
                     // Discharge the gate HERE, with core's OWN predicate
                     // (`why_blocked` is the same function `apply_transition`'s
                     // gate_check runs — the view shares the predicate of the
@@ -7389,7 +12961,17 @@ pub async fn patch_item(
                             })
                     };
 
-                    match apply_transition(&task, tx, &actor, &[], now) {
+                    let transition_actor = match (&caller_wid, &tx) {
+                        (Some(wid), t)
+                            if bs::lease_enforcement_enabled()
+                                && !matches!(t, BoardTransition::Force { .. }) =>
+                        {
+                            Actor::Worker { id: wid.clone() }
+                        }
+                        _ => actor.clone(),
+                    };
+
+                    match apply_transition(&task, tx, &transition_actor, &[], now) {
                         Ok(updated) => {
                             let from_raw = next.status.clone();
                             let stamp = hhmm();
@@ -7423,9 +13005,66 @@ pub async fn patch_item(
                             // the permissive case the invisible case.
                             next.log =
                                 Some(bs::append_log(next.log.as_deref(), &stamp, &authz_line));
+                            // A REVIEW HANDOFF NOBODY CAN RECEIVE, ON THE CARD
+                            // (AMUX-4662).
+                            //
+                            // `reviewer_unreachable_reason` has answered this
+                            // correctly since AMUX-3771, and the response says so
+                            // in `reviewer_notify_reason`. A response field lives
+                            // as long as the shell scrollback, and this card's own
+                            // scenario is discovering it DAYS later, when the card
+                            // is the only thing left to read. Measured
+                            // 2026-09-15: four cards handed to paused
+                            // amux-testing over five hours, and their logs say
+                            // `reviewer -> amux-testing` and `todo -> review`
+                            // with no trace of the refusal.
+                            //
+                            // Reported, never refused. A reviewer link keeps the
+                            // card on the author's own board, so it is not a
+                            // placement on the reviewer's board the way
+                            // `request_to` is, and the auto-pickup nudge points
+                            // every lane at `amux board reviewer <ID> <lane>` as
+                            // the exit that works. AMUX-4566 governs DELIVERY,
+                            // which is already refused; what was missing is that
+                            // the author is told.
+                            if target_raw == "review" {
+                                let reviewer =
+                                    next.reviewer.as_deref().unwrap_or("").trim().to_string();
+                                let owner =
+                                    next.session.as_deref().unwrap_or("").trim().to_string();
+                                if !reviewer.is_empty() {
+                                    if let Some(why) =
+                                        crate::api::session_verbs::reviewer_unreachable_reason(
+                                            &owner, &reviewer,
+                                        )
+                                    {
+                                        next.log = Some(bs::append_log(
+                                            next.log.as_deref(),
+                                            &stamp,
+                                            &format!(
+                                                "REVIEWER NOT REACHED: {reviewer} was named but \
+                                                 cannot be told. {why}"
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                             // Gap 4: waiting_on side effects before status change.
                             crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                             next.status = target_raw.clone();
+                            // RR-0052: mirror apply_common's lease set/clear on the
+                            // PATCH write path so the driver and PATCH never disagree.
+                            let lease_holder: Option<String> = if caller_lane.is_empty() {
+                                next.session.clone()
+                            } else {
+                                Some(caller_lane.clone())
+                            };
+                            crate::db::advance::apply_lease_transition(
+                                &mut next,
+                                &target_raw,
+                                lease_holder.as_deref(),
+                                now.timestamp(),
+                            );
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
 
                             // REVISIT DATE ON THE TWO STATUSES NOTHING DRAINS
@@ -7464,6 +13103,12 @@ pub async fn patch_item(
                             status_event = Some((from_raw, target_raw));
                             changed.push("status".into());
                         }
+                        Err(TransitionError::NoOp) if rechecking_verified && !force => {
+                            next.log = Some(bs::append_log(next.log.as_deref(), &hhmm(),
+                                &format!("{actor_name}: verified gate rechecked; {}", authz_line)));
+                            next.last_verified_at = Some(now_secs());
+                            changed.push("last_verified_at".into());
+                        }
                         Err(TransitionError::NoOp) => { /* nothing to do */ }
                         Err(TransitionError::GateBlocked { blocked }) => {
                             return finish(
@@ -7487,6 +13132,18 @@ pub async fn patch_item(
                             body["blocked"] = json!(true);
                             body["attempted_status"] = json!(target_raw);
                             body["item"] = json!(row.id);
+                            // AF-460: the remedy ("restore it first") was exactly
+                            // right and reached NOWHERE the workaround was
+                            // documented -- a caller had to already know
+                            // `amux board unarchive` existed. Named here, once,
+                            // in the body every caller of this refusal already
+                            // reads.
+                            if matches!(e, TransitionError::ArchivedTaskImmutable) {
+                                body["how_to_fix"] = json!(format!(
+                                    "amux board unarchive {} (or PATCH archived:false), then apply {target_raw} as usual",
+                                    row.id
+                                ));
+                            }
                             return finish(
                                 &slot_w,
                                 PatchOut::Refused(StatusCode::CONFLICT, body),
@@ -7500,10 +13157,27 @@ pub async fn patch_item(
             if changed.is_empty() {
                 // Invariant 37: nothing changed -> applied:false, rev/version
                 // untouched, unknown keys named.
+                //
+                // AMUX-4860: THE NO-OP ARM DISCLOSES TOO, and it is the arm
+                // that needs it most. Asking for `todo` on an isolated lane
+                // whose card is ALREADY `backlog` adjusts the target, finds
+                // nothing left to change, and lands here. Without this the
+                // caller asked for todo, got backlog, and the reply said
+                // `applied: false` with no reason. That is the silent
+                // adjustment the Applied arm's disclosure exists to prevent,
+                // reappearing on the path where nothing moved. Found by
+                // exercising the live build rather than by a test, which is
+                // why the guard below now covers this arm as well.
+                let mut body = detail_body(&row);
+                note_status_adjustment(
+                    &mut body,
+                    target_adjusted_from,
+                    next.session.as_deref().unwrap_or(""),
+                );
                 return finish(
                     &slot_w,
                     PatchOut::Noop {
-                        body: detail_body(&row),
+                        body,
                         ignored,
                         all_ignored,
                     },
@@ -7681,6 +13355,48 @@ pub async fn patch_item(
             }
             next.updated = now_secs();
             bs::save_patched(conn, &mut next)?;
+            // RR-0052 Invariant 1: the PATCH door is the other lease choke point.
+            // After the save, so a refusal above can never leave an attempt behind.
+            crate::db::attempts::record_lease_change(
+                conn,
+                &next.id,
+                row.lease_owner.as_deref(),
+                next.lease_owner.as_deref(),
+                next.lease_generation,
+                &next.status,
+                &actor_name,
+                body_str(&map, "reason").as_deref(),
+                now_secs(),
+            )?;
+            if next.status == "verified" && (row.status != "verified" || map.get("reverify").and_then(Value::as_bool) == Some(true)) && !map.get("force").and_then(Value::as_bool).unwrap_or(false) {
+                let groups = next.session.as_deref().map(crate::api::session_verbs::lane_groups).unwrap_or_default();
+                let trail = bs::effective_gate_trail(conn, &next, TaskStatus::Verified, &groups);
+                // Persist exactly the gate that passed normal transition validation.
+                // This is an attributed acknowledgement, never a fabricated harness run.
+                crate::db::verification_store::insert(conn, &crate::db::verification_store::VerificationRow {
+                    id: format!("VER-{}", ulid::Ulid::new().to_string().to_lowercase()),
+                    task_id: next.id.clone(),
+                    verifier: json!({"type":"gate_acknowledgement","source":trail.source.token(),"scope":trail.source.scope()}).to_string(),
+                    criteria: json!(trail.criteria).to_string(),
+                    evidence: json!({"evidence":next.evidence,"reviewer":next.reviewer}).to_string(),
+                    verdict: "acknowledged".into(), reason: None, run_detail: None,
+                    actor: actor_name.clone(), created_at: now_secs(), criteria_version: 0,
+                    harness_version: None, duration_ms: 0,
+                })?;
+                tracing::info!(target: "amux::verification", card = %next.id, actor = %actor_name,
+                    criteria_count = trail.criteria.len(), "verified gate acknowledgement recorded");
+            }
+            if let Some((from, to)) = &status_event {
+                if to == "doing" {
+                    ensure_owner_doing_claim(
+                        conn,
+                        &next,
+                        &actor_name,
+                        "board-patch",
+                        from,
+                    )?;
+                }
+            }
             // AF-137 / AMUX-3464: retiring an auto-filed REPORT re-arms its
             // detector. The filing dedupe is a PERMANENT session_events idem
             // row ("a restart must not refile"), so a discarded report whose
@@ -7747,6 +13463,34 @@ pub async fn patch_item(
                              recurrence files fresh"
                         );
                     }
+                }
+            }
+            // AMUX-4590: the tag door, same predicate as the status door
+            // (`ask_required` above, `needsyou_tag_refusal_body`). A
+            // `tags`-only PATCH never enters the `if target_raw != next.status`
+            // block that gate lives in, so it reached this write with zero
+            // validation. `next.status` is final here whether or not this same
+            // PATCH also carried a status change, so this fires exactly once,
+            // after both are settled, and never double-gates the sanctioned
+            // status+tag+ask PATCH that already passed `ask_required` above.
+            if let Some(tags) = &tags_change {
+                let sets_needs_you =
+                    tags.iter().any(|t| t.to_ascii_lowercase().starts_with("needs:you"));
+                let ends_as_needsyou = bs::parse_status(&next.status) == Some(TaskStatus::NeedsYou);
+                let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
+                if sets_needs_you
+                    && !ends_as_needsyou
+                    && !force
+                    && bs::needsyou_ask_required(next.session.as_deref())
+                {
+                    return finish(
+                        &slot_w,
+                        PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            needsyou_tag_refusal_body(&next.id, next.session.as_deref(), &next.status),
+                        ),
+                        no_write(),
+                    );
                 }
             }
             if let Some(tags) = &tags_change {
@@ -7875,6 +13619,16 @@ pub async fn patch_item(
                     "board note appended to an ARCHIVED card — write succeeded, nobody will see it"
                 );
             }
+            // AMUX-4860. The status the caller asked for is not the status it
+            // got, so the reply says so. Same disclosure as the create path,
+            // and for the same reason: a write that silently becomes something
+            // else is the AMUX-4776 trap, and a caller reading only the status
+            // code cannot tell. The code stays 200 because the patch applied.
+            note_status_adjustment(
+                &mut body,
+                target_adjusted_from,
+                next.session.as_deref().unwrap_or(""),
+            );
             finish(
                 &slot_w,
                 PatchOut::Applied {
@@ -7941,6 +13695,10 @@ pub async fn patch_item(
             // that does not compute this at all, and a caller cannot tell those
             // apart if it is omitted when empty (ethos rule 4).
             let dropped = discarded_on_refusal;
+            if dropped.iter().any(|key| key == "archive_outcome") {
+                tracing::warn!(target: "amux::board", verdict="archive_outcome_refused", item=%id,
+                    measured=true, n_considered=1, "archive outcome was not applied; the entire PATCH was refused");
+            }
             if !dropped.is_empty() {
                 body["discarded_note"] = json!(format!(
                     "the transition was refused, so the WHOLE body was discarded — \
@@ -8260,6 +14018,7 @@ pub async fn patch_item(
                     "attempted": dispatch.attempted,
                     "queued": dispatch.queued,
                     "refused": dispatch.refused,
+                    "suppressed": dispatch.suppressed,
                 });
                 if let Ok(conn) = state.store.read() {
                     if let Ok(Some(latest)) = bs::get_issue(&conn, &id) {
@@ -8275,7 +14034,7 @@ pub async fn patch_item(
                     && !session.is_empty()
                 {
                     let st = state.clone();
-                    tokio::spawn(async move {
+                    crate::db::interactions::spawn(async move {
                         let _ = crate::runtime_jobs::board_drive::drive_session(&st, &session).await;
                         crate::api::session_verbs::steer_deliver_for_session(&st, &session).await;
                     });
@@ -8283,6 +14042,1065 @@ pub async fn patch_item(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_requeue_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("capture-requeue.db"))
+                .expect("open store"),
+        );
+        // Store owns live SQLite handles after this helper returns.
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "capture-requeue-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed_capture(store: &crate::db::SharedStore) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title: "Clear out this worker's board then grind it all out".into(),
+                        desc: "**Prompt:** clear out this worker's board then grind it all out"
+                            .into(),
+                        status: "doing".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "chore".into(),
+                        creator: "amux".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("capture".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_788_955_507,
+                )?;
+                *slot_w.lock().expect("slot") = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .expect("seed capture");
+        let id = slot.lock().expect("slot").clone().expect("capture id");
+        id
+    }
+
+    fn worker_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-session", HeaderValue::from_static("mvs-research"));
+        headers
+    }
+
+    async fn patch(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response = patch_item(
+            State(state.clone()),
+            Path(id.to_string()),
+            worker_headers(),
+            Json(body),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    /// MR-174 is the production specimen: status-update claimed the captured
+    /// command, the lane registered its report asset, then PATCH moved the same
+    /// untouched envelope doing -> backlog. The board faithfully rendered that
+    /// last mutation, so it looked as though no work had happened and the fresh
+    /// trigger parked it outside the drain loop.
+    #[tokio::test]
+    async fn a_worked_capture_envelope_cannot_disappear_back_into_a_queue() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+
+        for target in ["backlog", "todo"] {
+            let (status, body) = patch(&state, &id, json!({"status": target})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
+            assert_eq!(body["code"], "capture_requeue_requires_disposition");
+            assert_eq!(body["preserved_status"], "doing");
+            assert_eq!(body["attempted_status"], target);
+            assert_eq!(
+                bs::get_issue(&store.read().expect("read"), &id)
+                    .expect("query")
+                    .expect("card")
+                    .status,
+                "doing",
+                "a refusal must not mutate the card"
+            );
+        }
+    }
+
+    /// The guard requires the model to make the semantic decision; it does not
+    /// ban parking. Once the same atomic PATCH replaces the prompt envelope with
+    /// a standalone task, the normal transition is available again.
+    #[tokio::test]
+    async fn reshaping_one_real_task_preserves_the_normal_backlog_exit() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let desc = "Re-run every MVS verification job whose named prerequisite has cleared; record each result and produced artifact.";
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "desc": desc,
+                "status": "backlog",
+                "source_ref": "Resume when MR-157 supplies the staging experiment path"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["status"], "backlog");
+        assert_eq!(body["desc"], desc);
+    }
+
+    /// The existing audited escape stays real. This is intentionally a
+    /// positive control: deleting force support would make the primary refusal
+    /// test pass while creating a state with no truthful exit.
+    #[tokio::test]
+    async fn an_attributed_reasoned_force_can_requeue_the_envelope() {
+        let (state, store) = fixture();
+        let id = seed_capture(&store);
+        let (status, body) = patch(
+            &state,
+            &id,
+            json!({
+                "status": "backlog",
+                "force": true,
+                "reason": "the source message was revoked before its semantic disposition could be recorded"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "backlog");
+        let log = body["log"].as_str().unwrap_or_default();
+        assert!(log.contains("force by mvs-research: doing->backlog reason="), "{log}");
+        assert!(log.contains("source message was revoked"), "{log}");
+    }
+}
+
+#[cfg(test)]
+mod af701_archive_guard_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("af701-archive-guard.db")).expect("open store"),
+        );
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "af701-archive-guard-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed(store: &crate::db::SharedStore, session: &str, status: &str) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let session = session.to_string();
+        let status = status.to_string();
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title: "AF-701 fixture card".into(),
+                        desc: "fixture".into(),
+                        status,
+                        session: Some(session),
+                        item_type: "chore".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: Some("decision".into()),
+                        ask_question: Some("is this ok?".into()),
+                        ask_unblocks: Some("the fixture proceeds".into()),
+                        ask_actor: Some("ethan".into()),
+                        source: Some("test".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_700_000_000,
+                )?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .expect("seed");
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    fn owner_headers(session: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-session", HeaderValue::from_str(session).unwrap());
+        headers
+    }
+
+    fn local_member_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-local-member-verified", HeaderValue::from_static("1"));
+        headers
+    }
+
+    async fn patch_as(state: &AppState, id: &str, headers: HeaderMap, body: Value) -> (StatusCode, Value) {
+        let response = patch_item(State(state.clone()), Path(id.to_string()), headers, Json(body)).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    fn current(store: &crate::db::SharedStore, id: &str) -> bs::IssueRow {
+        bs::get_issue(&store.read().expect("read"), id)
+            .expect("query")
+            .expect("card")
+    }
+
+    // ---- ask (b): the cross-lane guard must not exempt an unnamed caller ----
+
+    #[tokio::test]
+    async fn an_anonymous_caller_cannot_archive_a_named_owners_card() {
+        let (state, store) = fixture();
+        let id = seed(&store, "some-lane", "todo");
+        let (status, body) =
+            patch_as(&state, &id, HeaderMap::new(), json!({"archived": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "cross-lane destruction requires authorized_by");
+        assert_eq!(current(&store, &id).archived, 0, "a refusal must not mutate the card");
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_caller_can_archive_with_authorized_by() {
+        let (state, store) = fixture();
+        let id = seed(&store, "some-lane", "todo");
+        let (status, _body) = patch_as(
+            &state,
+            &id,
+            HeaderMap::new(),
+            json!({"archived": true, "authorized_by": "ethan", "archive_outcome": "no longer needed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current(&store, &id).archived, 1);
+    }
+
+    #[tokio::test]
+    async fn a_verified_local_member_can_still_archive_any_lanes_card_unauthorized() {
+        // Regression control: the human-from-the-dashboard exemption must
+        // survive closing the anonymous hole, or archiving breaks for Ethan.
+        let (state, store) = fixture();
+        let id = seed(&store, "some-lane", "todo");
+        let (status, _body) = patch_as(
+            &state,
+            &id,
+            local_member_headers(),
+            json!({"archived": true, "archive_outcome": "no longer needed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current(&store, &id).archived, 1);
+    }
+
+    #[tokio::test]
+    async fn a_named_caller_archiving_their_own_card_needs_no_authorization() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "todo");
+        let (status, _body) = patch_as(
+            &state,
+            &id,
+            owner_headers("mvs-research"),
+            json!({"archived": true, "archive_outcome": "no longer needed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current(&store, &id).archived, 1);
+    }
+
+    #[tokio::test]
+    async fn a_named_caller_archiving_a_different_lanes_card_is_still_refused() {
+        let (state, store) = fixture();
+        let id = seed(&store, "some-other-lane", "todo");
+        let (status, body) =
+            patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(current(&store, &id).archived, 0);
+    }
+
+    // ---- ask (a): archiving a needsyou card requires an outcome ----
+
+    #[tokio::test]
+    async fn archiving_a_needsyou_card_is_refused_without_an_outcome() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "needsyou");
+        let (status, body) =
+            patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "archiving a non-terminal card requires an outcome");
+        let row = current(&store, &id);
+        assert_eq!(row.archived, 0, "a refusal must not mutate the card");
+        assert_eq!(row.status, "needsyou");
+    }
+
+    #[tokio::test]
+    async fn archiving_a_needsyou_card_succeeds_with_archive_outcome() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "needsyou");
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            owner_headers("mvs-research"),
+            json!({"archived": true, "archive_outcome": "answered informally, no longer needed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(row.archived, 1);
+        assert_eq!(row.status, "needsyou", "the outcome does not itself change status");
+        assert!(
+            row.log.as_deref().unwrap_or_default().contains("archive_outcome: answered informally"),
+            "{:?}",
+            row.log
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_outcome_validation_uses_the_archive_flags_existing_coercion() {
+        let (state, store) = fixture();
+        for flag in [json!(true), json!(1), json!("1"), json!("true"), json!("TRUE"), json!(" yes "), json!("ON")] {
+            let id = seed(&store, "mvs-research", "done");
+            let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"),
+                json!({"archived":flag, "archive_outcome":"Exact compatibility reason"})).await;
+            assert_eq!(status, StatusCode::OK, "flag={flag}: {body}");
+            let row = current(&store, &id);
+            assert_eq!(row.archived, 1);
+            assert!(row.log.as_deref().unwrap_or_default().contains("archive_outcome: Exact compatibility reason"));
+        }
+        for flag in [json!(false), json!(0), json!("false"), json!("off"), json!(null), json!({}), json!([]), json!(2)] {
+            let id = seed(&store, "mvs-research", "done");
+            let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"),
+                json!({"archived":flag, "archive_outcome":"Must not be applied"})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "flag={flag}: {body}");
+            assert_eq!(current(&store, &id).archived, 0);
+            assert!(body["discarded"].as_array().unwrap().contains(&json!("archive_outcome")));
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_outcome_without_an_archive_is_explicitly_refused() {
+        let (state, store) = fixture();
+        for input in [json!({"archive_outcome":"must not vanish"}), json!({"archived":true,"archive_outcome":17})] {
+            let id = seed(&store, "mvs-research", "done");
+            let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"), input).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["discarded"].as_array().unwrap().contains(&json!("archive_outcome")), "{body}");
+            assert_eq!(current(&store, &id).archived, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_outcome_on_an_already_archived_card_is_not_silently_lost() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "done");
+        let input = json!({"archived":true,"archive_outcome":"original reason"});
+        let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"), input.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived":true,"archive_outcome":"different reason"})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let row = current(&store, &id);
+        assert!(row.log.as_deref().unwrap().contains("archive_outcome: original reason"));
+        assert!(!row.log.as_deref().unwrap().contains("different reason"));
+    }
+
+    #[tokio::test]
+    async fn a_combined_archive_and_status_change_in_one_request_is_still_refused_without_an_outcome() {
+        // Tried making this combination the escape hatch first; it cannot work
+        // (see the comment on the gate in patch_item), so this pins that a
+        // combined request gets THIS gate's refusal rather than silently
+        // archiving, silently changing status, or hitting the unrelated
+        // ArchivedTaskImmutable error with no mention of needsyou at all.
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "needsyou");
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            owner_headers("mvs-research"),
+            json!({"archived": true, "status": "discarded"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "archiving a non-terminal card requires an outcome");
+        let row = current(&store, &id);
+        assert_eq!(row.archived, 0);
+        assert_eq!(row.status, "needsyou");
+    }
+
+    #[tokio::test]
+    async fn the_two_step_path_still_works_status_change_then_archive() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "needsyou");
+        let (s1, b1) =
+            patch_as(&state, &id, owner_headers("mvs-research"), json!({"status": "discarded"}))
+                .await;
+        assert_eq!(s1, StatusCode::OK, "{b1}");
+        let (s2, b2) =
+            patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived": true})).await;
+        assert_eq!(s2, StatusCode::OK, "{b2}");
+        let row = current(&store, &id);
+        assert_eq!(row.archived, 1);
+        assert_eq!(row.status, "discarded");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_card_can_still_be_archived_with_no_outcome() {
+        // CONTROL: a card that is ALREADY terminal (done/verified/discarded)
+        // must be unaffected by this gate, or the gate blocks the ordinary
+        // "archive what's finished" case it is not meant to touch.
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "done");
+        let (status, body) =
+            patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived": true})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(current(&store, &id).archived, 1);
+    }
+
+    #[tokio::test]
+    async fn archiving_a_non_terminal_non_needsyou_card_is_also_refused_without_an_outcome() {
+        // AF-712: the needsyou-only gate let every OTHER non-terminal status
+        // (todo/doing/backlog/blocked/review) accumulate archived+non-terminal
+        // silently — 885 such cards measured fleet-wide. The gate generalizes
+        // to any non-terminal status, not just needsyou.
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "backlog");
+        let (status, body) =
+            patch_as(&state, &id, owner_headers("mvs-research"), json!({"archived": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "archiving a non-terminal card requires an outcome");
+        let row = current(&store, &id);
+        assert_eq!(row.archived, 0, "a refusal must not mutate the card");
+        assert_eq!(row.status, "backlog");
+    }
+
+    #[tokio::test]
+    async fn archiving_a_non_terminal_non_needsyou_card_succeeds_with_archive_outcome() {
+        let (state, store) = fixture();
+        let id = seed(&store, "mvs-research", "doing");
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            owner_headers("mvs-research"),
+            json!({"archived": true, "archive_outcome": "superseded by a later card"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["ignored_fields"].as_array().is_none_or(|fields| !fields.contains(&json!("archive_outcome"))), "persisted outcome must not be reported ignored: {body}");
+        let row = current(&store, &id);
+        assert_eq!(row.archived, 1);
+        assert_eq!(row.status, "doing", "the outcome does not itself change status");
+        assert!(row.log.as_deref().unwrap_or_default().contains("mvs-research: archive_outcome: superseded by a later card"), "exact attributed outcome must survive readback: {:?}", row.log);
+    }
+}
+
+#[cfg(test)]
+mod af711_acceptance_criteria_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("af711-acceptance-criteria.db"))
+                .expect("open store"),
+        );
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "af711-acceptance-criteria-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed(store: &crate::db::SharedStore, acceptance_criteria: Option<&str>) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let acceptance_criteria = acceptance_criteria.map(str::to_string);
+        store
+            .write(move |conn| {
+                let mut row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title: "AF-711 fixture card".into(),
+                        desc: "fixture".into(),
+                        status: "doing".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "code".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("test".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_700_000_000,
+                )?;
+                row.acceptance_criteria = acceptance_criteria;
+                bs::save_patched(conn, &mut row)?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed");
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    async fn patch_as(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response =
+            patch_item(State(state.clone()), Path(id.to_string()), HeaderMap::new(), Json(body))
+                .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    fn current(store: &crate::db::SharedStore, id: &str) -> bs::IssueRow {
+        bs::get_issue(&store.read().expect("read"), id).expect("query").expect("card")
+    }
+
+    #[tokio::test]
+    async fn an_array_patch_stores_and_reads_back_the_array_instead_of_clearing_it() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            json!({"acceptance_criteria": ["first condition", "second condition"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["acceptance_criteria"],
+            json!(["first condition", "second condition"]),
+            "the PATCH response must echo the array back, not null: {body}"
+        );
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["acceptance_criteria"],
+            json!(["first condition", "second condition"]),
+            "a subsequent read must still show the array, not a silently cleared field"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_string_patch_reads_back_the_identical_string() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) =
+            patch_as(&state, &id, json!({"acceptance_criteria": "a single plain-text condition"}))
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["acceptance_criteria"],
+            json!("a single plain-text condition"),
+            "a plain string must read back as the identical string, not null: {body}"
+        );
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["acceptance_criteria"],
+            json!("a single plain-text condition")
+        );
+    }
+
+    /// The real-world shape both incidents actually took: mixpeek-general's
+    /// three lost cards all cleared acceptance_criteria in a PATCH that ALSO
+    /// touched other fields in the same call, not an acceptance_criteria-only
+    /// body.
+    #[tokio::test]
+    async fn a_mixed_field_patch_does_not_lose_acceptance_criteria() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            json!({
+                "acceptance_criteria": ["survives a mixed-field patch"],
+                "next_action": "keep going",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["acceptance_criteria"], json!(["survives a mixed-field patch"]));
+        assert_eq!(body["next_action"], json!("keep going"));
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["acceptance_criteria"],
+            json!(["survives a mixed-field patch"])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_shape_is_rejected_and_does_not_clear_an_existing_value() {
+        let (state, store) = fixture();
+        let id = seed(&store, Some(&serde_json::to_string(&["already set"]).unwrap()));
+        let (status, body) = patch_as(&state, &id, json!({"acceptance_criteria": 5})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["acceptance_criteria"],
+            json!(["already set"]),
+            "a rejected write must never silently clear the existing value: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_array_with_a_non_string_entry_is_rejected_and_does_not_clear_an_existing_value() {
+        let (state, store) = fixture();
+        let id = seed(&store, Some(&serde_json::to_string(&["already set"]).unwrap()));
+        let (status, body) =
+            patch_as(&state, &id, json!({"acceptance_criteria": ["fine", 5]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(row.snapshot()["acceptance_criteria"], json!(["already set"]));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_null_still_clears_it() {
+        let (state, store) = fixture();
+        let id = seed(&store, Some(&serde_json::to_string(&["already set"]).unwrap()));
+        let (status, body) = patch_as(&state, &id, json!({"acceptance_criteria": null})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(row.acceptance_criteria, None);
+    }
+
+    /// AF-711's second, distinct bug: legacy content stored as a plain
+    /// (non-JSON-encoded) string by the old buggy write path must still be
+    /// VISIBLE on read — not silently substituted with null just because it
+    /// does not parse as JSON.
+    #[tokio::test]
+    async fn legacy_non_json_content_reads_back_as_the_raw_string_not_null() {
+        let (_state, store) = fixture();
+        let id = seed(&store, Some("a plain string stored before this fix, not JSON-encoded"));
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["acceptance_criteria"],
+            json!("a plain string stored before this fix, not JSON-encoded"),
+            "legacy non-JSON content must not read back as null"
+        );
+    }
+}
+
+/// AF-930. Same defect AF-711 fixed for `acceptance_criteria`, on
+/// `waiting_on`: a PATCH carrying the field's own documented JSON-object
+/// shape was silently treated as an explicit clear.
+#[cfg(test)]
+mod af930_waiting_on_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("af930-waiting-on.db")).expect("open store"),
+        );
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "af930-waiting-on-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed(store: &crate::db::SharedStore, waiting_on: Option<&str>) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let waiting_on = waiting_on.map(str::to_string);
+        store
+            .write(move |conn| {
+                let mut row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title: "AF-930 fixture card".into(),
+                        desc: "fixture".into(),
+                        status: "needsyou".into(),
+                        session: Some("mvs-research".into()),
+                        item_type: "code".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("test".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_700_000_000,
+                )?;
+                row.waiting_on = waiting_on;
+                bs::save_patched(conn, &mut row)?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed");
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    async fn patch_as(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response =
+            patch_item(State(state.clone()), Path(id.to_string()), HeaderMap::new(), Json(body))
+                .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    fn current(store: &crate::db::SharedStore, id: &str) -> bs::IssueRow {
+        bs::get_issue(&store.read().expect("read"), id).expect("query").expect("card")
+    }
+
+    /// The exact real-world shape: PATCHing the field's own documented
+    /// object, not an array or a plain string.
+    #[tokio::test]
+    async fn an_object_patch_stores_and_reads_back_the_object_instead_of_clearing_it() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let ask = json!({
+            "actor": "Ethan",
+            "type": "decision",
+            "question": "is this ok?",
+            "unblocks": "either answer moves it",
+        });
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": ask})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["waiting_on"], ask,
+            "the PATCH response must echo the object back, not null: {body}"
+        );
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["waiting_on"], ask,
+            "a subsequent read must still show the object, not a silently cleared field"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_string_patch_reads_back_the_identical_string() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) =
+            patch_as(&state, &id, json!({"waiting_on": "waiting on infra to add a label"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["waiting_on"],
+            json!("waiting on infra to add a label"),
+            "a plain string must read back as the identical string, not null: {body}"
+        );
+        let row = current(&store, &id);
+        assert_eq!(row.snapshot()["waiting_on"], json!("waiting on infra to add a label"));
+    }
+
+    /// The real incident shape: a PATCH that also touches an unrelated field
+    /// in the same call must not lose waiting_on either.
+    #[tokio::test]
+    async fn a_mixed_field_patch_does_not_lose_waiting_on() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let ask = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let (status, body) = patch_as(
+            &state,
+            &id,
+            json!({"waiting_on": ask, "next_action": "keep going"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["waiting_on"], ask);
+        assert_eq!(body["next_action"], json!("keep going"));
+        let row = current(&store, &id);
+        assert_eq!(row.snapshot()["waiting_on"], ask);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_shape_is_rejected_and_does_not_clear_an_existing_value() {
+        let (state, store) = fixture();
+        let existing = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let id = seed(&store, Some(&serde_json::to_string(&existing).unwrap()));
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": 5})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["waiting_on"], existing,
+            "a rejected write must never silently clear the existing value: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_null_still_clears_it() {
+        let (state, store) = fixture();
+        let existing = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let id = seed(&store, Some(&serde_json::to_string(&existing).unwrap()));
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": null})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(row.waiting_on, None);
+    }
+
+    /// The second, distinct bug: legacy/plain content that never went
+    /// through JSON encoding must still be VISIBLE on read, not silently
+    /// substituted with null just because it fails to parse as JSON.
+    #[tokio::test]
+    async fn legacy_non_json_content_reads_back_as_the_raw_string_not_null() {
+        let (_state, store) = fixture();
+        let id = seed(&store, Some("a plain string stored before this fix, not JSON-encoded"));
+        let row = current(&store, &id);
+        assert_eq!(
+            row.snapshot()["waiting_on"],
+            json!("a plain string stored before this fix, not JSON-encoded"),
+            "legacy non-JSON content must not read back as null"
+        );
+    }
+
+    /// AF-935: a caller sending the object pre-serialized to a string (instead
+    /// of the object itself) must be rejected, not silently double-encoded
+    /// into a value that reads back as a raw string on the next GET.
+    #[tokio::test]
+    async fn a_pre_encoded_object_string_is_rejected_not_double_encoded() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let ask = json!({"actor": "Ethan", "type": "decision", "question": "q", "unblocks": "u"});
+        let pre_encoded = serde_json::to_string(&ask).unwrap();
+        let (status, body) = patch_as(&state, &id, json!({"waiting_on": pre_encoded})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let row = current(&store, &id);
+        assert_eq!(
+            row.waiting_on, None,
+            "a rejected write must not leave a double-encoded value behind: {:?}",
+            row.waiting_on
+        );
+    }
+
+    /// The existing plain-text contract (identical round trip) must survive
+    /// unaffected by the AF-935 check above -- only strings whose content
+    /// parses as a JSON *object* are rejected.
+    #[tokio::test]
+    async fn plain_text_that_is_not_json_still_round_trips() {
+        let (state, store) = fixture();
+        let id = seed(&store, None);
+        let (status, body) =
+            patch_as(&state, &id, json!({"waiting_on": "waiting on infra to add a label"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["waiting_on"], json!("waiting on infra to add a label"));
+    }
+}
+
+#[cfg(test)]
+mod af703_citing_cards_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn fixture() -> (AppState, crate::db::SharedStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::db::Store::open(&dir.path().join("af703-citing-cards.db")).expect("open store"),
+        );
+        std::mem::forget(dir);
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "af703-citing-cards-test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, store)
+    }
+
+    fn seed(store: &crate::db::SharedStore, title: &str, desc: &str) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let title = title.to_string();
+        let desc = desc.to_string();
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title,
+                        desc,
+                        status: "todo".into(),
+                        session: Some("gtm-engine".into()),
+                        item_type: "chore".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("test".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_700_000_000,
+                )?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed");
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    fn owner_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-session", HeaderValue::from_static("gtm-engine"));
+        headers
+    }
+
+    async fn patch_as(state: &AppState, id: &str, body: Value) -> (StatusCode, Value) {
+        let response =
+            patch_item(State(state.clone()), Path(id.to_string()), owner_headers(), Json(body)).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("read response");
+        (status, serde_json::from_slice(&bytes).expect("json response"))
+    }
+
+    /// AF-703, the GE-607/GE-610 specimen: GE-610's title overstated a cost,
+    /// GE-607's `blocked_on` quoted the same figure an hour after GE-610 was
+    /// corrected. This pins that the correction NAMES the citing card instead
+    /// of landing silently on GE-610 alone.
+    #[tokio::test]
+    async fn renaming_a_card_surfaces_other_cards_that_cite_its_id() {
+        let (state, store) = fixture();
+        let cited = seed(&store, "GTM spend needs ~$810 to close", "original estimate");
+        let citing = seed(&store, "Follow-up decision", &format!("blocked_on: waiting on {cited}'s ~$810 approval"));
+
+        let (status, body) =
+            patch_as(&state, &cited, json!({"title": "GTM spend needs ~$520 to close"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let advisories = body["advisories"].as_array().expect("advisories array");
+        let title_advisory = advisories
+            .iter()
+            .find(|a| a["field"] == json!("title"))
+            .expect("a title advisory must be present");
+        let cited_ids: Vec<&str> = title_advisory["citing_cards"]
+            .as_array()
+            .expect("citing_cards array")
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert!(cited_ids.contains(&citing.as_str()), "{cited_ids:?}");
+    }
+
+    #[tokio::test]
+    async fn renaming_a_card_nobody_cites_adds_no_advisory() {
+        let (state, store) = fixture();
+        let lonely = seed(&store, "Nobody references this one", "desc");
+        let (status, body) =
+            patch_as(&state, &lonely, json!({"title": "Still nobody references this one"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["advisories"].is_null() || body["advisories"].as_array().unwrap().is_empty());
+    }
+
+    /// CONTROL: writing the SAME title is a no-op per the existing `t !=
+    /// next.title` guard, and must not run the citation search at all.
+    #[tokio::test]
+    async fn writing_the_identical_title_does_not_search_for_citations() {
+        let (state, store) = fixture();
+        let cited = seed(&store, "Unchanged title", "desc");
+        let _citing = seed(&store, "Cites it", &format!("see {cited}"));
+        let (status, body) = patch_as(&state, &cited, json!({"title": "Unchanged title"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["advisories"].is_null() || body["advisories"].as_array().unwrap().is_empty());
     }
 }
 
@@ -8484,6 +15302,84 @@ pub async fn delete_item(
     }
 }
 
+/// POST /api/board/{id}/undelete (AF-922). The sanctioned inverse of DELETE.
+///
+/// Before this existed, a mistaken DELETE -- fat-fingered, or a create that
+/// silently folded into the wrong card and got cleaned up as if it were a
+/// disposable probe -- had exactly one recovery path: a raw SQL UPDATE
+/// against the live production database, clearing `issues.deleted` by hand.
+/// This mirrors `restore_item`'s shape for the SAME reason `unarchive` exists
+/// beside `archive`: every soft state this API can SET needs a way back that
+/// does not require leaving the API.
+async fn undelete_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_actor, actor_name) = actor_from_headers(&headers);
+    enum Out {
+        NotFound,
+        NotDeleted,
+        Undeleted(Value),
+    }
+    let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let id_w = id.clone();
+    let who = actor_name.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            // `get_issue` filters `deleted IS NULL` (module invariant), so it
+            // cannot tell "never existed" from "exists but was deleted" --
+            // exactly the two cases this endpoint must answer differently.
+            if !bs::issue_exists_including_deleted(conn, &id_w)? {
+                return finish(&slot_w, Out::NotFound, no_write());
+            }
+            if !bs::undelete(conn, &id_w)? {
+                return finish(&slot_w, Out::NotDeleted, no_write());
+            }
+            let Some(mut row) = bs::get_issue(conn, &id_w)? else {
+                return finish(&slot_w, Out::NotFound, no_write());
+            };
+            row.log = Some(bs::append_log(
+                row.log.as_deref(),
+                &hhmm(),
+                &format!("{who}: undeleted"),
+            ));
+            row.rev += 1;
+            row.version += 1;
+            row.updated = now_secs();
+            bs::save_patched(conn, &mut row)?;
+            let event = ev_snap(&row, MutationKind::Updated);
+            finish(
+                &slot_w,
+                Out::Undeleted(detail_body(&row)),
+                WriteOutcome {
+                    applied: true,
+                    events: vec![event],
+                },
+            )
+        })
+        .await;
+    let reply = match write {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let outcome = slot.lock().expect("outcome slot poisoned").take();
+    match outcome {
+        None => internal("undelete produced no outcome"),
+        Some(Out::NotFound) => not_found(&id),
+        Some(Out::NotDeleted) => err(
+            StatusCode::CONFLICT,
+            json!({"error": "task is not deleted", "code": "not_deleted", "id": id}),
+        ),
+        Some(Out::Undeleted(mut body)) => {
+            body["global_rev"] = json!(reply.rev.0);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+    }
+}
+
 // ---- POST /api/board/{id}/status-request · /status-update ----------------
 //
 // The D1-exit pair (AMUX-2174), and the ethos inverse of terminal scraping:
@@ -8543,18 +15439,55 @@ async fn status_request(
         requester
     };
 
-    let (session, title) = {
+    let (session, title, terminal) = {
         let conn = match state.store.read() {
             Ok(c) => c,
             Err(e) => return internal(e),
         };
         match bs::get_issue(&conn, &id) {
-            Ok(Some(row)) => (row.session.clone().unwrap_or_default(), row.title.clone()),
+            Ok(Some(row)) => (
+                row.session.clone().unwrap_or_default(),
+                row.title.clone(),
+                bs::is_terminal_status(&row.status),
+            ),
             Ok(None) => return not_found(&id),
             Err(e) => return internal(e),
         }
     };
     let session = session.trim().to_string();
+    // A stale client can still invoke the old Refresh/status-request path after
+    // the card closed. Do not route that request to a provider: the board's
+    // terminal outcome is authoritative. Still append the attempted action so
+    // the durable record explains why no provider message appeared.
+    if terminal {
+        let question_part = if question.is_empty() {
+            String::new()
+        } else {
+            format!(" — \\\"{question}\\\"")
+        };
+        let line = format!(
+            "status request by {requester} ignored: card is terminal; authoritative Final outcome preserved{question_part}"
+        );
+        if let Err(e) = append_card_log(&state, &id, &line, None).await {
+            return internal(e);
+        }
+        tracing::info!(
+            target: "amux::board", marker = "terminal_status_request_preserved",
+            task = %id, requester = %requester,
+            "terminal status request was recorded without provider delivery"
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "delivered": false,
+                "session": session,
+                "reason": "card is terminal; authoritative Final outcome is preserved",
+                "logged": true,
+            })),
+        )
+            .into_response();
+    }
     if session.is_empty() {
         return (
             StatusCode::CONFLICT,
@@ -8797,9 +15730,7 @@ async fn capsule(
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let ac = row.acceptance_criteria.as_deref()
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .unwrap_or(Value::Null);
+    let ac = bs::parse_json_or_raw_string(row.acceptance_criteria.as_deref());
     let files: Vec<String> = conn
         .prepare("SELECT path FROM issue_files WHERE issue_id = ?1")
         .and_then(|mut stmt| {
@@ -9076,6 +16007,7 @@ async fn create_artifact(
 async fn patch_artifact(
     State(state): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let new_state = body.get("state").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -9097,8 +16029,10 @@ async fn patch_artifact(
         }
     }
     let now = chrono::Utc::now().timestamp();
+    let (_, actor) = actor_from_headers(&headers);
     let task_for_log = id.clone();
     let aid_for_log = aid.clone();
+    let state_for_log = new_state.clone();
     let write = state.store.write_async(move |conn| {
         if bs::get_issue(conn, &id)?.is_none() {
             return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -9128,7 +16062,24 @@ async fn patch_artifact(
         })
     }).await;
     match write {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Ok(_) => {
+            if let Some(ref disposition) = state_for_log {
+                if crate::db::artifact_store::is_retired_state(disposition) {
+                    tracing::warn!(
+                        target: "amux::board",
+                        marker = "artifact_retired",
+                        task = %task_for_log,
+                        artifact = %aid_for_log,
+                        worker = %actor,
+                        state = %disposition,
+                        measured = true,
+                        n_considered = 1,
+                        "board artifact retained for audit but retired from valid produced assets"
+                    );
+                }
+            }
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
         Err(e) if is_missing_task(&e) => {
             tracing::warn!(
                 marker = "artifact_target_missing",
@@ -9280,6 +16231,7 @@ async fn apply_status_update(
         } else if let Some(exclusion) = frontier_exclusion(&row, false) {
             match exclusion {
                 FrontierExclusion::Blocked => "blocked".to_string(),
+                FrontierExclusion::DormantType => "dormant_type".to_string(),
                 FrontierExclusion::NoContinuation => unreachable!("continuation gate is off"),
             }
         } else if bs::continuation_required(Some(&actor))
@@ -9287,15 +16239,9 @@ async fn apply_status_update(
         {
             "continuation_missing".to_string()
         } else {
-            let holding: Vec<String> = conn.prepare(
-                "SELECT id FROM issues WHERE session=?1 AND status='doing' AND id!=?2 \
-                 AND deleted IS NULL AND COALESCE(archived,0)=0 \
-                 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
-                 AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''),1,11)='**Prompt:**') \
-                 AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
-                                 AND lower(t.tag) LIKE 'needs:you%') ORDER BY id"
-            )?.query_map(rusqlite::params![&actor, &id], |r| r.get::<_, String>(0))?
-                .filter_map(Result::ok).collect();
+            let holding = crate::runtime_jobs::board_drive::wip_holding_ids(
+                conn, &actor, Some(&id),
+            )?;
             if !holding.is_empty() {
                 "wip_conflict".to_string()
             } else {
@@ -9334,6 +16280,18 @@ async fn apply_status_update(
             conn, &id, refs,
             &format!("automatically captured from status update by {actor}"), now_secs(),
         )?;
+        if bs::is_terminal_status(&prior_status)
+            && row
+                .last_result
+                .as_deref()
+                .is_some_and(|summary| summary.starts_with("Final outcome:"))
+        {
+            tracing::info!(
+                target: "amux::board", marker = "terminal_status_update_preserved",
+                task = %id, worker = %actor,
+                "terminal status update appended its audit evidence without replacing Final outcome"
+            );
+        }
         events.extend(inserted.iter().map(|artifact| crate::db::PendingEvent {
             entity_type: amux_core::revision::EntityType::Other("artifact".into()),
             entity_id: artifact.id.clone(),
@@ -9435,6 +16393,111 @@ mod param_tests {
 #[cfg(test)]
 mod isolation_designation_tests {
     use super::*;
+
+    /// AMUX-4860. A `todo` for an isolated lane is stored as `backlog`, and a
+    /// `todo` for an ordinary lane is left alone.
+    ///
+    /// BOTH ARMS IN ONE CELL ON PURPOSE. The obvious test files into an
+    /// isolated lane and asserts the result is backlog, and that test passes
+    /// just as well against an implementation that defaults EVERYTHING to
+    /// backlog, which would silently empty every lane's dispatch queue. The
+    /// negative arm is the one that can catch that, so it is asserted beside
+    /// the positive rather than in a cell someone could delete on its own.
+    #[test]
+    fn a_todo_is_rerouted_only_when_its_lane_is_actually_isolated() {
+        let isolated = |l: &str| l == "desktop";
+
+        // The specimen: DESKT-44 on `desktop`, the card that failed
+        // board.todo_is_reachable_by_dispatch 18863 times.
+        assert!(
+            todo_unreachable_on_isolated_lane(true, "desktop", &isolated),
+            "a todo for an isolated lane cannot be dispatched and must be rerouted"
+        );
+
+        // THE ARM THAT CATCHES AN OVER-EAGER FIX.
+        assert!(
+            !todo_unreachable_on_isolated_lane(true, "amux", &isolated),
+            "an ordinary lane's todo must stay todo, or the dispatch queue is emptied"
+        );
+
+        // Only `todo` claims to be next, so nothing else is touched. Without
+        // this, moving a card to `doing` or `done` on an isolated lane would
+        // be rewritten to backlog, which would make the lane unable to record
+        // its own work.
+        assert!(
+            !todo_unreachable_on_isolated_lane(false, "desktop", &isolated),
+            "a non-todo status on an isolated lane must pass through untouched"
+        );
+
+        // A detector card carries no session. The predicate must not be asked
+        // about an empty lane name.
+        // RefCell because the parameter is `&dyn Fn`, and a closure that
+        // pushes to a Vec it captured is `FnMut`.
+        let asked: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let recording = |l: &str| {
+            asked.borrow_mut().push(l.to_string());
+            true
+        };
+        assert!(
+            !todo_unreachable_on_isolated_lane(true, "", &recording),
+            "a card with no lane has no lane to be isolated"
+        );
+        assert!(
+            asked.borrow().is_empty(),
+            "the empty lane must short-circuit before the predicate is consulted, got {:?}",
+            asked.borrow()
+        );
+    }
+
+    /// AMUX-4860. Every response arm that can carry an adjusted status says so.
+    ///
+    /// WHY THIS CELL EXISTS, and it is a correction to my own first version.
+    /// The decision above was tested and green while the DISCLOSURE was wired
+    /// into the `Applied` arm only. Exercising the shipped build found it:
+    /// asking for `todo` on an isolated lane whose card was already `backlog`
+    /// adjusted the target, left nothing to write, and returned through `Noop`
+    /// with `applied: false` and no reason. The caller asked for todo, got
+    /// backlog, and the reply was silent about it, which is the AMUX-4776 trap
+    /// this field exists to prevent.
+    ///
+    /// A green decision test could not catch that, because the defect was in a
+    /// path the decision never sees. All three arms now call one function, so
+    /// this pins the function; the comment on it names the obligation for any
+    /// arm added later.
+    #[test]
+    fn an_adjusted_status_is_disclosed_and_an_ordinary_one_is_left_alone() {
+        // ADJUSTED: both fields present, and the reason names the lane so the
+        // reader knows WHICH lane's isolation moved their card.
+        let mut body = json!({"id": "X-1", "status": "backlog"});
+        note_status_adjustment(&mut body, Some("todo"), "desktop");
+        assert_eq!(
+            body["status_adjusted_from"], "todo",
+            "the caller must learn the status it asked for: {body}"
+        );
+        let reason = body["status_adjusted_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("desktop"),
+            "the reason must name the lane whose isolation caused it: {reason}"
+        );
+        assert!(
+            reason.contains("backlog"),
+            "and the status it got instead: {reason}"
+        );
+
+        // NOT ADJUSTED: nothing is written. Without this arm a helper that
+        // stamped the fields unconditionally would pass the first assertions
+        // and label every ordinary response as adjusted.
+        let mut plain = json!({"id": "X-2", "status": "todo"});
+        note_status_adjustment(&mut plain, None, "amux");
+        assert!(
+            plain.get("status_adjusted_from").is_none(),
+            "an unadjusted response must carry no adjustment field: {plain}"
+        );
+        assert!(
+            plain.get("status_adjusted_reason").is_none(),
+            "nor a reason: {plain}"
+        );
+    }
 
     /// AMUX-3713: a card whose owning lane is ISOLATED says so, and an ordinary
     /// one does not.
@@ -9704,6 +16767,71 @@ mod slim_tests {
     /// removed the fields without replacing what the SPA derives FROM them.
     /// A payload diet that drops a rendered value is a regression wearing a
     /// performance win, and it fails silently — the card just looks empty.
+    /// AF-555. A row shipped 48 fields including `status` and `archived` and
+    /// nothing that answered the question every consumer asks, so every
+    /// consumer derived it — and gtm-engine's derivation, in another repo and
+    /// another language, read status and never `archived`, silently
+    /// suppressing a hand-raiser breach page.
+    #[test]
+    fn a_row_publishes_whether_it_is_live_so_no_consumer_has_to_derive_it() {
+        let live = IssueRow { id: "T-1".into(), status: "todo".into(), ..Default::default() };
+        assert_eq!(live_state(&live), (true, "live"));
+
+        // The exact shape that suppressed the page: archived, but in a status
+        // that dispatch would otherwise treat as workable.
+        let ghost = IssueRow {
+            id: "T-2".into(),
+            status: "todo".into(),
+            archived: 1,
+            ..Default::default()
+        };
+        assert_eq!(live_state(&ghost), (false, "archived"));
+
+        // gtm-engine's carve-out: a needs:you ask is still owed after archiving,
+        // and a blanket rule would re-mint a breach over a live human ask.
+        let ask = IssueRow {
+            id: "T-3".into(),
+            status: "needsyou".into(),
+            archived: 1,
+            ..Default::default()
+        };
+        assert_eq!(live_state(&ask), (true, "archived_but_ask_still_owed"));
+
+        let done = IssueRow { id: "T-4".into(), status: "verified".into(), ..Default::default() };
+        assert_eq!(live_state(&done), (false, "status_claims_no_work"));
+
+        // A status we cannot parse is NOT reported dead: a measurement that did
+        // not run must not wear the clothes of one that did.
+        let weird = IssueRow { id: "T-5".into(), status: "banana".into(), ..Default::default() };
+        assert_eq!(live_state(&weird), (true, "status_unparseable"));
+    }
+
+    /// The verdict must survive slimming. A liveness field that disappears from
+    /// the list payload is worse than one that never existed: `row.get("live")`
+    /// returning None reads as an answer, which is the exact failure `desc`
+    /// caused (AF-161) and that `slim` names its drops to prevent.
+    #[test]
+    fn the_live_verdict_rides_through_slim_and_is_on_both_serializers() {
+        let row = IssueRow {
+            id: "T-6".into(),
+            status: "todo".into(),
+            archived: 1,
+            ..Default::default()
+        };
+        for (label, v) in [
+            ("full list", list_body(&row, false, false)),
+            ("slim list", list_body(&row, true, false)),
+            ("single-card GET", detail_body(&row)),
+        ] {
+            assert_eq!(v["live"], serde_json::json!(false), "{label} must carry live");
+            assert_eq!(v["live_reason"], serde_json::json!("archived"), "{label} reason");
+        }
+        assert!(
+            !SLIM_OMITS.contains(&"live") && !SLIM_OMITS.contains(&"live_reason"),
+            "adding either to SLIM_OMITS reintroduces the absent-key-reads-as-answer bug"
+        );
+    }
+
     #[test]
     fn slim_drops_the_prose_but_keeps_the_two_things_the_list_renders() {
         let row = IssueRow {
@@ -9958,6 +17086,8 @@ mod slim_tests {
 
     fn fold_card(creator: &str, status: &str, desc: &str, session: &str) -> bs::NewIssue {
         bs::NewIssue {
+            acceptance_criteria: None,
+            next_action: None,
             title: "t".into(),
             desc: desc.into(),
             status: status.into(),
@@ -10008,6 +17138,39 @@ mod slim_tests {
         assert!(
             got.desc.contains(&format!("Folded into {}", worker.id)),
             "the tombstone links to the worker card"
+        );
+    }
+
+    /// AF-616: the auto-fold CHOSE this target by adjacency, so the line it
+    /// writes must carry the inference marker. mixpeek-frustrations' specimen
+    /// is a report captured as AF-613 and folded into AF-615, an unrelated
+    /// finding carded in the same minute; the summary asserted that fold in the
+    /// same words a lane's own `--folded-into` would have produced.
+    ///
+    /// This pins the LABEL, not the choice. Narrowing the window is a change to
+    /// every lane's board and is not made here.
+    #[test]
+    fn an_auto_fold_records_that_it_inferred_the_target() {
+        let conn = fold_db();
+        let cap =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** do the thing", "lane"), 1000)
+                .unwrap();
+        let worker =
+            bs::create_issue(&conn, &fold_card("lane", "todo", "Fix the thing", "lane"), 1010).unwrap();
+        fold_capture_for_worker_card(&conn, &worker, 600, 1010).unwrap();
+
+        let got = bs::get_issue(&conn, &cap.id).unwrap().unwrap();
+        let log = got.log.as_deref().unwrap_or("");
+        assert!(
+            log.contains(&format!("capture folded into {} {}", worker.id, bs::FOLD_INFERRED_MARKER)),
+            "the adjacency-chosen target must be labelled as inferred; log was: {log}"
+        );
+        // AND IT MUST STILL RESOLVE. A marker that broke the id would turn a
+        // readable fold back into the dropped-request rendering b3db93fd fixed.
+        assert_eq!(
+            bs::folded_into_detail(Some(log)),
+            Some((worker.id.clone(), true)),
+            "the labelled line must still parse to the target"
         );
     }
 
@@ -10079,6 +17242,62 @@ mod slim_tests {
             "a capture a prior worker card already owns must not be re-folded"
         );
         assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
+    }
+
+    /// Bulk helpers are work inside a task, not new tasks. The receipt must
+    /// land on the uniquely active card and emit the same task-update event a
+    /// dashboard already knows how to consume.
+    #[test]
+    fn helper_activity_attaches_to_the_active_task_and_emits_its_snapshot() {
+        let conn = fold_db();
+        let card =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "Current task", "lane"), 1000)
+                .unwrap();
+        let (receipt, event) = record_session_task_activity(
+            &conn,
+            "lane",
+            None,
+            "delegated bulk read completed: 2 file(s), 900 line(s), via haiku, 12ms",
+            2000,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.verdict, "attached");
+        assert_eq!(receipt.card_id.as_deref(), Some(card.id.as_str()));
+        assert_eq!(receipt.n_considered, 1);
+        let updated = bs::get_issue(&conn, &card.id).unwrap().unwrap();
+        assert!(updated.log.unwrap().contains("delegated bulk read completed"));
+        assert_eq!(updated.updated, 2000, "the activity must move board recency");
+        let event = event.expect("a visible task mutation needs a realtime event");
+        assert_eq!(event.entity_type, EntityType::Task);
+        assert_eq!(event.entity_id, card.id);
+        assert!(event.payload.is_some(), "replay needs the post-write task snapshot");
+    }
+
+    /// Negative controls: no parent means an honest no-op; several candidates
+    /// are refused rather than writing evidence onto whichever row sorted first.
+    #[test]
+    fn helper_activity_never_invents_or_guesses_a_parent_task() {
+        let conn = fold_db();
+        let (none, event) =
+            record_session_task_activity(&conn, "lane", None, "helper ran", 2000).unwrap();
+        assert_eq!(none.verdict, "no_active_task");
+        assert_eq!(none.n_considered, 0);
+        assert!(event.is_none());
+
+        let a = bs::create_issue(&conn, &fold_card("lane", "doing", "A", "lane"), 1000)
+            .unwrap();
+        let b = bs::create_issue(&conn, &fold_card("lane", "doing", "B", "lane"), 1001)
+            .unwrap();
+        let (ambiguous, event) =
+            record_session_task_activity(&conn, "lane", None, "wrong card", 2000).unwrap();
+        assert_eq!(ambiguous.verdict, "task_request_parent_ambiguous");
+        assert_eq!(ambiguous.n_considered, 2);
+        assert!(event.is_none());
+        for id in [a.id, b.id] {
+            let row = bs::get_issue(&conn, &id).unwrap().unwrap();
+            assert!(!row.log.unwrap_or_default().contains("wrong card"));
+        }
     }
 }
 
@@ -10165,5 +17384,4 @@ mod bulk_migrate_tests {
         // Nothing considered is nothing to report.
         assert_eq!(unanimous_gate(0, 0, &[]), None, "an empty column is not a gate refusal");
     }
-
 }

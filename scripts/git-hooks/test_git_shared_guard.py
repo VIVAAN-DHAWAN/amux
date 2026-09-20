@@ -10,6 +10,7 @@ Run: python3 ~/.amux/hooks/test_git_shared_guard.py   (exit 0 = all pass)
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,45 @@ def main():
     A("add -u scoped to a dir", "git add -u crates/", False)
     # Mention, not invocation — the same class the heredoc pins above cover.
     A("add -A mentioned in a commit message", 'git commit -m "never git add -A here" -- f.txt', False)
+
+    # MC-1712 — `\b` AFTER A LITERAL WORD IS SATISFIED BY A HYPHEN, so the
+    # matcher reads `commit-tree` as `commit`. Reported by mixpeek-cicd, who hit
+    # it on the exact pattern CLAUDE.md recommends for this checkout: build a
+    # tree against a temp GIT_INDEX_FILE, then commit-tree, so you never cp into
+    # a worktree other lanes are using. They were told "bare `git commit` would
+    # sweep 47 file(s) of index-vs-HEAD DRIFT" about a command that reads
+    # neither the index nor the worktree and structurally cannot sweep anything.
+    #
+    # The documented escape did not fit either: AMUX_ALLOW_SWEEP_COMMIT=47
+    # asserts an intent to commit 47 files, which was false, so taking it would
+    # have put a wrong claim in the audit trail. They hand-built the commit
+    # object with `git hash-object -t commit -w --stdin` instead.
+    #
+    # Swept the sibling verbs rather than only the reported one: `add` and
+    # `fetch` have real hyphenated forms too.
+    # THE REPRODUCIBLE ONE, and it is not the rule the report named. `--all`
+    # makes it reach the `-a/--all` matcher, which refuses with "commits EVERY
+    # modified tracked file" about a command that reads the object database and
+    # never touches the index. Measured on the unfixed guard: rc=2.
+    # THE PRIMARY CELL: launch-videos' exact command. QUOTING is the variable
+    # that makes it reachable — the scrubber blanks quoted strings, so the tree
+    # operand disappears and _commit_has_pathspec stops exempting it, and the
+    # sweep verdict fires. Measured against HEAD's guard: rc=2 "would sweep",
+    # and rc=0 after. The UNQUOTED spelling never blocked, which is why the
+    # first report was not reproducible from what it recorded.
+    A("quoted commit-tree is not commit", 'git commit-tree "$tree" -p "$BASE" -F msg', False)
+    A("commit-graph --all is not commit --all", "git commit-graph write --all", False)
+    A("commit-tree --all is not commit --all", "git commit-tree $T -p $P --all", False)
+    # The plain forms did NOT block even before the fix, because
+    # _commit_has_pathspec reads their tree/subcommand operand as a pathspec and
+    # exempts them. Pinned so a later change to that helper cannot turn the
+    # accidental exemption into a refusal without saying so.
+    A("commit-tree plain", "git commit-tree $T -p $P", False)
+    A("commit-graph plain", "git commit-graph write --reachable", False)
+    A("fetch-pack is not fetch", "git fetch-pack --all origin", False)
+    A("add--interactive is not add", "git add--interactive --patch", False)
+    # ...and the real verbs must STILL block, or the fix is a hole rather than a fix.
+    A("plain commit -a still blocks", "git commit -a -m x", True)
 
     # quoted mentions (existing behavior, regression pins)
     A("quoted commit-msg mention", 'git commit -m "never git reset --hard again" -- f.txt', False)
@@ -676,6 +716,58 @@ def main():
         failures.append("lock-note: an absent lsof reported the lock UNHELD: %r" % _err[:220])
     os.unlink(_lock)
 
+    # ---- MC-1624: the amend LOCK REFUSAL, which shipped with no test ----------
+    # The pin is checked at ADMISSION. mvs-research pinned correctly, their
+    # command then waited 30 iterations on .git/index.lock held by another lane's
+    # commit, and by the time the amend ran HEAD was that lane's commit, which it
+    # rewrote. The guard now refuses while a FRESH lock is held.
+    #
+    # Four states, and the last two are the ones that matter. A refusal keyed on
+    # "lock exists" with no aging blocks every lane forever behind a lock from a
+    # crashed git; a refusal that fires on non-amend commands blocks ordinary
+    # work. Either failure is worse than the race being closed, and neither is
+    # visible from a test that only checks the refusal fires.
+    _amendlock = 0
+    _al_lock = os.path.join(work, ".git", "index.lock")
+    _al_head = subprocess.run(("git", "-C", work, "rev-parse", "HEAD"),
+                              capture_output=True, text=True).stdout.strip()
+    _al_pinned = "AMUX_AMEND_EXPECT=%s git commit --amend --no-edit" % _al_head
+
+    for _n, _setup, _cmd, _want_block in (
+        # 1. NO LOCK, correct pin -> ALLOW. The control that says this whole
+        #    block did not just break the documented amend procedure.
+        ("no lock, pinned", None, _al_pinned, False),
+        # 2. FRESH LOCK, correct pin -> BLOCK. The case that fired.
+        ("fresh lock, pinned", "fresh", _al_pinned, True),
+        # 3. STALE LOCK, correct pin -> ALLOW. Aging works. Without this a lock
+        #    from a crashed git refuses every lane's amend indefinitely while
+        #    blaming a peer who is not there.
+        ("stale lock, pinned", "stale", _al_pinned, False),
+        # 4. FRESH LOCK, NOT an amend -> ALLOW. The refusal must not widen into
+        #    ordinary commands just because a peer is mid-commit.
+        ("fresh lock, plain commit", "fresh", "git commit -m x", False),
+    ):
+        if _setup == "fresh":
+            open(_al_lock, "w").close()
+            os.utime(_al_lock, None)
+        elif _setup == "stale":
+            open(_al_lock, "w").close()
+            _st = time.time() - 1200          # past the 900s freshness cutoff
+            os.utime(_al_lock, (_st, _st))
+        _amendlock += 1
+        _rc, _err = run_hook(_cmd, work, tmp)
+        _blocked = _rc != 0
+        if _blocked != _want_block:
+            failures.append(
+                "MC-1624/%s: expected %s, got %s for %r"
+                % (_n, "BLOCK" if _want_block else "ALLOW",
+                   "BLOCK" if _blocked else "ALLOW", _cmd))
+        # The refusal has to name WHY, or the caller retries into the same wall.
+        if _want_block and "index.lock" not in _err:
+            failures.append("MC-1624/%s: refusal does not name the lock: %r" % (_n, _err[:200]))
+        if os.path.exists(_al_lock):
+            os.unlink(_al_lock)
+
     # ------------------------------------------------------------------
     # AF-507 — a bare `git commit` that would sweep index-vs-frozen-HEAD drift
     #
@@ -782,8 +874,279 @@ def main():
             "AF-507/control: a genuine 40-file commit with NO drift was blocked (rc=%s). "
             "The signal is drift, not size. stderr: %r" % (_rc, _err[:300]))
 
+    # ---- AF-597 defect 2: the escape hatch pins a SET, not a count ----
+    #
+    # mixpeek-frustrations, 2026-09-08: they read "would sweep 36 file(s)",
+    # re-ran with AMUX_ALLOW_SWEEP_COMMIT=36, and were refused with a demand
+    # for 40. The drift is recomputed live across ~50 lanes sharing one index,
+    # so the number moves between reading it and using it. That made the
+    # documented escape unwalkable (ethos rules 3 and 6).
+    #
+    # ITS OWN FIXTURE, deliberately. The cells above end with 40 staged
+    # `mine*.txt` files and a worktree at a detached base, and inheriting that
+    # is how the first draft of these cells passed while testing nothing: a
+    # `git add -A` staged those leftovers, they differ from origin, so they
+    # were never DRIFT and the "drift grew" case measured no growth at all.
+    _c = 0
+    _co = os.path.join(tmp, "consentorigin.git")
+    _cw = os.path.join(tmp, "consentwork")
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", _co])
+    subprocess.run(["git", "clone", "-q", _co, _cw], capture_output=True)
+    git(_cw, "config", "user.email", "t@t")
+    git(_cw, "config", "user.name", "t")
+    open(os.path.join(_cw, "base.txt"), "w").write("base\n")
+    git(_cw, "add", "base.txt")
+    git(_cw, "commit", "-q", "-m", "base")
+    _cold = git(_cw, "rev-parse", "HEAD")
+    for _i in range(40):
+        open(os.path.join(_cw, f"peer{_i}.txt"), "w").write(f"{_i}\n")
+    git(_cw, "add", "-A")
+    git(_cw, "commit", "-q", "-m", "40 files that are NOT this lane's work")
+    git(_cw, "push", "-q", "origin", "main")
+
+    def _freeze():
+        """The graft-push shape: HEAD frozen old, index carrying origin/main."""
+        git(_cw, "checkout", "-q", "--detach", _cold)
+        git(_cw, "read-tree", "origin/main")
+
+    _freeze()
+
+    _c += 1
+    _rc, _err = _sweep_hook("git commit -m x", _cw)
+    _consent = ""
+    _m = re.search(r"AMUX_ALLOW_SWEEP_COMMIT=@(\S+?) git commit", _err)
+    if _rc != 2 or not _m:
+        failures.append(
+            "AF-597/offer: the refusal does not offer a consent FILE to pin (rc=%s). "
+            "A count cannot survive the gap between reading it and using it: %r"
+            % (_rc, _err[:400]))
+    else:
+        _consent = _m.group(1)
+        _listed = [l.strip() for l in open(_consent) if l.strip()]
+        if sorted(_listed) != sorted(f"peer{_i}.txt" for _i in range(40)):
+            failures.append(
+                "AF-597/offer-contents: the consent file does not list the 40 drift paths "
+                "the refusal counted (%d listed). Pinning a file that does not describe "
+                "the commit is the count problem with extra steps." % len(_listed))
+
+    # THE ESCAPE MUST ACTUALLY RELEASE THE COMMIT. Without this cell the change
+    # could refuse everything and every other cell here would still pass.
+    if _consent:
+        _c += 1
+        _rc, _err = _sweep_hook("git commit -m x", _cw,
+                                env={"AMUX_ALLOW_SWEEP_COMMIT": "@" + _consent})
+        if _rc != 0:
+            failures.append(
+                "AF-597/consent: pinning the consent file the guard itself just wrote did "
+                "NOT release the commit (rc=%s). The documented escape must be walkable "
+                "with the sanctioned tooling: %r" % (_rc, _err[:400]))
+
+        # THE RACE, WHICH IS THE WHOLE POINT. Two more files land on ORIGIN
+        # after the consent file was written, so the drift genuinely GROWS.
+        # (New files staged locally would not do it: they differ from origin,
+        # so they are the caller's own work and never drift.) A count refuses
+        # with arithmetic; a set must refuse by NAME, and only the two the
+        # operator never saw.
+        _c += 1
+        git(_cw, "checkout", "-q", "main")
+        git(_cw, "reset", "-q", "--hard", "origin/main")
+        for _n in ("late_a.txt", "late_b.txt"):
+            open(os.path.join(_cw, _n), "w").write("landed after you looked\n")
+        git(_cw, "add", "-A")
+        git(_cw, "commit", "-q", "-m", "a peer pushes while you are reading")
+        git(_cw, "push", "-q", "origin", "main")
+        _freeze()
+        _rc, _err = _sweep_hook("git commit -m x", _cw,
+                                env={"AMUX_ALLOW_SWEEP_COMMIT": "@" + _consent})
+        if _rc != 2:
+            failures.append(
+                "AF-597/grew: drift that GREW after consent was allowed (rc=%s). The added "
+                "paths are exactly what was never consented to: %r" % (_rc, _err[:400]))
+        elif not ("late_a.txt" in _err and "late_b.txt" in _err):
+            failures.append(
+                "AF-597/grew-names: the refusal does not NAME the paths that arrived after "
+                "consent. Naming them is the difference between this and the count it "
+                "replaces: %r" % _err[:400])
+        elif "peer0.txt" in _err:
+            failures.append(
+                "AF-597/grew-scope: the refusal names a path that WAS consented to. It must "
+                "refuse the difference, not restate the whole set: %r" % _err[:400])
+
+        # SHRINKING IS FINE. Every remaining path is still consented, so a
+        # subset must pass. Equality here would reintroduce the same race in
+        # the other direction, and a consent file would expire the moment
+        # anything landed.
+        _c += 1
+        git(_cw, "restore", "--staged", "late_a.txt", "late_b.txt", "peer0.txt")
+        _rc, _err = _sweep_hook("git commit -m x", _cw,
+                                env={"AMUX_ALLOW_SWEEP_COMMIT": "@" + _consent})
+        if _rc != 0:
+            failures.append(
+                "AF-597/shrank: drift that SHRANK after consent was refused (rc=%s). A "
+                "subset of what was consented to is still consented to: %r"
+                % (_rc, _err[:400]))
+
+    _freeze()
+
+    # A consent file that does not exist must REFUSE, not fail open. This is
+    # the consent path: an uncheckable claim is not a claim.
+    _c += 1
+    _rc, _err = _sweep_hook("git commit -m x", _cw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": "@/nonexistent/consent.txt"})
+    if _rc != 2 or "could not be read" not in _err:
+        failures.append(
+            "AF-597/missing: an unreadable consent file did not refuse (rc=%s). Nothing "
+            "was checked, so nothing was consented to: %r" % (_rc, _err[:300]))
+
+    # An EMPTY consent file consents to nothing while reading like consent to
+    # everything. That is the shape that would make this hatch a switch.
+    _c += 1
+    _empty = os.path.join(tmp, "empty-consent.txt")
+    open(_empty, "w").close()
+    _rc, _err = _sweep_hook("git commit -m x", _cw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": "@" + _empty})
+    # MATCH THE BRANCH, NOT A WORD THAT ALSO APPEARS IN THE PATH. The first
+    # draft asserted `"empty" in _err`, which the filename `empty-consent.txt`
+    # satisfies on its own: deleting the empty-file branch left this cell green.
+    if _rc != 2 or "consents to nothing" not in _err:
+        failures.append(
+            "AF-597/empty: an EMPTY consent file was accepted, or was refused by the "
+            "generic set check rather than named as empty (rc=%s). Consenting to no "
+            "paths must not release a 42-file sweep: %r" % (_rc, _err[:300]))
+
+    # THE LEGACY COUNT still releases the commit when it matches exactly, so a
+    # call already in flight when this shipped is not broken by it.
+    _c += 1
+    _drift_now = len([l for l in git(_cw, "diff", "--cached", "--name-only").splitlines()
+                      if l.strip() and l.strip() != "base.txt"])
+    _rc, _err = _sweep_hook("git commit -m x", _cw,
+                            env={"AMUX_ALLOW_SWEEP_COMMIT": str(_drift_now)})
+    if _rc != 0:
+        failures.append(
+            "AF-597/legacy-count: an exactly-correct count no longer releases the commit "
+            "(rc=%s, pinned %s). Dropping the old form breaks anything mid-flight: %r"
+            % (_rc, _drift_now, _err[:300]))
+
+    # ---- AF-597 defect 3: name the files the skipped half was going to write ----
+    #
+    # A blocked compound command skips its non-git segments. When one of those
+    # writes a scratch file the git half reads, the natural retry (fix the git
+    # complaint only) reads the PREVIOUS day's file and returns rc=0. Measured
+    # on mixpeek main: a correct 3-file fix landed under a commit message about
+    # RayJob drain calibration (b354b3d1f8, corrected by e222baefb5).
+    _c += 1
+    _rc, _err = _sweep_hook(
+        "cat > /tmp/af597-msg.txt <<'EOF'\nsubject\nEOF\ngit commit -m x", _cw)
+    if _rc != 2:
+        failures.append(
+            "AF-597/skipped: the compound command was not blocked at all (rc=%s), so this "
+            "cell is testing nothing: %r" % (_rc, _err[:300]))
+    # MATCH THE NEW LINE, NOT THE PATH. The path is already inside the
+    # pre-existing "first: `<segment>`" echo, so asserting on the path alone
+    # stayed green with the entire NOT WRITTEN line removed: a check pinning
+    # the wrong layer is exactly as green as one pinning the right layer.
+    elif "NOT WRITTEN: /tmp/af597-msg.txt" not in _err:
+        failures.append(
+            "AF-597/skipped-names: the refusal does not name the file the skipped half was "
+            "going to write. That file is what the retry reads stale: %r" % _err[:600])
+
+    # DISCRIMINATES: a skipped half that writes NOTHING must not grow a
+    # NOT WRITTEN line naming nothing. A notice that always fires is one nobody
+    # reads, which is the defect being fixed here, one layer up.
+    _c += 1
+    _rc, _err = _sweep_hook("echo hello && git commit -m x", _cw)
+    if _rc == 2 and "NOT WRITTEN" in _err:
+        failures.append(
+            "AF-597/skipped-noise: a skipped segment that writes no file still produced a "
+            "NOT WRITTEN line: %r" % _err[:400])
+
+    # /dev/null IS a redirect target and is not a file anyone reads back, so it
+    # must not be announced as unwritten. Without this cell the exclusion set is
+    # held by nothing: `echo hello` has no redirect at all, so deleting the
+    # filter left the noise cell above green.
+    _c += 1
+    _rc, _err = _sweep_hook("echo hello > /dev/null && git commit -m x", _cw)
+    # GUARD THE SPLIT. With no "NOT WRITTEN" marker, split returns the WHOLE
+    # message, and /dev/null is already in the "first: `<segment>`" echo, so the
+    # unguarded form failed on a correct refusal.
+    if _rc == 2 and "NOT WRITTEN" in _err and "/dev/null" in _err.split("NOT WRITTEN")[-1]:
+        failures.append(
+            "AF-597/skipped-devnull: /dev/null was announced as an unwritten file. Nothing "
+            "reads it back, so naming it is the noise this note exists to avoid: %r"
+            % _err[:400])
+    _sweep += _c
+
+    # ---- AF-577: `git config` from inside a LINKED WORKTREE writes SHARED ----
+    # A linked worktree has no config of its own unless
+    # extensions.worktreeConfig is enabled, so a bare `git config` there rewrites
+    # the file the main checkout and every sibling worktree read. Through this
+    # channel `core.bare true` killed every work-tree operation for every lane on
+    # the mixpeek checkout for ~30 minutes, and the identity half authored 9
+    # commits as `t <t@t.t>` (mixpeek-general, 132a2b8a).
+    #
+    # SHARED_ROOT IS DELIBERATELY A DIRECTORY THAT IS NOT THIS REPO. A linked
+    # worktree is never inside the checkout it belongs to (ours live in /tmp, per
+    # CLAUDE.md:185), so a check gated on AMUX_SHARED_CHECKOUTS could not fire on
+    # any real target. The first draft sat after that gate and returned 0 for all
+    # cells including `core.bare true`; passing an unrelated shared_root here is
+    # what stops it silently drifting back behind the gate.
+    _wt = tempfile.mkdtemp(prefix="guardwt-")
+    _wt_main = os.path.join(_wt, "main")
+    _wt_linked = os.path.join(_wt, "linked")
+    subprocess.run(["git", "init", "-q", "-b", "main", _wt_main], capture_output=True)
+    git(_wt_main, "config", "user.email", "a@b.c")
+    git(_wt_main, "config", "user.name", "ab")
+    subprocess.run(["git", "-C", _wt_main, "commit", "-q", "--allow-empty", "-m", "init"],
+                   capture_output=True)
+    subprocess.run(["git", "-C", _wt_main, "worktree", "add", "-q", _wt_linked, "-b", "side"],
+                   capture_output=True)
+    _elsewhere = os.path.join(_wt, "not-the-repo")
+    os.makedirs(_elsewhere, exist_ok=True)
+
+    _wtcases = [
+        ("git config user.email t@t.t", _wt_linked, True,
+         "the identity write that authored 9 commits as t@t.t"),
+        ("git config core.bare true", _wt_linked, True,
+         "the write that took a whole fleet down"),
+        ("git config --add remote.o.url u", _wt_linked, True, "--add is a write"),
+        ("git config --unset user.email", _wt_linked, True, "--unset writes the SHARED file"),
+        # The MAIN checkout owns its own config; refusing there would break every
+        # legitimate repo-level setting and is the obvious over-reach.
+        ("git config user.email t@t.t", _wt_main, False,
+         "the main checkout writing its own config is not this defect"),
+        ("git config --global user.email t@t.t", _wt_linked, False, "--global is an exit"),
+        ("git config --worktree core.bare true", _wt_linked, False, "--worktree is an exit"),
+        ("git config --file /tmp/x k v", _wt_linked, False, "--file is an exit"),
+        # READS. `git config user.email` and `git config user.email x` differ only
+        # in operand count and no flag separates them.
+        ("git config user.email", _wt_linked, False, "a bare key is a READ"),
+        ("git config --get user.email", _wt_linked, False, "--get is a READ"),
+        ("git config -l", _wt_linked, False, "-l is a READ"),
+        # Not a repo: the probe cannot run, so it must not produce a verdict.
+        ("git config user.email t@t.t", _elsewhere, False,
+         "no repo -> unmeasured -> must not block (AF-559)"),
+        ("echo hello", _wt_linked, False, "a non-git command is untouched"),
+    ]
+    _wtcfg = len(_wtcases)
+    for _c, _d, _want_block, _why in _wtcases:
+        _rc, _err = run_hook(_c, _d, _elsewhere)
+        _blocked = _rc == 2
+        if _blocked != _want_block:
+            failures.append(
+                "AF-577: %r in %s -> blocked=%s, want %s (%s). stderr: %r"
+                % (_c, "linked" if _d == _wt_linked else os.path.basename(_d),
+                   _blocked, _want_block, _why, _err[:200]))
+    # The refusal must NOT offer --local, which in a linked worktree IS the shared
+    # file. Recommending it would name the defect as its own cure.
+    _rc, _err = run_hook("git config core.bare true", _wt_linked, _elsewhere)
+    _wtcfg += 1
+    if "--local" not in _err or "NOT one of them" not in _err:
+        failures.append(
+            "AF-577: the refusal must explicitly rule OUT --local; got %r" % _err[:300])
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101 + _subst + _lockcases + _sweep)
+             + len(redir_cases) + _mr101 + _subst + _lockcases + _amendlock + _sweep
+             + _wtcfg)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

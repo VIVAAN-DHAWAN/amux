@@ -30,6 +30,27 @@
 //!    `waitpid` only for an aged child owned by this amux-server process;
 //!    zombies owned by another application are reported and left alone.
 //!
+//! 6. **SIP-protected indexing daemons pegged hot** (`fseventsd`, `ecosystemd`,
+//!    `ecosystemanalyti`, `mds*`). the earlier resident-memory ranking had already
+//!    caught `fseventsd` holding 8.8GB in one process, and the 2026-09-11
+//!    memory-exhaustion incident (swap 20.7/21.5GB, `fseventsd` 100%+ CPU for
+//!    over 11 days uninterrupted) confirmed it cannot be reaped the way
+//!    categories 1-5 are: `csrutil status` reports SIP enabled and the binary
+//!    itself is flagged `restricted`, so no signal (including from root)
+//!    touches it, and no amount of watching changes that. What DOES help is
+//!    upstream of the daemon: it is busy because Spotlight is indexing
+//!    high-churn directories (`~/Dev`, `~/.amux`, this fleet's scratchpad
+//!    tmp), and this machine's separate process-health tool (`procwarden`)
+//!    had been logging exactly that recommendation into its own
+//!    `~/.procwarden/maintain.log` for a while — "add its churn source to
+//!    maintenance.spotlight_exclude" — with nobody ever filling the config in,
+//!    because a log line nobody is grepping for is not a fix (ethos rule 6).
+//!    Dropping a `.metadata_never_index` sentinel file is the standard
+//!    per-directory Spotlight opt-out: it needs no root, cannot lose data, and
+//!    is fully reversible (delete the file). It only stops the indexer from
+//!    ENTERING new churn from that path — a live backlog already queued still
+//!    has to drain, so this is not instant.
+//!
 //! WHAT THIS WILL NOT DO:
 //! - Kill a process whose state it cannot verify. Silence is not dead.
 //! - Kill processes the raylet is still using (raylet running = ray is live).
@@ -347,13 +368,31 @@ fn orphaned_playwright_chromes(grace_s: u64) -> (Vec<(u32, u64)>, usize) {
 }
 
 /// Count running `claude` processes and warn if over threshold.
-fn check_claude_count(max: usize) -> usize {
-    let count = std::process::Command::new("pgrep")
-        .args(["-c", "-x", "claude"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
-        .unwrap_or(0);
+///
+/// `None` means the count could not be taken — which is NOT zero, and the two
+/// must not share a rendering (ethos rule 4).
+///
+/// THIS RETURNED 0 FOREVER. It ran `pgrep -c -x claude`, and macOS pgrep has
+/// no `-c`: the command printed its usage to stderr, exited non-zero, and
+/// `.unwrap_or(0)` turned that into a count of zero. So the ceiling below could
+/// never be crossed and the warning could never fire. Measured 2026-09-10 with
+/// 78 real claude processes against a max of 60: the tick logged
+/// `claude_count=0 max_claude=60` while the host sat at 95% swap and macOS was
+/// killing workers. A check that cannot fail is not a check (ethos rule 7).
+fn check_claude_count(max: usize) -> Option<usize> {
+    let out = std::process::Command::new("pgrep").args(["-x", "claude"]).output().ok()?;
+    // pgrep exits 1 with no output when nothing matches, which IS a real zero.
+    // Any other failure is an un-measured count and must stay None.
+    let code = out.status.code().unwrap_or(-1);
+    if code > 1 {
+        tracing::warn!(
+            job = JOB, code, stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "mac-health: could not count claude processes — the ceiling is UNENFORCED \
+             until this is fixed, and a zero here would be a lie"
+        );
+        return None;
+    }
+    let count = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count();
     if count > max {
         tracing::warn!(
             job = JOB,
@@ -364,7 +403,192 @@ fn check_claude_count(max: usize) -> usize {
              Check for ghost lanes with `amux ls` and stop idle ones."
         );
     }
-    count
+    Some(count)
+}
+
+/// Where sysctl actually is, most-specific first. `/usr/sbin` is absent from
+/// launchd's PATH; the bare name is kept last so a non-standard host still works.
+const SYSCTL_PATHS: [&str; 2] = ["/usr/sbin/sysctl", "sysctl"];
+
+/// Swap percentage in use, or None when it cannot be read.
+fn swap_used_pct() -> Option<f64> {
+    // ABSOLUTE PATH, BECAUSE LAUNCHD'S PATH IS NOT A SHELL'S.
+    // This server runs under launchd with
+    // PATH=~/.cargo/bin:~/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
+    // — no /usr/sbin, which is where sysctl lives. Bare `sysctl` therefore
+    // failed to spawn and the probe returned None on every tick: the first
+    // deploy of this arm logged `swap_pct=-1 swap_measured=false` while the
+    // host really was at 95%. It is the documented launchd-PATH trap in
+    // CLAUDE.md, hit again. pgrep, ps and tmux all resolve on that PATH, which
+    // is why only this one broke.
+    let out = SYSCTL_PATHS
+        .iter()
+        .find_map(|bin| std::process::Command::new(bin).args(["-n", "vm.swapusage"]).output().ok())
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    // "total = 32768.00M  used = 31284.00M  free = 1484.00M  (encrypted)"
+    let grab = |key: &str| -> Option<f64> {
+        let at = text.find(key)?;
+        text[at + key.len()..]
+            .trim_start_matches(|c: char| c == '=' || c.is_whitespace())
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .next()?
+            .parse::<f64>()
+            .ok()
+    };
+    let (total, used) = (grab("total")?, grab("used")?);
+    if total <= 0.0 { return None; }
+    Some(used / total * 100.0)
+}
+
+/// tmux sessions created by an amux TEST harness, older than `grace_s`.
+///
+/// These are the amux-owned share of memory pressure and nothing else reaps
+/// them: they carry no registered worker, so no lane owns them, and each holds
+/// a claude process. Measured 2026-09-10 on a host at 96% swap: 40 such panes
+/// alive, 25 of them leaked by amux's own lifecycle e2e spec across earlier
+/// runs, together holding 19 claude processes.
+///
+/// Scoped to prefixes a harness mints, never to a worker name. A real lane is
+/// somebody's work in progress and is not this job's to end.
+fn stale_test_panes(grace_s: u64) -> Vec<String> {
+    const HARNESS: [&str; 3] = ["e2e-", "board-reviewer-", "callback-b-"];
+    let out = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() { return Vec::new(); }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, created) = line.rsplit_once(' ')?;
+            let bare = name.strip_prefix("amux-")?;
+            if !HARNESS.iter().any(|p| bare.starts_with(p)) { return None; }
+            let age = now.saturating_sub(created.trim().parse::<u64>().ok()?);
+            (age >= grace_s).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn test_pane_grace_s() -> u64 {
+    std::env::var("AMUX_TEST_PANE_GRACE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(1800)
+}
+
+fn mem_reap_swap_pct() -> f64 {
+    std::env::var("AMUX_MEM_REAP_SWAP_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(85.0)
+}
+
+/// SIP-protected indexing daemons worth watching — the same list procwarden's
+/// `maintenance.watch_daemons` already uses. `ps comm` truncates long names,
+/// so these are prefix-matched (`ecosystemanalyti`, not the full
+/// `ecosystemanalyticsd`).
+const INDEXING_DAEMON_NAMES: [&str; 7] = [
+    "fseventsd", "ecosystemd", "ecosystemanalyti", "mds", "mds_stores", "mdworker", "mdworker_shared",
+];
+
+fn indexing_daemon_cpu_above() -> f64 {
+    std::env::var("AMUX_MAC_HEALTH_DAEMON_CPU_ABOVE").ok().and_then(|v| v.parse().ok()).unwrap_or(80.0)
+}
+
+/// `ps comm` truncates long names, so this is a prefix match against
+/// [`INDEXING_DAEMON_NAMES`], not an exact one.
+fn is_indexing_daemon(name: &str) -> bool {
+    INDEXING_DAEMON_NAMES.iter().any(|w| name.starts_with(w))
+}
+
+/// Whether a `.metadata_never_index` sentinel can plausibly quiet this daemon.
+///
+/// THE ARM ABOVE CANNOT REACH `fseventsd`, AND SAYING SO IS THE POINT.
+/// `.metadata_never_index` is a SPOTLIGHT opt-out: it stops `mds`/`mds_stores`
+/// from ENTERING a path into the index. `fseventsd` is a different daemon that
+/// journals filesystem events for the whole volume, and it does that whether or
+/// not Spotlight indexes the path. Measured 2026-09-14: `~/Dev` is fully
+/// excluded (`mdfind -onlyin ~/Dev -count` = 0) while `fseventsd` sat at
+/// 108-112% CPU for a fifteenth consecutive day. The exclusion is still worth
+/// doing for the mds family; it is simply not a lever on this one.
+///
+/// Without this split the tick logs "every known churn source is already
+/// excluded" beside `fseventsd=108%`, which reads as "the remedy is applied and
+/// working" when the remedy was never connected to that daemon. Two lanes have
+/// now spent time adding exclusions expecting fseventsd to fall.
+fn spotlight_exclusion_can_reach(name: &str) -> bool {
+    !name.starts_with("fseventsd")
+}
+
+/// `(name, %cpu)` for every watched indexing daemon currently above the
+/// threshold. CPU discovery is separate from the compressed-memory snapshot.
+fn hot_indexing_daemons(above: f64) -> Vec<(String, f64)> {
+    let Ok(out) = std::process::Command::new("ps").args(["-eo", "%cpu=,comm="]).output() else {
+        return Vec::new();
+    };
+    let mut out_rows = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        let Some((cpu, comm)) = line.split_once(char::is_whitespace) else { continue };
+        let Ok(cpu) = cpu.trim().parse::<f64>() else { continue };
+        let name = comm.trim().rsplit('/').next().unwrap_or(comm.trim());
+        if cpu > above && is_indexing_daemon(name) {
+            out_rows.push((name.to_string(), cpu));
+        }
+    }
+    out_rows
+}
+
+/// Directories whose Spotlight churn feeds the indexing daemons above.
+/// `/private/tmp/claude-<uid>` is computed rather than hardcoded, because the
+/// literal `501` in the incident that prompted this is this host's uid, not a
+/// constant — a different uid would make a hardcoded path silently do nothing.
+fn spotlight_exclude_paths() -> Vec<std::path::PathBuf> {
+    if let Ok(raw) = std::env::var("AMUX_MAC_HEALTH_SPOTLIGHT_EXCLUDE") {
+        return raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| std::path::PathBuf::from(shellexpand_home(s)))
+            .collect();
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into());
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let mut v = vec![
+        std::path::PathBuf::from(format!("{home}/Dev")),
+        std::path::PathBuf::from(format!("{home}/.amux")),
+    ];
+    if let Some(uid) = uid {
+        v.push(std::path::PathBuf::from(format!("/private/tmp/claude-{uid}")));
+    }
+    v
+}
+
+fn shellexpand_home(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into());
+        format!("{home}/{rest}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Drops the sentinel if the directory exists and does not already have one.
+/// `Ok(true)` = newly excluded this call, `Ok(false)` = already excluded or
+/// not a directory (both are "nothing to do", not an error).
+fn ensure_spotlight_excluded(dir: &std::path::Path) -> Result<bool, String> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let sentinel = dir.join(".metadata_never_index");
+    if sentinel.exists() {
+        return Ok(false);
+    }
+    std::fs::File::create(&sentinel).map(|_| true).map_err(|e| e.to_string())
 }
 
 fn one_pass() {
@@ -494,17 +718,117 @@ fn one_pass() {
         );
     }
 
+    // --- Memory pressure: reap what amux owns, and NAME the rest ---
+    let swap_pct = swap_used_pct();
+    let mut panes_reaped = 0usize;
+    if swap_pct.is_some_and(|p| p >= mem_reap_swap_pct()) {
+        for name in stale_test_panes(test_pane_grace_s()) {
+            let st = crate::backend::tmux::session_target(&name);
+            if std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &st])
+                .status()
+                .is_ok_and(|st| st.success())
+            {
+                panes_reaped += 1;
+                tracing::info!(job = JOB, pane = %name, "mac-health: reaped a stale test pane under memory pressure");
+            }
+        }
+        let memory = super::memory_consumers::snapshot();
+        tracing::warn!(
+            job = JOB,
+            measured = memory.measured,
+            n_considered = memory.n_considered,
+            memory_metric = memory.metric,
+            why_unmeasured = ?memory.why_unmeasured,
+            swap_pct = swap_pct.unwrap_or(-1.0) as i64,
+            threshold_pct = mem_reap_swap_pct() as i64,
+            panes_reaped,
+            top_consumers = ?memory.consumers,
+            knob = "AMUX_MEM_REAP_SWAP_PCT",
+            "mac-health: host is under memory pressure — reaped amux's own stale test panes. \
+             Anything named above that is not amux's is a human's call, not this job's."
+        );
+    }
+
+    // --- SIP-protected indexing daemons: exclude their known churn sources ---
+    // Unlike the arm above, this does not wait for swap pressure: excluding a
+    // directory from Spotlight has no downside, so the right time to do it is
+    // as soon as the daemon that would benefit is hot, not after the host is
+    // already at 85%+ swap. It is idempotent (the sentinel either exists or
+    // it does not) and safe to run every tick.
+    let hot_daemons = hot_indexing_daemons(indexing_daemon_cpu_above());
+    let mut spotlight_newly_excluded = Vec::new();
+    if !hot_daemons.is_empty() {
+        for p in spotlight_exclude_paths() {
+            match ensure_spotlight_excluded(&p) {
+                Ok(true) => spotlight_newly_excluded.push(p.display().to_string()),
+                Ok(false) => {}
+                Err(e) => tracing::debug!(
+                    job = JOB, path = %p.display(), error = %e,
+                    "mac-health: spotlight-exclude failed"
+                ),
+            }
+        }
+        let daemons_str = hot_daemons
+            .iter()
+            .map(|(n, c)| format!("{n}={c:.0}%"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !spotlight_newly_excluded.is_empty() {
+            tracing::warn!(
+                job = JOB,
+                daemons = %daemons_str,
+                excluded = %spotlight_newly_excluded.join(", "),
+                "mac-health: SIP-protected indexing daemon(s) hot — dropped .metadata_never_index \
+                 in known churn sources (non-destructive, reversible; can't kill fseventsd — SIP \
+                 blocks it — so this starves the churn instead; an already-queued backlog still \
+                 drains on its own, this is not instant)"
+            );
+        } else {
+            tracing::debug!(
+                job = JOB, daemons = %daemons_str,
+                "mac-health: indexing daemon(s) hot but every known churn source is already excluded"
+            );
+        }
+        // Say which of the hot daemons this arm CANNOT help, every time it runs.
+        // Otherwise the two lines above are the only signal and both imply the
+        // lever applies to everything in `daemons_str`.
+        let unreachable = hot_daemons
+            .iter()
+            .filter(|(n, _)| !spotlight_exclusion_can_reach(n))
+            .map(|(n, c)| format!("{n}={c:.0}%"))
+            .collect::<Vec<_>>();
+        if !unreachable.is_empty() {
+            tracing::warn!(
+                job = JOB,
+                daemons = %unreachable.join(" "),
+                measured = true,
+                verdict = "spotlight_exclusion_cannot_reach_daemon",
+                "mac-health: these hot daemons are NOT addressable by Spotlight exclusion — they                  journal volume events regardless of what is indexed. Adding more exclude paths                  will not lower them. fseventsd is also SIP-protected (csrutil enabled, binary                  flagged restricted), so no signal reaches it either: a reboot on the owner's                  schedule is the only thing that clears it (MO-3326)"
+            );
+        }
+    }
+
     // --- Claude process count ---
     let claude_count = check_claude_count(max_claude);
     tracing::info!(
         job = JOB,
-        claude_count,
+        claude_count = claude_count.map(|c| c as i64).unwrap_or(-1),
+        // The discriminator the old line lacked: a real 0 and a failed probe
+        // rendered identically, so nobody could tell a quiet host from a blind
+        // one. -1 is never a process count.
+        claude_count_measured = claude_count.is_some(),
         max_claude,
+        swap_pct = swap_pct.unwrap_or(-1.0) as i64,
+        swap_measured = swap_pct.is_some(),
+        panes_reaped,
         ray_alive = raylet_running(),
         playwright_chromes_reaped = pw_orphans.len(),
         rustc_reaped,
         zombies_seen,
         zombies_reaped,
+        indexing_daemons_hot = hot_daemons.len(),
+        spotlight_newly_excluded = spotlight_newly_excluded.len(),
         "mac-health tick"
     );
 }
@@ -520,6 +844,52 @@ pub fn spawn() -> super::PeriodicTask {
 mod tests {
     use super::*;
 
+    /// The predicate this whole arm hinges on: only the SIP-protected
+    /// indexing daemons it can't reap by any other means should match, not
+    /// every process whose name happens to contain a substring.
+    #[test]
+    fn indexing_daemon_matching_is_prefix_not_substring() {
+        for name in ["fseventsd", "ecosystemd", "ecosystemanalyticsd", "mds", "mds_stores", "mdworker", "mdworker_shared"] {
+            assert!(is_indexing_daemon(name), "{name} must match — it's what this arm exists to find");
+        }
+        for name in ["rustc", "Chrome", "claude", "xecosystemd", "notmds"] {
+            assert!(!is_indexing_daemon(name), "{name} must NOT match — a substring hit would exclude the wrong host state");
+        }
+    }
+
+    #[test]
+    fn ensure_spotlight_excluded_is_idempotent_and_leaves_a_real_sentinel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // First call: the directory is unmarked, so this drops the sentinel.
+        assert_eq!(ensure_spotlight_excluded(dir.path()), Ok(true));
+        assert!(dir.path().join(".metadata_never_index").exists());
+        // Second call on the same directory: already excluded, nothing to do.
+        // A job that re-touches this every 30-minute tick without noticing
+        // would generate a WARN line every tick forever, which is exactly the
+        // kind of noise ethos rule 5 is about.
+        assert_eq!(ensure_spotlight_excluded(dir.path()), Ok(false));
+    }
+
+    #[test]
+    fn ensure_spotlight_excluded_skips_non_directories_without_erroring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        assert_eq!(ensure_spotlight_excluded(&missing), Ok(false));
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(ensure_spotlight_excluded(&file), Ok(false));
+    }
+
+    #[test]
+    fn shellexpand_home_only_touches_a_leading_tilde_slash() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into());
+        assert_eq!(shellexpand_home("~/Dev"), format!("{home}/Dev"));
+        assert_eq!(shellexpand_home("/private/tmp/claude-501"), "/private/tmp/claude-501");
+        // A bare `~` with no trailing slash is not the pattern this function
+        // promises to handle — must pass through unchanged, not panic.
+        assert_eq!(shellexpand_home("~"), "~");
+    }
+
     #[test]
     fn etime_parses_correctly() {
         assert_eq!(parse_etime("01:30"), Some(90));
@@ -528,6 +898,54 @@ mod tests {
         assert_eq!(parse_etime("00:05"), Some(5));
         // Malformed -> None, not a panic.
         assert_eq!(parse_etime("bad"), None);
+    }
+
+    #[test]
+    fn the_pressure_arm_reaps_only_harness_panes_and_only_when_stale() {
+        // The rule this job must not get wrong: a real lane is somebody's work
+        // in progress. Only prefixes a HARNESS mints are eligible, and only
+        // once they are old enough that no run still owns them.
+        const HARNESS: [&str; 3] = ["e2e-", "board-reviewer-", "callback-b-"];
+        let eligible = |bare: &str| HARNESS.iter().any(|p| bare.starts_with(p));
+
+        // Real workers, including ones whose names merely CONTAIN a harness
+        // word — a prefix test and a substring test differ exactly here.
+        for lane in [
+            "amux", "backend", "mixpeek-orchestrator", "amux-testing-e2e",
+            "gtm-e2e-runner", "my-callback-b-worker",
+        ] {
+            assert!(!eligible(lane), "{lane} is a real lane and must never be reaped");
+        }
+        for harness in [
+            "e2e-life-desktop-1788996104537",
+            "board-reviewer-ios-safari-1788976843246",
+            "callback-b-desktop-1788849272894",
+        ] {
+            assert!(eligible(harness), "{harness} is harness scaffolding and should be eligible");
+        }
+
+        // Age gates independently of the name: a pane from a RUNNING test is
+        // not stale, and reaping it would kill the run that owns it.
+        let grace = test_pane_grace_s();
+        assert!(grace > 0, "a zero grace would reap panes belonging to a live run");
+        assert!(mem_reap_swap_pct() > 0.0 && mem_reap_swap_pct() <= 100.0);
+    }
+
+    #[test]
+    fn swap_and_consumers_report_absence_rather_than_a_false_zero() {
+        // Both feed a decision to KILL things, so "could not measure" must not
+        // arrive as a number. swap_used_pct returns Option and the tick logs
+        // swap_measured beside it; the ranking says so in words.
+        // On macOS this MUST measure. Returning None here is the launchd-PATH
+        // bug: /usr/sbin is not on the server's PATH, so a bare `sysctl` never
+        // spawns and the arm silently never fires. Asserting Some is what
+        // makes that a red test instead of a quiet -1 in a log nobody reads.
+        #[cfg(target_os = "macos")]
+        {
+            let p = swap_used_pct().expect("swap must be measurable on macOS — check SYSCTL_PATHS");
+            assert!((0.0..=100.0).contains(&p), "swap pct out of range: {p}");
+        }
+        // The memory snapshot has its own native and malformed-output controls.
     }
 
     #[test]
@@ -646,6 +1064,28 @@ mod ps_row_tests {
         assert_eq!(ppid, 1, "orphaned to init");
         assert!(cmd.contains("Google Chrome"));
         assert!(cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile"));
+    }
+
+    /// The arm drops Spotlight sentinels and then reports on daemons it cannot
+    /// affect. This pins WHICH ones it cannot, because the whole failure mode is
+    /// a log line that reads as "remedy applied and working" over a daemon the
+    /// remedy never touched. If someone adds fseventsd back to the reachable
+    /// set, this goes red rather than the fleet quietly re-learning it.
+    #[test]
+    fn spotlight_exclusion_is_not_claimed_to_reach_fseventsd() {
+        // Not reachable: journals volume events regardless of what is indexed,
+        // verified 2026-09-14 with ~/Dev fully excluded and fseventsd at 110%.
+        assert!(!spotlight_exclusion_can_reach("fseventsd"));
+        // `ps comm` truncation must not smuggle it back in as "reachable".
+        assert!(!spotlight_exclusion_can_reach("fseventsd_foo"));
+        // The mds family IS reachable — that is why the arm still exists, and a
+        // change that made this blanket-false would quietly disable a real fix.
+        for reachable in ["mds", "mds_stores", "mdworker", "mdworker_shared", "ecosystemd"] {
+            assert!(
+                spotlight_exclusion_can_reach(reachable),
+                "{reachable} is addressable by a Spotlight exclusion and must stay so"
+            );
+        }
     }
 
     #[test]

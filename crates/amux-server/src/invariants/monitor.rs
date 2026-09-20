@@ -109,6 +109,25 @@ pub fn last_section_timing() -> Option<SectionTiming> {
     SECTION_MS.get_or_init(Default::default).lock().ok().and_then(|g| g.clone())
 }
 
+/// Fold two recency readings into the NEWEST (AMUX-4753).
+///
+/// SQL groups by raw path and Rust folds those into a route shape, so one shape
+/// accumulates a `MAX(ts)` from each of its paths. Newest has to win: taking the
+/// oldest, or letting the last row seen overwrite, reports a shape as stale
+/// while one of its paths was called a minute ago — and stale is exactly what a
+/// reader now uses to decide whether a finding is live.
+///
+/// Extracted rather than inlined because it was not testable inlined. Written
+/// inline first, it survived a mutation from `max` to `min` with the whole suite
+/// green, which is a rule nothing tested.
+fn newest(current: Option<f64>, incoming: Option<f64>) -> Option<f64> {
+    match (current, incoming) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
 pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let mut out = Vec::new();
     let mut tm = SectionTimer::new();
@@ -143,11 +162,44 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         )),
         Ok(conn) => {
             let since = crate::config::now_f64() - 14.0 * 86400.0;
-            let mut acc: std::collections::HashMap<(String, String), (i64, i64)> =
+            // NAMED FIELDS, not a 5-tuple. clippy::type_complexity refuses the
+            // tuple, and it is right for a second reason: five bare i64s
+            // accumulated positionally (`e.0 += ok; e.1 += n; ...`) is a
+            // transposition waiting to happen, and a swapped pair here would
+            // surface as a wrong verdict rather than as a compile error.
+            #[derive(Default)]
+            struct Acc {
+                ok: i64,
+                n: i64,
+                redirect: i64,
+                client_err: i64,
+                server_err: i64,
+                unavailable: i64,
+                /// Newest `ts` in the group, so a finding can say how old it is
+                /// (AMUX-4753). `None` until a row contributes one.
+                last_seen: Option<f64>,
+            }
+            let mut acc: std::collections::HashMap<(String, String), Acc> =
                 std::collections::HashMap::new();
+            // 503 is summed APART from the rest of the 5xx band, because it is
+            // the only status a handler picks to say "something I depend on is
+            // not there" and `status >= 500` cannot be un-mixed afterwards
+            // (AMUX-4545).
+            // 3xx is summed too (AMUX-4753): a redirect is the route ANSWERING,
+            // and `ok` alone cannot say so. MAX(ts) rides along so a finding can
+            // publish how old it is — without it a burst early in this 14-day
+            // window is indistinguishable from a route failing right now.
             let rows = conn
                 .prepare(
-                    "SELECT method, path,                             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),                             COUNT(*)                      FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
+                    "SELECT method, path, \
+                            SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), \
+                            COUNT(*), \
+                            SUM(CASE WHEN status >= 400 AND status < 500 THEN 1 ELSE 0 END), \
+                            SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), \
+                            SUM(CASE WHEN status = 503 THEN 1 ELSE 0 END), \
+                            SUM(CASE WHEN status >= 300 AND status < 400 THEN 1 ELSE 0 END), \
+                            MAX(ts) \
+                     FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map([since], |r| {
@@ -156,24 +208,39 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             r.get::<_, String>(1)?,
                             r.get::<_, i64>(2)?,
                             r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, i64>(7)?,
+                            r.get::<_, Option<f64>>(8)?,
                         ))
                     })
                     .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 })
                 .unwrap_or_default();
-            for (method, path, ok, n) in rows {
+            for (method, path, ok, n, c4, c5, c503, c3, last) in rows {
                 let shape = crate::api::request_log::normalize_target_verb(&path);
-                let e = acc.entry((method, shape)).or_insert((0, 0));
-                e.0 += ok;
-                e.1 += n;
+                let e = acc.entry((method, shape)).or_default();
+                e.ok += ok;
+                e.n += n;
+                e.redirect += c3;
+                e.client_err += c4;
+                e.server_err += c5;
+                e.unavailable += c503;
+                e.last_seen = newest(e.last_seen, last);
             }
             let groups: Vec<checks::RouteOutcomeRow> = acc
                 .into_iter()
-                .map(|((method, shape), (ok, n))| checks::RouteOutcomeRow {
+                .map(|((method, shape), a)| checks::RouteOutcomeRow {
                     method,
                     shape,
-                    n,
-                    ok,
+                    n: a.n,
+                    ok: a.ok,
+                    redirect: a.redirect,
+                    client_err: a.client_err,
+                    server_err: a.server_err,
+                    unavailable: a.unavailable,
+                    last_seen: a.last_seen,
                 })
                 .collect();
             out.extend(checks::mounted_routes_answer(&groups, &mounted));
@@ -260,6 +327,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // path INIT-1's KillMode=process already covers (an OOM kill of the
     // pane, a manual kill, a crash).
     out.extend(registered_lanes_running_check().await);
+    out.push(crate::backend::tmux_health::observe().await.invariant());
 
     tm.mark(&out, "5c. every registered, non-archived lane actually has");
     // -- 5d. did any pane's WHOLE systemd scope just get OOM-killed, not just
@@ -326,6 +394,50 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             wt.as_deref(),
             runtime,
         ));
+
+        // -- 6b. the DEPLOY path is still ticking (AMUX-4809). launchd stopped
+        // firing com.amux.server-rs-builder for 59 consecutive cycles and
+        // NOTHING SAID SO: the log stopped, /health's `commit` quietly stopped
+        // moving, and a human found it an hour later while wondering whether a
+        // fix was live. Every lane's commits stopped deploying for that hour.
+        //
+        // The log's mtime is the signal because it is what the builder touches
+        // every cycle, and it is observable without asking launchd anything.
+        // That matters: `launchctl list` and `launchctl print` returned nothing
+        // for this label AND for com.amux.server-rs while the latter was
+        // definitely running, so a probe built on them cannot produce a
+        // positive and is not evidence either way.
+        //
+        // A stat failure becomes Unknown inside the check, never a pass.
+        let builder_log_age_s = std::fs::metadata(amux_home.join("logs/rust-auto-build.log"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs_f64());
+        out.extend(checks::builder_has_ticked_recently(
+            builder_log_age_s,
+            checks::BUILDER_INTERVAL_S,
+            checks::BUILDER_MAX_INTERVALS,
+        ));
+
+        // The helper-model read router is the third consumer of the same
+        // installed-script rule. Keeping it here means an uncommitted runtime
+        // edit cannot silently change fleet-wide context routing.
+        const BAKED_LARGE_READ_GUARD: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/hooks/large-read-guard.py"
+        ));
+        let runtime = std::fs::read_to_string(amux_home.join("hooks/large-read-guard.py"))
+            .map_err(|e| e.to_string());
+        let head = read_head(checks::LARGE_READ_GUARD.committed_path);
+        let wt = read_worktree(checks::LARGE_READ_GUARD.committed_path);
+        out.extend(checks::installed_script_matches_committed(
+            &checks::LARGE_READ_GUARD,
+            BAKED_LARGE_READ_GUARD,
+            head.as_deref(),
+            wt.as_deref(),
+            runtime,
+        ));
     }
 
     tm.mark(&out, "6. shared-checkout git guard");
@@ -334,6 +446,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // file it compares was correct the whole time and settings.json simply
     // pointed elsewhere. This is the leg that fails on the actual incident.
     out.extend(report_hooks_check());
+    out.extend(large_read_hooks_check());
 
     tm.mark(&out, "6b. and is anything WIRED to that script? The sha ch");
     // -- 6c. are session reports ATTRIBUTED? (AF-67). The largest signal in the
@@ -343,12 +456,22 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(reports_attributed_check(state));
 
     tm.mark(&out, "6c. are session reports ATTRIBUTED?");
+    // -- 6c2. does the CURRENT staged-guard reach every checkout? (AF-410,
+    // restored under AF-943 after 9c17d990 silently dropped it in a wholesale
+    // merge-resolution rewrite of this file. See checks.rs for the incident.)
+    out.extend(guard_reach_check(state));
+
+    tm.mark(&out, "6c2. does the staged-guard reach every checkout?");
     // -- 6d. are auto-filed cards DISPATCHABLE? (AF-137: 215 session=NULL
     // reports invisible to auto-pickup's session-keyed predicate, both
     // halves reporting success for 11 days).
     out.extend(autofix_dispatchable_check(state));
+    out.extend(todo_reachable_check(state));
+    out.extend(repeat_offer_check(state));
+    out.extend(archived_terminal_check(state));
     out.extend(card_type_vocabulary_check(state));
     out.extend(board_list_read_check(state));
+    out.extend(task_graph_check(state));
 
     tm.mark(&out, "6d. are auto-filed cards DISPATCHABLE?");
     // -- 6f. does the frustrations LEDGER agree with the board? (AF-191).
@@ -358,6 +481,14 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // fact with nothing between them.
     out.extend(frustration_ledger_check(state));
     out.extend(schedule_kind_check(state));
+    out.extend(schedule_target_check(state));
+    // AF-582: the announcement for an interrupted schedule fire already
+    // existed (scheduler.rs's own AF-515 warn on startup) and reached
+    // nobody — it fired 20 times through gtm-ticker's incident window and
+    // the only consumer was the log file. This is the same fact surfaced
+    // through a channel lanes already read (GET /api/health/invariants),
+    // read-only and additive.
+    out.extend(unrecorded_schedule_outcomes_check(state));
 
     tm.mark(&out, "6f. does the frustrations LEDGER agree with the boar");
     // -- 6e. is the invariant system's OWN evaluation log bounded? (AMUX-3489:
@@ -372,6 +503,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(capture_pipeline_check(state));
 
     tm.mark(&out, "7. capture pipeline");
+    // -- 7b. did decomposition produce cards a stranger can execute and close?
+    // The endpoint validates the write; this independent read catches any
+    // second producer, legacy partial row, or later destructive edit.
+    out.extend(decomposition_detail_check(state));
+
+    tm.mark(&out, "7b. decomposition detail");
     // -- 8. provider launch agrees with its adapter (RR-0043 / AMUX-3153): does
     // the server launch each provider with the same binary its adapter — and its
     // capability report — describes? The launcher and the adapter are two
@@ -401,7 +538,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
 
     tm.mark(&out, "9. fire-alarm reachability");
 
-    // -- N. Nonterminal cards have a disposition (next_action).
+    // -- N. Nonterminal cards record what moves them, per status (AMUX-4540).
     match state.store.read() {
         Err(_) => {
             out.push(InvariantResult::unknown(
@@ -412,7 +549,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         Ok(conn) => {
             let rows: Vec<checks::DispositionRow> = conn
                 .prepare(
-                    "SELECT id, status, next_action, session, COALESCE(type,'code') \
+                    "SELECT id, status, next_action, session, COALESCE(type,'code'), \
+                            COALESCE(NULLIF(TRIM(ask_question),''), NULLIF(TRIM(decision_question),'')), \
+                            reviewer, \
+                            COALESCE(NULLIF(TRIM(blocked_on),''), NULLIF(TRIM(waiting_on),'')), \
+                            COALESCE(TRIM(depends_on),'') NOT IN ('', '[]'), \
+                            callback_session \
                      FROM issues WHERE deleted IS NULL AND COALESCE(archived,0) = 0",
                 )
                 .and_then(|mut stmt| {
@@ -423,6 +565,11 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             next_action: r.get(2)?,
                             session: r.get(3)?,
                             item_type: r.get(4)?,
+                            ask: r.get(5)?,
+                            reviewer: r.get(6)?,
+                            waiting_on: r.get(7)?,
+                            has_dependency: r.get(8)?,
+                            callback_session: r.get(9)?,
                         })
                     })
                     .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
@@ -433,8 +580,113 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     }
     tm.mark(&out, "N. nonterminal disposition");
 
+    // -- 12. does an f64 read back from JSON as the f64 that was written? (AF-595)
+    out.extend(checks::f64_survives_json_roundtrip(&f64_roundtrip_probes()));
+    tm.mark(&out, "12. f64 JSON round trip");
+
     tm.finish();
     out
+}
+
+/// Probe values for [`checks::f64_survives_json_roundtrip`] (AF-595): the two
+/// epoch f64s CI actually failed on, plus two built from THIS process's clock
+/// so the check measures the running server rather than two constants a future
+/// parser could happen to get right.
+///
+/// The round trip is done HERE and the comparison in `checks`, so the
+/// comparator stays pure and its negative control can inject the drift.
+fn f64_roundtrip_probes() -> Vec<(f64, f64)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    [1788887412.4197621_f64, 1788859526.4033027_f64, now, now - 10.0]
+        .into_iter()
+        .map(|wrote| {
+            // A round trip that ERRORS is a failed round trip, not a skip:
+            // NAN compares unequal, so it reaches the check as a drift.
+            let read = serde_json::to_string(&wrote)
+                .ok()
+                .and_then(|t| serde_json::from_str::<f64>(&t).ok())
+                .unwrap_or(f64::NAN);
+            (wrote, read)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod f64_roundtrip_wiring_tests {
+    /// AF-595's check is REGISTERED, not merely written. Deleting its call
+    /// site in `evaluate_all` reddens nothing else: the section/mark counter
+    /// in `section_timing_tests` stays balanced because the section comment
+    /// goes with it, and `checks`'s own unit tests keep passing on a function
+    /// nobody calls. An unregistered invariant is silence that reads as health.
+    #[test]
+    fn the_f64_roundtrip_check_is_actually_called_by_evaluate_all() {
+        let src = include_str!("monitor.rs");
+        let body = src
+            .split_once("pub async fn evaluate_all(")
+            .expect("evaluate_all exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        assert!(
+            body.contains("checks::f64_survives_json_roundtrip("),
+            "serde.f64_survives_json_roundtrip is defined but not evaluated, so a \
+             dropped float_roundtrip feature would announce nothing at runtime"
+        );
+    }
+}
+
+fn decomposition_detail_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.decomposed_tasks_have_comprehensive_details";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT i.id,i.title,i.desc,i.status,i.session,i.creator,COALESCE(i.type,'code'),i.epic, \
+                i.depends_on,i.next_action,i.acceptance_criteria, \
+                (SELECT GROUP_CONCAT(t.tag) FROM issue_tags t WHERE t.issue_id=i.id), \
+                i.evidence,i.closed_at,COALESCE(i.created,0), \
+                (SELECT COUNT(*) FROM _amux_task_artifacts a WHERE a.task_id=i.id) \
+         FROM issues i WHERE i.source='decomposition' AND i.deleted IS NULL \
+              AND COALESCE(i.archived,0)=0 ORDER BY i.created,i.id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query prepare failed: {e}"))],
+    };
+    let rows = match stmt
+        .query_map([], |r| {
+            let tags_raw: Option<String> = r.get(11)?;
+            Ok(checks::DecompositionDetailRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                desc: r.get(2)?,
+                status: r.get(3)?,
+                session: r.get(4)?,
+                creator: r.get(5)?,
+                item_type: r.get(6)?,
+                epic: r.get(7)?,
+                depends_on: r.get(8)?,
+                next_action: r.get(9)?,
+                acceptance_criteria: r.get(10)?,
+                tags: tags_raw
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                evidence: r.get(12)?,
+                closed_at: r.get(13)?,
+                created: r.get(14)?,
+                artifact_count: r.get(15)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(rows) => rows,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
+    };
+    checks::decomposed_tasks_have_comprehensive_details(&rows)
 }
 
 /// AMUX-3203. Reads the SAME config keys and `push_subscriptions` table
@@ -527,6 +779,66 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
 /// `deleted` and `enabled` are filtered HERE rather than in the check, because a
 /// disabled or deleted schedule costs nothing per fire — it does not fire. The
 /// claim under test is about what a LIVE schedule spends.
+/// AMUX-4784: enabled schedules pointed at a lane that refuses them.
+///
+/// The deliverability question is NOT answered here. It delegates to
+/// `session_verbs::schedule_target_refusal`, which is the same function
+/// `deliver_automated` refuses with, so this check cannot drift from the
+/// mechanism it describes. Re-deriving the rules locally is exactly the defect
+/// one layer up: a view that does not share the predicate of the thing it
+/// reports on.
+fn schedule_target_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "schedule.target_can_receive";
+    let Ok(conn) = state.store.read() else {
+        // Cannot read: Unknown, never Pass.
+        return vec![InvariantResult::new(ID, Status::Unknown)];
+    };
+    // `consecutive_refusals` counts back only to the last run that was NOT
+    // refused, so a schedule that recovered does not carry its old refusals
+    // forever. It is evidence of how long this has been going on; it is not
+    // part of the predicate, which is purely the target's state right now.
+    let rows: Vec<(String, String, String, String, i64)> = conn
+        .prepare(
+            "SELECT s.id, COALESCE(s.title,''), COALESCE(s.session,''), COALESCE(s.kind,'tmux'), \
+                    (SELECT COUNT(*) FROM schedule_runs r \
+                       WHERE r.schedule_id = s.id \
+                         AND COALESCE(r.delivery,'') = 'refused' \
+                         AND r.ran_at > COALESCE((SELECT MAX(r2.ran_at) FROM schedule_runs r2 \
+                                                    WHERE r2.schedule_id = s.id \
+                                                      AND COALESCE(r2.delivery,'') <> 'refused'), 0)) \
+             FROM schedules s WHERE s.enabled=1 AND COALESCE(s.deleted,0)=0",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+
+    let mut total_enabled = 0i64;
+    let mut bad = Vec::new();
+    for (id, title, target, kind, refusals) in rows {
+        // `shell` runs a command with no lane to deliver into, so it has no
+        // target that could refuse. Named in the evidence, not silently dropped.
+        if kind == "shell" {
+            continue;
+        }
+        total_enabled += 1;
+        if let Some(refusal) = crate::api::session_verbs::schedule_target_refusal(&target) {
+            bad.push(checks::UndeliverableSchedule {
+                schedule_id: id,
+                title,
+                target,
+                cause: refusal.cause().to_string(),
+                refusals,
+                terminal: refusal.is_terminal(),
+            });
+        }
+    }
+    checks::schedule_targets_can_receive(&bad, total_enabled)
+}
+
 fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
     let Ok(conn) = state.store.read() else {
         // Cannot read: Unknown, never Pass. A store we could not open is not a
@@ -563,6 +875,124 @@ fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
         )];
     }
     checks::schedule_cost_titles_match_kind(&rows)
+}
+
+/// AF-582: a schedule fire whose delivery outcome was never recorded
+/// (`delivery='unknown'`, stamped by fail_orphaned_cron_runs when the server
+/// restarted mid-fire, AF-515) already gets a `tracing::warn!` on startup --
+/// but a log line is a channel to whoever already suspects something and
+/// knows to grep, not to the fleet. Measured live during gtm-ticker's
+/// restart-burst incident: that warn fired 20 times through the exact
+/// window two lanes lost time misreading `status='error'` as a genuine job
+/// failure, and nothing besides the log file ever consumed it.
+///
+/// Read-only and additive, per the diagnostic contract: counts
+/// `schedule_runs` with `delivery='unknown'` in a recent window, so the
+/// same fact reaches every lane that already reads
+/// `GET /api/health/invariants` instead of only whoever thinks to grep
+/// server-rs.log.
+/// A schedule's period in seconds, taken from the SAME parser the scheduler
+/// fires on so this cannot drift from the cadence the fleet actually runs.
+///
+/// Derived from consecutive fire times rather than a per-shape table, which
+/// keeps cron working without a second implementation of `*/4`. The widest of
+/// several gaps wins: a weekday schedule's Friday-to-Monday gap is three days
+/// while its other gaps are one, and taking a narrow gap there would call a
+/// perfectly healthy Saturday overdue.
+fn cadence_seconds(expr: &str) -> Option<i64> {
+    use crate::runtime_jobs::scheduler::ScheduleExpr;
+    let parsed = ScheduleExpr::parse(expr).ok()?;
+    let mut at = chrono::Local::now();
+    let mut widest = 0i64;
+    for _ in 0..8 {
+        let Some(next) = parsed.next_run_after(at) else { break };
+        widest = widest.max((next - at).num_seconds());
+        at = next;
+    }
+    (widest > 0).then_some(widest)
+}
+
+fn unrecorded_schedule_outcomes_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "scheduler.unrecorded_delivery_outcomes";
+    let window_h: i64 = std::env::var("AMUX_UNRECORDED_SCHEDULE_WINDOW_H")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "could not read the store")];
+    };
+    let now = crate::config::now_f64();
+    let cutoff = chrono::Utc::now().timestamp() - window_h * 3600;
+    // AF-582 follow-up (gtm-ticker): a count with no names sends a reader
+    // back to /api/schedules/runs to re-derive exactly this join. LEFT JOIN
+    // because a schedule can be deleted after firing; a row must still be
+    // reported, just without a title/session to show for it.
+    //
+    // RECOVERY RIDES ALONG (AMUX-4546). An unknown costs whatever the
+    // schedule's own cadence is, and the flat count cannot express that: on
+    // 2026-09-16 the same "1" stood for a 15-minute blip on an every-15m tick
+    // and a 22-hour gap on a daily one. `last_success_after` is the newest
+    // successful run of the SAME schedule after its most recent unknown, so
+    // NULL means the schedule has not succeeded since and the tick is still
+    // outstanding right now.
+    //
+    // SUCCESS IS THREE STATUSES, NOT ONE. Shell runs record 'ok'; tmux
+    // deliveries record 'delivered' or 'queued'. Filtering on 'ok' alone finds
+    // only shell recoveries and reports every healthy tmux schedule as never
+    // having recovered — it invented a stalled SCHED-455 while that schedule
+    // was firing every 20 minutes exactly as configured.
+    //
+    // AND A REFUSAL COUNTS, because what this invariant measures is whether an
+    // outcome got RECORDED, not whether the work succeeded (AMUX-4805). A
+    // 'refused' row says the scheduler fired, reached a decision and wrote it
+    // down, with `last_refusal_reason` naming the cause; nothing about that tick
+    // is in doubt. Leaving it out meant a schedule whose TARGET is paused could
+    // never clear, because a paused target yields refusals forever and never a
+    // success: SCHED-183 read as 11.7 days outstanding while firing daily on
+    // time, and the actionable fact ("gtm-engine is paused") was already on
+    // every one of those rows. Measured over the full history, including it
+    // drops the fires from 15 to 11 and every one it removes is that shape.
+    let rows: Vec<checks::UnrecordedScheduleOutcome> = conn
+        .prepare(
+            "SELECT r.schedule_id, COUNT(*), COALESCE(s.title,''), COALESCE(s.session,''), \
+                    MAX(r.ran_at) AS newest_unknown, \
+                    (SELECT MIN(n.ran_at) FROM schedule_runs n \
+                       WHERE n.schedule_id = r.schedule_id \
+                         AND n.ran_at > MAX(r.ran_at) \
+                         AND n.status IN ('ok','delivered','queued','refused')) AS recovered_at, \
+                    s.schedule_expr, \
+                    (s.id IS NOT NULL AND COALESCE(s.enabled,0)=1 AND s.deleted IS NULL) AS can_fire \
+             FROM schedule_runs r LEFT JOIN schedules s ON s.id = r.schedule_id \
+             WHERE r.delivery='unknown' AND r.ran_at > ?1 \
+             GROUP BY r.schedule_id",
+        )
+        .and_then(|mut st| {
+            st.query_map([cutoff], |r| {
+                let newest_unknown: f64 = r.get(4)?;
+                let recovered_at: Option<f64> = r.get(5)?;
+                let expr: Option<String> = r.get(6)?;
+                Ok(checks::UnrecordedScheduleOutcome {
+                    schedule_id: r.get(0)?,
+                    count: r.get(1)?,
+                    title: r.get(2)?,
+                    session: r.get(3)?,
+                    // Seconds from the newest unknown to the schedule's next
+                    // success, or to NOW when there has not been one: a tick
+                    // outstanding for 22h and one that recovered in 15m are
+                    // different facts and must not render as the same number.
+                    outstanding_s: (recovered_at.unwrap_or(now) - newest_unknown).max(0.0) as i64,
+                    recovered: recovered_at.is_some(),
+                    // The schedule's OWN deadline, from the same parser the
+                    // scheduler fires on, so the check cannot drift from the
+                    // cadence the fleet actually runs (AMUX-4805).
+                    cadence_s: expr.as_deref().and_then(cadence_seconds),
+                    can_fire: r.get::<_, i64>(7)? == 1,
+                })
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    checks::unrecorded_schedule_outcomes_are_visible(window_h, &rows)
 }
 
 fn provider_launch_check() -> Vec<InvariantResult> {
@@ -659,13 +1089,6 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         max_ts: i64,
     }
     let mut map: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
-    // ISOLATED LANES MUST STILL REPORT (AMUX-3824, second pass). Skipping them
-    // outright was my first fix and it was wrong in the way this file keeps
-    // teaching: a skipped entity emits NO result, so `latest_per_invariant`
-    // holds its last one forever — `self` stayed RED after the fix deployed,
-    // because the check simply stopped speaking about it. Absence is not health
-    // (ethos rule 4). An isolated lane is a PASS with a reason, not a silence.
-    let mut isolated_seen: std::collections::BTreeSet<String> = Default::default();
     for (session, text, carded, ts) in rows {
         if session.is_empty()
             || amux_core::board::title_from_prompt(&text).is_none()
@@ -673,25 +1096,10 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         {
             continue;
         }
-        // AN ISOLATED LANE IS NOT CARDED BY DESIGN (AMUX-3232, AMUX-3824).
-        //
-        // The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`,
-        // and this loop replicated only the first. So a raw agent — which has no
-        // session or URL to run `amux board`, and whose prompts are deliberately
-        // left off the board because a card there would name work nobody can
-        // drive — read as a lane whose board leg had been "silently dropped".
-        //
-        // Measured: `self` (CC_ISOLATED=1, Ethan's personal notes lane) failed
-        // this check 67 times from 2026-08-15 to 2026-08-28 while behaving
-        // exactly as specified. A permanently-red check on deliberate behaviour
-        // is the AF-132 shape, and it trains people to skim the invariants page.
-        //
-        // Calls the MINT'S OWN predicate rather than re-reading CC_ISOLATED here,
-        // so the exclusion cannot drift from the rule it mirrors (ethos rule 1).
-        if crate::api::session_verbs::session_is_isolated(&session) {
-            isolated_seen.insert(session);
-            continue;
-        }
+        // AMUX-4159: isolated means no injected harness/peer automation, not
+        // invisible human work. These rows now follow the same invariant as
+        // every other owner-delivered task so another capture regression is a
+        // failing `/api/health/invariants` result instead of a policy-shaped gap.
         let e = map.entry(session).or_insert(Acc {
             cardable: 0,
             carded: 0,
@@ -717,15 +1125,7 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
             span_s: (a.max_ts - a.min_ts) / 1000,
         })
         .collect();
-    let mut out = checks::user_prompts_produce_cards(&stats, min_cardable);
-    // An isolated lane PASSES, explicitly and by name, so its entity keeps
-    // reporting. Appended rather than folded into `stats` because it is a
-    // different claim: not "this lane carded its prompts" but "this lane is not
-    // supposed to card them" (AMUX-3232), and the two should not be one row.
-    for session in isolated_seen {
-        out.push(InvariantResult::pass(ID).entity(&session));
-    }
-    out
+    checks::user_prompts_produce_cards(&stats, min_cardable)
 }
 
 /// The derived card status against the physical pane, per lane (AMUX-2646).
@@ -843,6 +1243,60 @@ pub fn undeclared_timestamp_columns(conn: &rusqlite::Connection) -> (Vec<String>
     (out, n_scanned)
 }
 
+/// Newest-N max for one declared timestamp column, with an unset 0 skipped.
+///
+/// Extracted so a test can call the SQL rather than a paraphrase of it: the
+/// defect this fixes lived in the query string, and a test asserting on
+/// hand-built `observed` tuples would have stayed green through it.
+///
+/// `NULLIF(col, 0)`: A ZERO IS AN UNSET SENTINEL, NOT A TIMESTAMP. Without it
+/// this check cannot PASS in the healthy state for any column that uses 0 for
+/// "not applicable". Measured on this box (AMUX-4673):
+/// `cmd_history.intake_called_at` and `.intake_retry_at` were the only 2
+/// failures out of 72 entities, and all 500 rows in the sample were 0 because
+/// that IS the correct value there. `board_lifecycle` writes it deliberately:
+/// on a successful intake it does `SET ... intake_retry_at=0`, meaning no retry
+/// is pending. So the check reported a permanent FAIL over a table behaving
+/// exactly as designed, and the detector kept filing cards about it.
+///
+/// Nothing is hidden by skipping zeros. This check exists to catch a
+/// SECONDS-vs-MILLISECONDS mixup, a factor of 1000, and 0 is the single value
+/// that carries no unit information at all: 0 seconds and 0 milliseconds are
+/// the same instant. An all-zero sample cannot tell you the unit, so the
+/// truthful answer is "no value to check against", which this check already
+/// has both wording and a code path for. This turns a false FAIL into a real
+/// UNKNOWN.
+fn sampled_timestamp_max(
+    conn: &rusqlite::Connection,
+    table: &str,
+    col: &str,
+    sample: usize,
+) -> Option<f64> {
+    // rowid order, not `col` order: ordering by the column being probed would
+    // need the index this exists to avoid needing.
+    let bounded = format!(
+        "SELECT MAX(NULLIF(\"{col}\", 0)) FROM \
+         (SELECT \"{col}\" FROM \"{table}\" ORDER BY rowid DESC LIMIT {sample})"
+    );
+    // FALL BACK RATHER THAN REPORT A NULL. A WITHOUT ROWID table has no rowid to
+    // order by and the bounded form errors; `.ok()` on it alone would turn that
+    // into "this column is empty", which the check reports as unknown and a
+    // reader reads as a schema fact. Two such tables exist in this database
+    // today (the FTS shadow tables), and the next declared column could live in
+    // one.
+    match conn.query_row(&bounded, [], |r| r.get(0)) {
+        Ok(v) => v,
+        Err(_) => conn
+            .query_row(
+                &format!("SELECT MAX(NULLIF(\"{col}\", 0)) FROM \"{table}\""),
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten(),
+    }
+}
+
 fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "schema.timestamp_units_declared";
     let Ok(conn) = state.store.read() else {
@@ -894,25 +1348,7 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     const SAMPLE: usize = 500;
     let mut observed: Vec<(String, Option<f64>)> = Vec::new();
     for (t, c, _) in checks::TIMESTAMP_COLUMNS {
-        // rowid order, not `c` order: ordering by the column being probed would
-        // need the index this exists to avoid needing.
-        let bounded = format!(
-            "SELECT MAX(\"{c}\") FROM (SELECT \"{c}\" FROM \"{t}\" ORDER BY rowid DESC LIMIT {SAMPLE})"
-        );
-        // FALL BACK RATHER THAN REPORT A NULL. A WITHOUT ROWID table has no
-        // rowid to order by and the bounded form errors; `.ok()` on it alone
-        // would turn that into "this column is empty", which the check reports
-        // as unknown and a reader reads as a schema fact. Two such tables exist
-        // in this database today (the FTS shadow tables), and the next declared
-        // column could live in one.
-        let max: Option<f64> = match conn.query_row(&bounded, [], |r| r.get(0)) {
-            Ok(v) => v,
-            Err(_) => conn
-                .query_row(&format!("SELECT MAX(\"{c}\") FROM \"{t}\""), [], |r| r.get(0))
-                .ok()
-                .flatten(),
-        };
-        observed.push((format!("{t}.{c}"), max));
+        observed.push((format!("{t}.{c}"), sampled_timestamp_max(&conn, t, c, SAMPLE)));
     }
     let now = crate::runtime_jobs::registry::unix_now();
     checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now, SAMPLE)
@@ -1045,8 +1481,10 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
         .into_iter()
         .map(|(name, pane_says_working)| {
             let rep = signals.reports.get(&name).cloned().unwrap_or(json!({}));
+            let (status, status_explain) = signals.derive_status_explain(&name, true);
             checks::LaneTruth {
-                status: signals.derive_status(&name, true),
+                status,
+                status_explain,
                 pane_says_working,
                 report_state: rep["state"].as_str().unwrap_or("").into(),
                 report_age_s: signals.now - rep["ts"].as_f64().unwrap_or(signals.now),
@@ -1202,6 +1640,43 @@ fn report_hooks_check() -> Vec<InvariantResult> {
     checks::report_hooks_wired(parsed)
 }
 
+fn large_read_hooks_check() -> Vec<InvariantResult> {
+    const ID: &str = "hooks.large_read_guard_wired";
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/settings.json");
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} unreadable: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+        })
+        .map(|value| extract_large_read_hooks(&value));
+    if let Err(ref why) = parsed {
+        tracing::debug!(target: "invariants", "{ID}: {why}");
+    }
+    checks::large_read_hooks_wired(parsed)
+}
+
+fn extract_large_read_hooks(v: &serde_json::Value) -> Vec<checks::ReportHookEntry> {
+    let mut entries = Vec::new();
+    for (event, groups) in v["hooks"].as_object().into_iter().flatten() {
+        for group in groups.as_array().into_iter().flatten() {
+            for hook in group["hooks"].as_array().into_iter().flatten() {
+                let command = hook["command"].as_str().unwrap_or_default().to_string();
+                if !command.contains("large-read-guard.py") {
+                    continue;
+                }
+                entries.push(checks::ReportHookEntry {
+                    event: event.clone(),
+                    command,
+                    matcher: group["matcher"].as_str().map(String::from),
+                });
+            }
+        }
+    }
+    entries
+}
+
 /// PURE so it can be driven by the incident's own settings.json shape.
 ///
 /// Split out deliberately: an extractor that silently selects nothing makes the
@@ -1240,24 +1715,69 @@ mod report_hook_wiring_tests {
     /// The settings.json shapes verbatim: the one running now (correct), and the
     /// AMUX-2936 fork it replaced. Both must be SELECTED — the fork especially,
     /// since filtering it out is what would leave a check that cannot fail.
+    /// AF-555. `non_terminal_statuses()` replaced a hand-written literal with a
+    /// derivation over `TaskStatus::ALL`. A refactor that silently CHANGES the
+    /// set would alter what `board.archived_cards_are_terminal` measures while
+    /// staying green, so the old literal is pinned here as the control.
+    ///
+    /// Compared as SETS and by COUNT: a set comparison alone cannot see a
+    /// duplicate, and a count alone cannot see a substitution.
+    #[test]
+    fn the_derived_live_status_set_still_equals_the_literal_it_replaced() {
+        use std::collections::BTreeSet;
+        // The exact literal from AF-544, before the derivation.
+        const WAS: [&str; 6] = ["todo", "doing", "review", "backlog", "needsyou", "blocked"];
+        let now = non_terminal_statuses();
+        assert_eq!(
+            now.iter().copied().collect::<BTreeSet<_>>(),
+            WAS.iter().copied().collect::<BTreeSet<_>>(),
+            "the derivation must measure the same statuses the literal did"
+        );
+        assert_eq!(now.len(), WAS.len(), "and hold no duplicates");
+        // And it must be DERIVED, not a second literal: every entry has to
+        // round-trip through the enum that now owns the fact.
+        for st in &now {
+            let parsed = crate::db::board_store::parse_status(st)
+                .unwrap_or_else(|| panic!("{st} must parse"));
+            assert!(parsed.claims_live_work(), "{st} must claim live work");
+        }
+        for st in amux_core::board::TaskStatus::ALL {
+            if st.claims_live_work() {
+                assert!(
+                    now.contains(&crate::db::board_store::db_status_spelling(st)),
+                    "a status added to the enum must join this set automatically: {st:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_extractor_selects_both_the_wired_and_the_forked_shape() {
-        let wired = serde_json::json!({"hooks": {
-            "SessionStart": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-reset session-start-hook"}]}],
-            "Stop": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
-            "UserPromptSubmit": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active prompt-hook"}]}],
-            "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}],
-            "SubagentStart": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-start subagent-start-hook"}]}],
-            "SubagentStop": [{"hooks": [{"type": "command",
-                "command": "bash \"$HOME/.amux/hook-report.sh\" subagent-stop subagent-stop-hook"}]}]
-        }});
+        // BUILT from the canonical list, not spelled out beside it. This
+        // fixture was a THIRD copy of the six-event set (after the invariant's
+        // and the installer's) and it drifted with them: when AMUX-4723 added
+        // Notification, this one kept asserting Pass on a set that no longer
+        // was one, and it only surfaced when the invariant's copy was corrected
+        // (AMUX-4783). The matcher still rides on the GROUP for tool events,
+        // which is the thing this test exists to pin.
+        let mut events = serde_json::Map::new();
+        for (event, args) in checks::CANONICAL_REPORT_HOOKS {
+            let mut group = serde_json::json!({"hooks": [{
+                "type": "command",
+                "command": format!("bash \"$HOME/.amux/hook-report.sh\" {args}"),
+            }]});
+            if matches!(*event, "PreToolUse" | "PostToolUse") {
+                group["matcher"] = serde_json::json!(".*");
+            }
+            events.insert((*event).to_string(), serde_json::json!([group]));
+        }
+        let wired = serde_json::json!({ "hooks": events });
         let got = extract_report_hooks(&wired);
-        assert_eq!(got.len(), 6, "all six report hooks must be selected");
+        assert_eq!(
+            got.len(),
+            checks::CANONICAL_REPORT_HOOKS.len(),
+            "every canonical report hook must be selected"
+        );
         assert_eq!(
             got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
             Some(".*"),
@@ -1420,6 +1940,26 @@ fn result_log_bounded_check(state: &AppState) -> Vec<InvariantResult> {
 /// predicate that can pass while the API is down, which is precisely the failure
 /// being closed. It is the one board check that must never be "optimised" into
 /// its own SQL.
+fn task_graph_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.graph_integrity";
+    let result = state.store.read().and_then(|conn| crate::db::task_graph_store::verify_graph(&conn));
+    match result {
+        Ok((n, verification)) => {
+            let evidence = json!({"measured":true,"n_considered":n,"findings":verification.findings,
+                "dependency_cycles":verification.dependencies.cycles,
+                "unbuildable_count":verification.dependencies.unbuildable.len(),
+                "lineage_cycles":verification.lineage.cycles});
+            let row = if verification.valid { InvariantResult::pass(ID) } else {
+                InvariantResult::fail(ID, "resolvable, acyclic task dependencies and parent lineage",
+                    format!("{} graph findings; GET /api/graph/board", verification.findings.len()))
+            };
+            vec![row.evidence(evidence)]
+        }
+        Err(error) => vec![InvariantResult::unknown(ID, error.to_string())
+            .evidence(json!({"measured":false,"n_considered":0,"why_unmeasured":error.to_string()}))],
+    }
+}
+
 fn board_list_read_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.list_read_succeeds";
     let Ok(conn) = state.store.read() else {
@@ -1643,6 +2183,235 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
     out
 }
 
+/// AF-535: the same defect AF-137 caught for session=NULL, one level up — a
+/// card on an ISOLATED lane has a session, so it passes that check, and
+/// board_drive still never offers it to anyone.
+///
+/// The isolation test is `session_is_isolated`, the SAME function board_drive
+/// filters its lane list with, so the check and the mechanism cannot drift.
+/// It is not expressible in SQL, hence the group-then-filter rather than one
+/// query.
+/// AF-543. The re-offer history is already in `task.claimed`; nothing counted it.
+///
+/// Window and threshold are consts rather than settings on purpose: this REPORTS
+/// and does not throttle, so neither number changes behaviour, and a knob nobody
+/// sets is a knob that drifts from the measurement that justified it.
+const REPEAT_OFFER_WINDOW_S: i64 = 7 * 86_400;
+/// Measured, not picked — see `checks::repeat_offers_are_visible`. Over 7 days:
+/// 867 pairs claimed once, 104 twice, 39 three times, 9 at four, tail to 9x. The
+/// distribution knees between 3 and 4.
+const REPEAT_OFFER_THRESHOLD: i64 = 4;
+
+/// AF-544, reported by studio-plg. The statuses a card can hold and still be
+/// claiming live work; anything else is terminal and archiving it is correct.
+///
+/// DERIVED from `TaskStatus::claims_live_work`, not written out (AF-555). This
+/// was a hand-maintained literal, and it was the ONLY place the fact lived —
+/// so every other consumer re-derived it, including one in another repo and
+/// another language that got it wrong and silently suppressed a page. A status
+/// added to the enum now joins this list automatically, and cannot be added to
+/// one and forgotten in the other.
+///
+/// AMUX-4801 moved the SQL-ready form to `board_store::live_work_status_list`,
+/// because autofix needed the same fact and hand-wrote its inverse five times.
+/// This stays as the Vec form its own callers want, derived identically.
+fn non_terminal_statuses() -> Vec<&'static str> {
+    amux_core::board::TaskStatus::ALL
+        .iter()
+        .filter(|s| s.claims_live_work())
+        .map(|s| crate::db::board_store::db_status_spelling(*s))
+        .collect()
+}
+
+fn archived_terminal_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.archived_cards_are_terminal";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    // The list is built from the const rather than inlined, so adding a status
+    // there cannot leave this check quietly measuring the old set.
+    let live_statuses = non_terminal_statuses();
+    let placeholders = live_statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let params: Vec<&dyn rusqlite::ToSql> =
+        live_statuses.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let by_status: Result<Vec<(String, i64)>, _> = conn
+        .prepare(&format!(
+            "SELECT status, COUNT(*) FROM issues WHERE deleted IS NULL              AND COALESCE(archived,0)=1 AND status IN ({placeholders})              GROUP BY status ORDER BY 2 DESC"
+        ))
+        .and_then(|mut st| {
+            st.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map(|it| it.flatten().collect())
+        });
+    let Ok(by_status) = by_status else {
+        return vec![InvariantResult::unknown(ID, "archived-status query failed")];
+    };
+    let params2: Vec<&dyn rusqlite::ToSql> =
+        live_statuses.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let worst = conn
+        .prepare(&format!(
+            "SELECT COALESCE(session,'<unassigned>'), COUNT(*) FROM issues              WHERE deleted IS NULL AND COALESCE(archived,0)=1              AND status IN ({placeholders}) GROUP BY 1 ORDER BY 2 DESC LIMIT 1"
+        ))
+        .and_then(|mut st| {
+            st.query_row(params2.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+        })
+        .ok();
+    checks::archived_cards_are_terminal(&by_status, worst)
+}
+
+fn repeat_offer_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.repeat_offers_are_visible";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let cut = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) - REPEAT_OFFER_WINDOW_S as f64;
+    // json_extract in SQL rather than pulling 1279 rows into Rust to group them:
+    // the store can do this, and ethos rule 2 says not to spend the process on
+    // string manipulation a GROUP BY already does.
+    // The card's CURRENT status rides along, so the check can tell a live fault
+    // from history: a pair that crossed the threshold on a card which has since
+    // closed cannot be re-offered again (AMUX-4541). Measured on this board,
+    // those are 23 of 40 pairs and 742 of 847 claims, so without the join the
+    // headline is a resolved burst.
+    let rows: Result<Vec<(String, String, i64, bool)>, _> = conn
+        .prepare(
+            "SELECT e.session, json_extract(e.data, '$.issue') AS issue, COUNT(*) AS n, \
+                    COALESCE(MAX(i.status IN ('done','verified','discarded','quarantined','cancelled')), 0) \
+             FROM session_events e LEFT JOIN issues i ON i.id = json_extract(e.data, '$.issue') \
+             WHERE e.type='task.claimed' AND e.ts > ?1 AND issue IS NOT NULL \
+             GROUP BY e.session, issue ORDER BY n DESC",
+        )
+        .and_then(|mut st| {
+            st.query_map([cut], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })
+            .map(|it| it.flatten().collect())
+        });
+    let Ok(all) = rows else {
+        return vec![InvariantResult::unknown(ID, "task.claimed query failed")];
+    };
+    let total = all.len() as i64;
+    let pairs: Vec<checks::RepeatOfferPair> = all
+        .into_iter()
+        .filter(|(_, _, n, _)| *n >= REPEAT_OFFER_THRESHOLD)
+        .map(|(lane, card, claims, card_closed)| checks::RepeatOfferPair {
+            lane,
+            card,
+            claims,
+            card_closed,
+        })
+        .collect();
+    checks::repeat_offers_are_visible(&pairs, total, REPEAT_OFFER_THRESHOLD)
+}
+
+fn todo_reachable_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.todo_is_reachable_by_dispatch";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let rows: Result<Vec<(String, i64)>, _> = conn
+        .prepare(
+            "SELECT COALESCE(session,''), COUNT(*) FROM issues \
+             WHERE deleted IS NULL AND COALESCE(archived,0)=0 AND status='todo' \
+             GROUP BY 1",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map(|it| it.flatten().collect())
+        });
+    let Ok(per_lane) = rows else {
+        return vec![InvariantResult::unknown(ID, "query failed")];
+    };
+    let total: i64 = per_lane.iter().map(|(_, c)| *c).sum();
+    let stranded =
+        stranded_lanes(per_lane, &|l| crate::api::session_verbs::session_is_isolated(l));
+    checks::todo_is_reachable_by_dispatch(&stranded, total)
+}
+
+/// The SELECTION, with the isolation predicate injected.
+///
+/// Split out for the same reason AF-529 split the ambient-env lookup: the real
+/// `session_is_isolated` reads this machine's worker config, so a test written
+/// against it would pass or fail depending on which box ran it — which is the
+/// exact defect that produced this seam the first time. Injected, the rule is
+/// assertable anywhere.
+///
+/// An EMPTY session is AF-137's case and already has its own check with its own
+/// remedy; counting it here too would double-report one card under two different
+/// fixes, so it is excluded here on purpose.
+fn stranded_lanes(
+    per_lane: Vec<(String, i64)>,
+    is_isolated: &dyn Fn(&str) -> bool,
+) -> Vec<(String, i64)> {
+    let mut stranded: Vec<(String, i64)> = per_lane
+        .into_iter()
+        .filter(|(lane, _)| !lane.is_empty() && is_isolated(lane))
+        .collect();
+    stranded.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    stranded
+}
+
+#[cfg(test)]
+mod stranded_lanes_tests {
+    use super::stranded_lanes;
+
+    fn lanes() -> Vec<(String, i64)> {
+        vec![
+            ("".to_string(), 3),          // AF-137's case, not this check's
+            ("amux".to_string(), 123),    // isolated -> stranded
+            ("mvs-infra".to_string(), 16),// dispatched -> fine
+            ("byo-ray".to_string(), 40),  // isolated -> stranded, and BIGGER than amux? no: sorts under
+        ]
+    }
+
+    /// The predicate must be ISOLATION, not lane name, not queue size. Mutate
+    /// the filter to `false` and this fails; mutate it to drop the emptiness
+    /// guard and the empty lane appears, which is AF-137's card double-counted.
+    #[test]
+    fn only_isolated_lanes_are_stranded_and_the_empty_session_is_left_to_af_137() {
+        // The fake says the EMPTY lane is isolated too. Deliberately: if it said
+        // otherwise, the empty-session assertion below would pass because of the
+        // fake rather than because of the `!lane.is_empty()` guard, and deleting
+        // that guard would leave the suite green. Measured — it did, until this
+        // line changed.
+        let out = stranded_lanes(lanes(), &|l| l.is_empty() || l == "amux" || l == "byo-ray");
+        assert_eq!(
+            out,
+            vec![("amux".to_string(), 123), ("byo-ray".to_string(), 40)],
+            "isolated lanes only, largest first"
+        );
+        assert!(
+            !out.iter().any(|(l, _)| l.is_empty()),
+            "an empty session belongs to board.autofix_cards_are_dispatchable, not here"
+        );
+    }
+
+    /// Nothing isolated is the healthy fleet, and it must come back empty
+    /// rather than defaulting to "everything" — the direction that would spam
+    /// every lane with a false stranding.
+    #[test]
+    fn a_fleet_with_no_isolated_lane_strands_nothing() {
+        assert!(stranded_lanes(lanes(), &|_| false).is_empty());
+        // ...and the empty session is still excluded even when EVERYTHING is
+        // isolated, which is the only condition under which the guard is load
+        // bearing.
+        let all = stranded_lanes(lanes(), &|_| true);
+        assert!(
+            !all.iter().any(|(l, _)| l.is_empty()),
+            "the empty session is AF-137's card and must never appear here: {all:?}"
+        );
+    }
+}
+
 fn autofix_dispatchable_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.autofix_cards_are_dispatchable";
     let Ok(conn) = state.store.read() else {
@@ -1687,6 +2456,55 @@ fn reports_attributed_check(state: &AppState) -> Vec<InvariantResult> {
         Ok((total, unattr)) => checks::reports_are_attributed(total, unattr),
         Err(e) => vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
     }
+}
+
+/// AF-410 (restored under AF-943): roll `guard_verdicts` up to one row per
+/// checkout — the newest `GUARD_VERSION` it has reported in the window, and
+/// how much traffic that version served.
+///
+/// `COALESCE(guard_version, 0)` deliberately keeps version-0 rows in the
+/// rollup rather than filtering them in SQL: a checkout whose ONLY rows are
+/// version 0 must reach the check and be reported as unmeasured, not vanish
+/// into an empty result that reads identically to "no data at all". The
+/// check applies the `>= 1` predicate itself, where the distinction is
+/// expressible.
+fn guard_reach_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.guard_reaches_every_checkout";
+    let days = std::env::var("AMUX_INVARIANT_GUARD_WINDOW_D")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(14.0);
+    let since = crate::config::now_f64() - days * 86_400.0;
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT g.dir, g.gv, COUNT(*), COUNT(DISTINCT v.session) \
+         FROM (SELECT dir, MAX(COALESCE(guard_version, 0)) gv FROM guard_verdicts \
+               WHERE ts >= ?1 GROUP BY dir) g \
+         JOIN guard_verdicts v \
+           ON v.dir = g.dir AND COALESCE(v.guard_version, 0) = g.gv AND v.ts >= ?1 \
+         GROUP BY g.dir, g.gv",
+    ) {
+        Ok(s) => s,
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("prepare failed: {e}"))],
+    };
+    let rows = stmt.query_map([since], |r| {
+        Ok(checks::GuardCheckout {
+            dir: r.get::<_, String>(0)?,
+            version: r.get::<_, i64>(1)?,
+            runs: r.get::<_, i64>(2)?,
+            lanes: r.get::<_, i64>(3)?,
+        })
+    });
+    let checkouts: Vec<checks::GuardCheckout> = match rows {
+        Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
+            Ok(v) => v,
+            Err(e) => return vec![InvariantResult::unknown(ID, format!("row decode failed: {e}"))],
+        },
+        Err(e) => return vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
+    };
+    checks::guard_reaches_every_checkout(&checkouts)
 }
 
 /// The steering queue, joined against each target's reported state.
@@ -1742,6 +2560,20 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
         let block_reason = crate::api::session_verbs::lane_block_reason(&session)
             .await
             .map(str::to_string);
+        // AF-219: the report's "active"/"idle" split cannot name "waiting on a
+        // human at a selector" -- an active report has no staleness bound,
+        // since its only exit is the turn ending, and a turn blocked on a
+        // human never ends. Only worth the extra pane scrape in the one
+        // combination the report vocabulary cannot answer: routable
+        // (block_reason is None) and not self-reported idle. Every other row
+        // already has a decisive answer and does not pay this cost.
+        let selector_wait = if block_reason.is_none() && !idle {
+            let pane = crate::api::session_verbs::tmux_capture(&session, 12).await;
+            crate::api::session_verbs::detect_claude_status(&pane) == "waiting"
+                && !crate::api::session_verbs::is_rate_limit_menu(&pane)
+        } else {
+            false
+        };
         items.push(checks::QueuedItem {
             queue: "steering".into(),
             target: session,
@@ -1749,6 +2581,7 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
             target_idle: idle,
             block_reason,
             idle_since,
+            target_selector_wait: selector_wait,
         });
     }
 
@@ -2146,20 +2979,268 @@ pub async fn run(state: AppState) {
     // and teach everyone the monitor is noisy.
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     loop {
-        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::INVARIANTS);
-        let st = state.clone();
-        // A panic in one pass must not kill the monitor for the process
-        // lifetime — a dead monitor is the failure this whole module exists to
-        // make visible, so it must not be able to die quietly itself.
-        if let Err(e) = tokio::spawn(async move { tick(&st).await }).await {
-            tracing::error!(error = %e, "invariant tick panicked");
-        }
+        one_pass(&state).await;
         tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+    }
+}
+
+/// One monitor iteration. Returns true when the pass finished and its verdicts
+/// are durable.
+///
+/// AMUX-4734. THE TICK NOW BOOKENDS THE PASS INSTEAD OF PRECEDING IT, and the
+/// order is the whole fix. `registry::tick` used to fire at the TOP of the loop,
+/// before the pass ran, which made `monitor.ticks` mean "a pass was started"
+/// while every reader takes it to mean "a pass is done". Three separate wrong
+/// answers came out of that one placement:
+///
+/// 1. A READER THAT WAITS FOR A TICK CAN SEE NO VERDICTS. That is the reported
+///    symptom: ticks=1, last_tick_age_s=13.3, and verdicts_build=null beside
+///    counts from the PREVIOUS generation, an internally inconsistent payload.
+///    The window is not a write-commit gap: `store::record` already awaits its
+///    `write_async`, so verdicts ARE durable once the pass returns. The window
+///    is the whole pass.
+///
+/// 2. A HEALTHY MONITOR REPORTED ITSELF STALLED. `last_tick_age_s` measured
+///    time since the pass STARTED, so it carried the pass duration. Measured on
+///    this box: passes land 118s apart while `duration_ms` records only ~8.5s,
+///    because `record` then waits on a contended store writer (AMUX-4744). With
+///    stall_after_s(30) = 90, the endpoint served `state: "stalled"` on a
+///    monitor whose verdicts were current and from the serving build.
+///
+/// 3. A MONITOR THAT PANICKED EVERY PASS LOOKED ALIVE FOREVER. The tick fired
+///    before the spawn and the Err arm only logged, so ticks kept climbing while
+///    zero verdicts were produced. That is precisely the failure the comment
+///    below says this module exists to make visible, and the placement let it
+///    happen quietly.
+///
+/// So the tick is now recorded ONLY when the pass returns Ok, which is after
+/// `record` has awaited its write. `tick_start`/`tick_end` rather than the
+/// one-shot `tick`, so `last_ms` also becomes the real wall time of a pass
+/// instead of the zero that `tick` records by setting start and end together.
+async fn one_pass(state: &AppState) -> bool {
+    crate::runtime_jobs::registry::tick_start(crate::runtime_jobs::registry::ids::INVARIANTS);
+    let st = state.clone();
+    // A panic in one pass must not kill the monitor for the process
+    // lifetime. A dead monitor is the failure this whole module exists to
+    // make visible, so it must not be able to die quietly itself.
+    match tokio::spawn(async move { tick(&st).await }).await {
+        Ok(_) => {
+            crate::runtime_jobs::registry::tick_end(crate::runtime_jobs::registry::ids::INVARIANTS);
+            true
+        }
+        Err(e) => {
+            // NO TICK on this path, deliberately. A pass that panicked produced
+            // no verdicts, and letting it tick is what made a dead monitor
+            // indistinguishable from a working one.
+            tracing::error!(error = %e, "invariant tick panicked");
+            false
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// AMUX-4753. One route shape accumulates a `MAX(ts)` from each raw path
+    /// that folds into it, and the fold has to keep the NEWEST.
+    ///
+    /// This cell exists because the rule was untestable where it was written:
+    /// inline in `evaluate_all`, a mutation from `max` to `min` left the entire
+    /// suite green. Order-independence is the half that matters — a fold that
+    /// only works when the newest row happens to arrive last is a bug that
+    /// reproduces on someone else's data.
+    #[test]
+    fn folding_recency_keeps_the_newest_reading_in_either_order() {
+        use super::newest;
+        let (old, new) = (1_000.0, 2_000.0);
+        assert_eq!(newest(Some(old), Some(new)), Some(new), "newest arriving last");
+        assert_eq!(newest(Some(new), Some(old)), Some(new), "newest arriving first");
+        // ABSENCE IS NOT ZERO. A path with no timestamp must not drag a shape's
+        // recency back to the epoch, and it must not erase one already known.
+        assert_eq!(newest(Some(new), None), Some(new), "an unmeasured row erases nothing");
+        assert_eq!(newest(None, Some(old)), Some(old), "the first reading is adopted");
+        assert_eq!(newest(None, None), None, "nothing measured stays nothing measured");
+    }
+
+    /// AMUX-4734: the tick BOOKENDS the pass, and only a completed pass ticks.
+    ///
+    /// A property of the SOURCE, because it is an ORDERING and the thing that
+    /// goes wrong is someone moving one line. The behavioural cell above pins
+    /// that verdicts are durable when a pass returns; this pins that the tick
+    /// is taken at that moment rather than before the pass starts.
+    ///
+    /// Reading the source is the weaker instrument and it is the one that fits:
+    /// driving `one_pass` means running `evaluate_all`, 693 checks that shell
+    /// out to git and tmux, which took over 60 seconds against an empty store
+    /// when tried.
+    #[test]
+    fn the_tick_is_taken_after_the_pass_and_only_when_it_completed() {
+        let src = include_str!("monitor.rs");
+        // BOUND THE SLICE TO ONE FUNCTION, at its closing brace in column 0.
+        // A fixed character window swept past `one_pass` into this very test
+        // module, whose assertion below contains the literal "registry::tick(",
+        // so the guard matched its OWN source and failed on a correct file.
+        // Third instance of that trap in this codebase today.
+        let body_start = src.find("async fn one_pass(").expect("one_pass exists");
+        let rest = &src[body_start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 2).expect("one_pass is closed")];
+
+        let start_at = body.find("tick_start(").expect("the pass is bracketed with tick_start");
+        let spawn_at = body.find("tokio::spawn(").expect("the pass runs in a spawned task");
+        let end_at = body.find("tick_end(").expect("the pass records a tick_end");
+        let ok_at = body.find("Ok(_) =>").expect("the completed arm is matched explicitly");
+
+        assert!(start_at < spawn_at, "tick_start must precede the pass");
+        assert!(spawn_at < end_at,
+            "tick_end must come AFTER the pass: a tick taken first means a pass that was \
+             STARTED, while every reader takes ticks to mean a pass that is DONE");
+        assert!(ok_at < end_at,
+            "tick_end must sit in the Ok arm: a panicking pass that still ticks makes a dead \
+             monitor indistinguishable from a working one");
+
+        // The one-shot `registry::tick(` sets last_start and last_end to the
+        // same instant, so it can neither express a duration nor separate
+        // start from finish. Using it here is what the fix replaced.
+        assert!(!body.contains("registry::tick("),
+            "one_pass must not use the one-shot tick; it cannot distinguish started from done");
+    }
+
+    /// AMUX-4734: by the time a pass returns, its verdicts are ALREADY durable.
+    ///
+    /// This is the fact the card got wrong, and it decides the fix. The card
+    /// said `record` "writes through write_async, so the rows land on the
+    /// store's writer thread" and that the tick therefore beats the commit.
+    /// `record` AWAITS that write. So there is no write-commit window at all,
+    /// and the reported symptom came from somewhere else: the tick was being
+    /// taken at the TOP of the loop, before the pass had even started.
+    ///
+    /// Pinning it here matters because the whole fix rests on it. Moving the
+    /// tick to after the pass only makes `ticks` mean "durable" if `record` has
+    /// really finished writing by then. If someone later drops the `.await`,
+    /// the tick placement silently stops delivering what it promises, and this
+    /// cell is what says so.
+    ///
+    /// Deliberately NOT driven through `one_pass`: that runs `evaluate_all`, 693
+    /// checks, several of which shell out to git and tmux. A first cut of this
+    /// cell did exactly that and ran for over 60 seconds against an empty temp
+    /// store before being killed. A slow, environment-dependent cell in the
+    /// shared suite buys less than it costs.
+    #[tokio::test]
+    async fn record_returns_only_after_its_verdicts_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::db::Store::open(&dir.path().join("inv.db")).unwrap());
+
+        let before: i64 = store.read().unwrap()
+            .query_row("SELECT COUNT(*) FROM _amux_invariant_result", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0, "set-up: the fixture store starts empty");
+
+        let results = vec![
+            super::super::InvariantResult::pass("amux4734.control").entity("a"),
+            super::super::InvariantResult::fail("amux4734.probe", "expected", "observed")
+                .entity("b"),
+        ];
+        super::store::record(&store, results, 7).await;
+
+        // IMMEDIATELY, with no sleep and no retry. A poll loop here would pass
+        // against the very bug this pins, which is the difference between
+        // testing durability and waiting for it.
+        let after: i64 = store.read().unwrap()
+            .query_row("SELECT COUNT(*) FROM _amux_invariant_result", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 2,
+            "record returned but its rows are not readable yet: {after} of 2");
+    }
+
+    /// AMUX-4673: an all-zero sample must read as UNKNOWN, never as a FAIL.
+    ///
+    /// `cmd_history.intake_retry_at` holds 0 for "no retry pending", which
+    /// `board_lifecycle` writes on every successful intake. Before the fix,
+    /// `MAX(col)` over the newest rows returned 0, the unit check compared 0
+    /// against now, and the invariant failed permanently over a healthy table.
+    /// Measured live: 2 failures out of 72 entities, both this shape, with 500
+    /// of the 500 sampled rows holding the sentinel.
+    #[test]
+    fn an_all_zero_timestamp_sample_is_unknown_not_a_false_max() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..5i64 {
+            conn.execute(
+                "INSERT INTO cmd_history (text, type, session, ts, origin, \
+                 intake_called_at, intake_retry_at) \
+                 VALUES ('x', 'msg', 's', ?1, 'test', 0, 0)",
+                rusqlite::params![1_789_000_000i64 + i],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            super::sampled_timestamp_max(&conn, "cmd_history", "intake_retry_at", 500),
+            None,
+            "0 is an unset sentinel; reporting it as a max makes the unit check fail forever"
+        );
+
+        // POSITIVE CONTROL. Without it this passes just as happily against an
+        // empty table or a misspelled column, which would make it a test of the
+        // fixture rather than of the NULLIF.
+        assert_eq!(
+            super::sampled_timestamp_max(&conn, "cmd_history", "ts", 500),
+            Some(1_789_000_004.0),
+            "a real timestamp column must still report its max, or the NULLIF is eating data"
+        );
+    }
+
+    /// Skipping the sentinel must not skip the row carrying the unit evidence.
+    #[test]
+    fn one_real_timestamp_among_zeros_is_still_found() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..4i64 {
+            conn.execute(
+                "INSERT INTO cmd_history (text, type, session, ts, origin, intake_called_at) \
+                 VALUES ('x', 'msg', 's', ?1, 'test', 0)",
+                rusqlite::params![1_789_000_000i64 + i],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO cmd_history (text, type, session, ts, origin, intake_called_at) \
+             VALUES ('x', 'msg', 's', 9, 'test', ?1)",
+            rusqlite::params![1_789_499_020i64],
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::sampled_timestamp_max(&conn, "cmd_history", "intake_called_at", 500),
+            Some(1_789_499_020.0),
+            "the one non-zero row is the only unit evidence there is; it must not be skipped"
+        );
+    }
+    #[test]
+    fn graph_invariant_distinguishes_corruption_from_an_unmeasured_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("graph.db")).unwrap());
+        let state = crate::api::AppState { store:store.clone(), started:std::time::Instant::now(),
+            build_hash:"test".into(),auth_token:None,reconciled:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let result = super::task_graph_check(&state);
+        assert_eq!(result[0].status,crate::invariants::Status::Pass);
+        assert_eq!(result[0].evidence["measured"],true);
+        store.write(|conn| {
+            conn.execute_batch("INSERT INTO issues(id,title,status,created,updated,depends_on) VALUES \
+                ('G-1','cycle','todo',1,1,'[\"G-1\"]')")?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let result = super::task_graph_check(&state);
+        assert_eq!(result[0].status,crate::invariants::Status::Fail);
+        assert_eq!(result[0].evidence["n_considered"],1);
+        store.write(|conn| {
+            conn.execute_batch("ALTER TABLE issues RENAME TO broken_issues")?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let result = super::task_graph_check(&state);
+        assert_eq!(result[0].status,crate::invariants::Status::Unknown);
+        assert_eq!(result[0].evidence["measured"],false);
+    }
+
     // ── AF-317 fallout: the board's own readability had no invariant ────────
     //
     // 2026-08-30, ~20 minutes, every session: GET /api/board answered
@@ -2247,6 +3328,45 @@ mod tests {
             "a migrated, empty board is readable: {}",
             r.observed
         );
+    }
+
+    /// The decomposition check owns a query across `issues` and `issue_tags`.
+    /// Exercise that query, not only the pure row checker: tags are a relation,
+    /// and selecting an imaginary `issues.tags` column made the first live
+    /// probe return Unknown while every pure test stayed green.
+    #[test]
+    fn decomposition_detail_check_reads_the_real_tag_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO issues \
+                     (id,title,desc,status,session,creator,owner_type,type,epic,next_action, \
+                      acceptance_criteria,source,created,updated) \
+                     VALUES ('D-1','Execute the child','Execute this complete child.','todo', \
+                             'lane','lane','agent','code','E-1','Run the focused check', \
+                             '[\"The focused check passes\"]','decomposition',1,1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('D-1','p0',1)",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let rows = super::decomposition_detail_check(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::invariants::Status::Pass, "{rows:?}");
+        assert_eq!(rows[0].evidence["n_considered"], serde_json::json!(1));
     }
 
     use super::*;
@@ -2433,6 +3553,53 @@ mod tests {
                     || r.invariant_id == "status.contradicts_fresh_idle_report"
             }),
             "unexpected invariant id — the sweep contract greps for these exact strings"
+        );
+    }
+
+    /// AF-410 (restored under AF-943): the binding must REACH A VERDICT
+    /// against a real store, and it must be reachable from `evaluate_all`
+    /// rather than merely existing. The original of this test (and the check
+    /// it wires) shipped under AF-410 and was silently dropped ~10 hours
+    /// later by a wholesale file-replacement merge resolution (9c17d990) that
+    /// named neither in its commit message.
+    #[test]
+    fn the_guard_reach_check_is_actually_wired_into_the_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let rs = guard_reach_check(&state);
+        assert!(!rs.is_empty(), "the binding must always reach a verdict");
+        assert!(
+            rs.iter().all(|r| r.invariant_id == "hooks.guard_reaches_every_checkout"),
+            "unexpected invariant id — the sweep contract greps for this exact string"
+        );
+        assert_eq!(rs[0].status, crate::invariants::Status::Unknown, "empty table must not read as healthy");
+        assert_eq!(rs[0].evidence["measured"], serde_json::json!(false));
+    }
+
+    /// ...and the binding must be REGISTERED in `evaluate_all`, not merely
+    /// callable — a check that exists but is never called is exactly what
+    /// 9c17d990 produced for ten hours (well, it dropped the check entirely,
+    /// but a defined-and-unregistered check is the same failure mode this
+    /// guards against for next time).
+    #[test]
+    fn the_guard_reach_check_is_registered_in_evaluate_all() {
+        let src = include_str!("monitor.rs");
+        let start = src
+            .find("pub async fn evaluate_all")
+            .expect("evaluate_all must exist — the registry is the thing being checked");
+        let body = &src[start..];
+        let end = body.find("\n}\n").map(|e| e + start).unwrap_or(src.len());
+        assert!(
+            src[start..end].contains("guard_reach_check(state)"),
+            "hooks.guard_reaches_every_checkout is defined but never registered in \
+             evaluate_all — it would never run"
         );
     }
 
@@ -2818,5 +3985,55 @@ mod section_timing_tests {
             "{sections} sections but {marks} marks — an unmarked section's cost is charged to \
              whichever section happens to precede it"
         );
+    }
+
+}
+
+/// AMUX-4805. `cadence_seconds` is the deadline the unrecorded-outcome check
+/// measures every schedule against, so a wrong number here silently moves the
+/// bound for the whole fleet: too small and the check goes back to crying wolf
+/// during normal recovery, too large and a dead schedule never surfaces.
+#[cfg(test)]
+mod cadence_seconds_tests {
+    use super::cadence_seconds;
+
+    /// The shapes the live fleet actually runs, with the periods measured off
+    /// `schedule_runs` on 2026-09-19: every-15m recovered in 14-15m, every-30m
+    /// in 29-30m, every-4h in 240m, daily in 1440m.
+    #[test]
+    fn the_interval_and_daily_shapes_give_their_own_period() {
+        assert_eq!(cadence_seconds("every 15m"), Some(900));
+        assert_eq!(cadence_seconds("every 30m"), Some(1_800));
+        assert_eq!(cadence_seconds("every 120m"), Some(7_200));
+        assert_eq!(cadence_seconds("every 4h"), Some(14_400));
+        assert_eq!(cadence_seconds("daily at 08:27"), Some(86_400));
+    }
+
+    /// Cron is the shape a per-expression table would have had to reimplement.
+    /// SCHED-173 and SCHED-184 are both 4-hourly and both spelled as cron.
+    #[test]
+    fn cron_periods_come_out_without_a_second_parser() {
+        assert_eq!(cadence_seconds("7 */4 * * *"), Some(14_400));
+        assert_eq!(cadence_seconds("37 */4 * * *"), Some(14_400));
+        assert_eq!(cadence_seconds("0 9 * * *"), Some(86_400));
+    }
+
+    /// The WIDEST gap wins. A weekday schedule runs Monday to Friday, so its
+    /// Friday-to-Monday gap is three days while every other gap is one. Taking
+    /// a narrow gap would call a perfectly healthy Saturday overdue, which is
+    /// the same false positive this whole change exists to remove.
+    #[test]
+    fn a_weekday_schedule_is_measured_by_its_weekend_gap() {
+        let got = cadence_seconds("every weekday at 09:00").expect("weekday parses");
+        assert_eq!(got, 3 * 86_400, "Friday to Monday is the gap that matters, got {got}s");
+    }
+
+    /// An expression nobody can parse yields no deadline, and the check treats
+    /// `None` as "never overdue". Returning a plausible default here would put
+    /// the guesswork back one layer down where no test would see it.
+    #[test]
+    fn an_unparseable_expression_yields_no_deadline() {
+        assert_eq!(cadence_seconds("whenever ethan says so"), None);
+        assert_eq!(cadence_seconds(""), None);
     }
 }

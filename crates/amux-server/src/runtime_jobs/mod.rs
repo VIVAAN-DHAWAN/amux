@@ -48,23 +48,32 @@
 //!   3: the honest refusal beats the quiet lie).
 
 pub mod autofix;
+pub mod board_drain;
 pub mod board_drive;
+pub mod board_hygiene;
+pub mod message_capture;
 pub mod browser_reaper;
+pub mod cdc_poller;
+pub mod codex_ledger;
+pub mod gemini_ledger;
 pub mod commit_mention_notes;
-pub mod commit_nudge;
 pub mod context_health;
 pub mod status_history;
 pub mod disk_watch;
-pub mod ghost_rescue;
+pub(crate) mod executor;
 pub mod heartbeat;
+pub mod host_metrics;
 pub mod mac_health;
+mod memory_consumers;
 pub mod pane_size;
 /// The live registry of the jobs below — see [`registry`] for why it is
 /// derived from the spawn sites rather than declared alongside them.
-pub mod queue_disposition;
+pub mod recordings_transcribe;
 pub mod registry;
+mod poll_watch;
 pub mod scheduler;
 pub mod storage;
+mod log_retention;
 pub mod tailnet_watch;
 pub mod telegram_poll;
 pub mod telegram_relay;
@@ -83,10 +92,9 @@ use tokio::time::MissedTickBehavior;
 /// a different type from [`scheduler::DurableSchedule`] and must stay one:
 /// no persistence, no history, no audit — by design, not by omission.
 ///
-/// Each task runs on its OWN spawned tokio task driven by
-/// `tokio::time::interval`, so a slow or wedged task cannot delay any other
-/// task (the plan's non-blocking requirement; contrast Python's shared
-/// `_JOB_REGISTRY` thread). A run that overshoots its interval delays only
+/// Each task runs on a spawned Tokio task on the maintenance runtime, driven
+/// by `tokio::time::interval`. Synchronous polls can delay other maintenance
+/// jobs but cannot occupy HTTP runtime threads. A run that overshoots its interval delays only
 /// its own next tick (`MissedTickBehavior::Delay` — no catch-up burst),
 /// mirroring the Python registry's `_running` skip guard.
 pub struct PeriodicTask {
@@ -154,7 +162,7 @@ pub(crate) fn per_job_disable_var(name: &str) -> String {
 /// control without touching process-global env, which cargo's parallel tests
 /// share.
 ///
-/// The hazard: some periodic jobs (`pane_size`, `ghost_rescue`) enumerate the
+/// The hazard: some periodic jobs (`pane_size`) enumerate the
 /// tmux fleet directly and take no `AppState`, so `AMUX_HOME` does not scope
 /// them. A SECOND or TEST amux-server pointed at the production tmux socket would
 /// therefore press Enter and resize panes in the real lanes. Two switches turn a
@@ -162,7 +170,10 @@ pub(crate) fn per_job_disable_var(name: &str) -> String {
 ///   - a GLOBAL isolation switch (`AMUX_ISOLATED=1` / `AMUX_NO_FLEET=1`) - the
 ///     one knob a dev/test server sets ONCE to opt the whole process out;
 ///   - a PER-JOB `AMUX_<NAME>_SECS=0` opt-out, to silence one loop.
-fn isolation_reason_with<F: Fn(&str) -> Option<String>>(name: &str, get: F) -> Option<String> {
+pub(crate) fn isolation_reason_with<F: Fn(&str) -> Option<String>>(
+    name: &str,
+    get: F,
+) -> Option<String> {
     for var in ["AMUX_ISOLATED", "AMUX_NO_FLEET"] {
         if get(var).as_deref().map(str::trim) == Some("1") {
             return Some(format!("{var}=1"));
@@ -227,7 +238,7 @@ where
     // report a tick it did not run. See registry's docs for the three loops
     // that were dead for hours with nothing visible anywhere.
     let job_id = name.clone();
-    let handle = tokio::spawn(async move {
+    let handle = executor::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // Delay, not Burst: a run that overshoots must not be "paid back"
         // with a rapid-fire catch-up volley (the spin-catcher lesson — a
@@ -258,7 +269,7 @@ where
                 }
             }
             registry::tick_start(&job_id);
-            f().await;
+            poll_watch::watch(&job_id, f()).await;
             registry::tick_end(&job_id);
         }
     });
@@ -359,13 +370,12 @@ mod tests {
         let files: &[(&str, &str)] = &[
             ("board_drive.rs", include_str!("board_drive.rs")),
             ("autofix.rs", include_str!("autofix.rs")),
-            ("ghost_rescue.rs", include_str!("ghost_rescue.rs")),
             ("pane_size.rs", include_str!("pane_size.rs")),
             ("storage.rs", include_str!("storage.rs")),
             ("token_ledger.rs", include_str!("token_ledger.rs")),
             ("heartbeat.rs", include_str!("heartbeat.rs")),
             ("status_history.rs", include_str!("status_history.rs")),
-            ("commit_nudge.rs", include_str!("commit_nudge.rs")),
+            ("board_hygiene.rs", include_str!("board_hygiene.rs")),
         ];
         // The control first: this cell is worthless unless the literal it looks
         // for is one these files COULD contain, so prove the deriver produces
@@ -375,11 +385,6 @@ mod tests {
 
         let mut offenders: Vec<String> = Vec::new();
         for (name, src) in files {
-            // ONLY modules that actually go through the deriver. `commit_nudge`
-            // reads AMUX_COMMIT_NUDGE_SECS and spawns with a bare
-            // `tokio::spawn`, so nothing derives that name and its one spelling
-            // is the only one — flagging it would be telling a module to stop
-            // duplicating something it does not duplicate.
             if !src.contains("spawn_periodic") {
                 continue;
             }

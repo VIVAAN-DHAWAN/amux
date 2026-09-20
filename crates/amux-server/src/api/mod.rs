@@ -12,8 +12,12 @@ pub mod usage;
 pub mod aliases;
 pub mod auth;
 pub mod board;
+pub mod board_intake;
+pub mod board_lifecycle;
 pub mod criteria;
+pub mod dependency_audit;
 pub mod browser;
+pub mod browser_import;
 pub mod calendar;
 pub mod connectors;
 pub mod dictation;
@@ -36,10 +40,14 @@ pub mod health;
 pub mod env_config;
 pub mod gmail;
 pub mod graph;
+pub mod harness;
 pub mod history;
+pub mod history_ask;
 pub mod reports;
 pub mod terminal;
 pub mod invariants_api;
+pub mod brex;
+pub mod interactions;
 pub mod journal;
 pub mod layout_presets;
 pub mod log_search;
@@ -53,15 +61,20 @@ pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod recordings;
+pub mod policy;
+pub mod planning;
 pub mod proxies;
 pub mod tunnel;
 pub mod py_proxy;
 pub mod reclaim;
+pub mod reconciliation;
 pub mod request_log;
 pub mod review;
 pub mod saved_messages;
 pub mod schedules;
 pub mod scope;
+pub mod screen;
 pub mod search;
 pub mod self_update;
 pub mod session_verbs;
@@ -69,6 +82,7 @@ pub mod telegram;
 pub mod board_themes;
 pub mod lookup;
 pub mod orchestrate;
+pub mod orchestrations;
 pub mod simple;
 pub mod config_iac;
 pub mod skin;
@@ -117,6 +131,7 @@ pub fn router(state: AppState) -> Router {
     // For the request-log layer below — `state` itself is consumed by
     // `.with_state` before the outermost wrap.
     let store_for_reqlog = state.store.clone();
+    let state_for_member_identity = state.clone();
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
@@ -131,6 +146,7 @@ pub fn router(state: AppState) -> Router {
             "/api/ollama/models",
             axum::routing::get(workers::ollama_models),
         )
+        .route("/api/models", axum::routing::get(workers::model_catalog))
         .nest("/api/memories", memories::routes())
         .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())
@@ -144,7 +160,15 @@ pub fn router(state: AppState) -> Router {
         // lives here so there is one place to be wrong.
         .nest("/api/why", why::routes())
         .nest("/api/verify", verify::routes())
+        .nest(
+            "/api/harness",
+            harness::routes()
+                .merge(planning::routes())
+                .merge(reconciliation::routes()),
+        )
+        .nest("/api/policy", policy::routes())
         .nest("/api/prefs", prefs::routes())
+        .nest("/api/brex", brex::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/reclaim", reclaim::routes())
@@ -186,6 +210,7 @@ pub fn router(state: AppState) -> Router {
         // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
         .nest("/api/scope", scope::routes())
         .nest("/api/orchestrate", orchestrate::routes())
+        .nest("/api/board-lifecycle", board_lifecycle::routes())
         // Nothing proxies. py_proxy::PROXIED_FAMILIES is EMPTY post-AMUX-2608
         // and the forwarder it fed was deleted in AMUX-2906, so the merge that
         // used to sit here (already a no-op) is gone too — the registry, the
@@ -193,6 +218,11 @@ pub fn router(state: AppState) -> Router {
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
         .nest("/api/browser", browser::routes())
+        // Server-machine screen capture (AMUX-4661): a real macOS Screen
+        // Recording permission grant needs the OS's own native prompt, not a
+        // manually-added System Settings entry — see screen.rs header for why.
+        // Loopback-only; the fleet's remote/tunnel-facing paths don't reach it.
+        .nest("/api/screen", screen::routes())
         // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
         // streaming + vtt + ffmpeg prepare/transcode with durable job state
         // (api/file_viewer.rs; was PROXIED_FAMILIES' /api/file namespace row).
@@ -266,8 +296,12 @@ pub fn router(state: AppState) -> Router {
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).
         .nest("/api/logs", request_log::routes())
+        .merge(interactions::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
+        // Record tab (AMUX-4624): device recordings synced into a folder and
+        // transcribed locally. The folder is the store; see the module docs.
+        .nest("/api/recordings", recordings::routes())
         .nest("/api/dictation", dictation::routes())
         // Transcription lives at the TOP-LEVEL /api/dictate (python parity);
         // the dictation module owns it and answers NATIVELY (AMUX-2598:
@@ -300,6 +334,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
         .route("/api/board/themes", axum::routing::get(board_themes::board_themes))
         .route("/api/lookup", axum::routing::post(lookup::lookup))
+        .route(
+            "/api/lookup/bulk",
+            axum::routing::post(lookup::bulk_read)
+                // JSON may escape one source byte as six (`\u0000`); the
+                // handler still enforces 512 KiB of decoded file content.
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .route("/api/skin", axum::routing::get(skin::get_skin))
         .route("/api/config/export", axum::routing::get(config_iac::export))
         .route("/api/config/apply", axum::routing::put(config_iac::apply))
@@ -376,6 +417,10 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            policy::enforce,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::require_bearer,
         ));
 
@@ -427,6 +472,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(crate::legacy_port::debug),
         )
         .merge(invariants_api::routes())
+        .merge(dependency_audit::routes())
         .merge(crate::runtime_jobs::board_drive::routes())
         .merge(crate::runtime_jobs::autofix::routes())
         .merge(crate::runtime_jobs::storage::routes())
@@ -451,6 +497,11 @@ pub fn router(state: AppState) -> Router {
         // Same rationale: the connectors broker's callback receives provider
         // redirects (Google/Slack), which cannot carry a bearer.
         .merge(connectors::callback_routes())
+        // Public local invite landing + acceptance. A successful POST installs
+        // a revocable member cookie; the outer identity layer below resolves
+        // it before auth and request logging.
+        .merge(org::public_routes())
+        .route("/api/_clear_sw", axum::routing::get(static_files::clear_sw_landing))
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);
@@ -480,6 +531,8 @@ pub fn router(state: AppState) -> Router {
     // Synthesizes ONLY into an empty body: a handler that returned its own 405
     // with prose knows more than this layer does and must not be overwritten.
     let app = app.layer(axum::middleware::from_fn(explain_method_not_allowed));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        store_for_reqlog.clone(), interactions::middleware));
 
     // Transparent gzip compression for every response whose client sends
     // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,
@@ -490,7 +543,15 @@ pub fn router(state: AppState) -> Router {
     // request — including alias-rewritten and fallback paths — is recorded
     // with the RAW path the client sent. Never blocks or fails a request
     // (rows ride a bounded channel to the single-writer store).
-    request_log::layer(app, store_for_reqlog)
+    let app = request_log::layer(app, store_for_reqlog);
+
+    // Outermost so verified member headers exist before BOTH auth and the
+    // request logger inspect the request. The middleware strips its internal
+    // marker before validating the cookie, so clients cannot self-assert it.
+    app.layer(axum::middleware::from_fn_with_state(
+        state_for_member_identity,
+        org::local_member_identity,
+    ))
 }
 
 /// Give an empty 405 a body that names the verb it wanted (AF-211).
@@ -615,6 +676,20 @@ pub(crate) fn dominated_by_external(total_ms: u128, external_ms: u128) -> bool {
 /// carries the measured external time rather than a bare label. An exclusion
 /// that cannot say what it excluded on is the ethos-4 shape this whole
 /// mechanism exists to avoid.
+/// Bound a caller-supplied verb before it becomes a response header (AMUX-4779).
+///
+/// The value comes straight from the request body, so it is capped and stripped
+/// to a safe charset. A header value cannot carry a newline, and an unbounded
+/// one would let a caller widen every request-log row it touches. Anything that
+/// is not `[A-Za-z0-9_-]` is dropped rather than escaped: the point is to group
+/// rows by verb, and a verb that needs escaping is not one of the seven.
+pub(crate) fn truncate_verb(v: &str) -> String {
+    v.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect()
+}
+
 pub(crate) fn slow_ok(mut r: axum::response::Response, why: &str) -> axum::response::Response {
     if let Ok(hv) = axum::http::HeaderValue::from_str(why) {
         r.headers_mut().insert("x-amux-slow-ok", hv);
@@ -862,9 +937,16 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
     // (_api_key_status). This server runs no validator, so it answers what
     // python answers before its first validation — null/"" — rather than
     // inventing a verdict (Invariant 20: never invent state).
+    let is_local_member = org::is_verified_local_member(&headers);
+    let access_scope = org::local_member_scope(&headers)
+        .map(|scope| serde_json::json!({"level": scope.level(), "name": scope.name()}));
+    let team = org::local_member_team(&headers);
     axum::Json(serde_json::json!({
         "email": email,
-        "is_cloud": !email.is_empty(),
+        "is_cloud": !email.is_empty() && !is_local_member,
+        "is_local_member": is_local_member,
+        "access_scope": access_scope,
+        "team": team,
         "has_api_key": has_key_in_env || has_oauth || has_proxy,
         "has_oauth": has_oauth,
         "managed_upstream": has_proxy,

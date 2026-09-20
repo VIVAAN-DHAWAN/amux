@@ -6,8 +6,8 @@
 # What it does, in order:
 #   1. checks prerequisites (rust toolchain, tmux; herdr is optional) —
 #      prompts before installing anything, never silently
-#   2. cargo build --release the workspace
-#   3. installs the server (amux-server-rs) + CLI (amux-rs) into ~/.local/bin
+#   2. compile Rust binaries from a pinned commit into private verified artifacts
+#   3. installs the server, Rust CLI and validated Bash CLI into ~/.local/bin
 #   4. writes + loads the launchd agents (macOS): com.amux.server-rs on
 #      port 8824, and com.amux.server-rs-builder (auto-rebuild on new
 #      commits). On other platforms it installs the binaries and prints an
@@ -60,6 +60,8 @@ PLIST_DIR="${AMUX_LAUNCHD_DIR:-$HOME/Library/LaunchAgents}"
 # empirically, not read off a doc), so this mirrors that order exactly.
 SHARED_TARGET_DIR="$AMUX_HOME/rust-build-target"
 TARGET_DIR="${CARGO_TARGET_DIR:-$SHARED_TARGET_DIR}"
+# Resolve a relative target against the checkout before the build changes cwd.
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$SCRIPT_DIR/$TARGET_DIR" ;; esac
 OS="$(uname -s)"
 
 echo "${BOLD}amux installer${RESET} (Rust server, port $PORT)"
@@ -172,21 +174,29 @@ EOF
 fi
 
 echo ""
-echo "Building (cargo build --release --workspace) …"
-(cd "$SCRIPT_DIR" && cargo build --release --workspace)
-[[ -x "$TARGET_DIR/release/amux-server" ]] || die "build finished but $TARGET_DIR/release/amux-server is missing"
-[[ -x "$TARGET_DIR/release/amux-rs" ]]     || die "build finished but $TARGET_DIR/release/amux-rs is missing"
-say "built server + CLI"
+echo "Building committed Rust server + CLI with private publication artifacts …"
+# The dependencies still share TARGET_DIR. Final compiler outputs and the
+# publication candidates belong only to this invocation, never release/.
+mkdir -p "$BIN_DIR"
+INSTALL_ARTIFACT_DIR="$(mktemp -d "$BIN_DIR/.amux-rust-install.XXXXXX")"
+cleanup_install_artifacts() { rm -rf -- "$INSTALL_ARTIFACT_DIR"; }
+trap cleanup_install_artifacts EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+"$SCRIPT_DIR/scripts/build-install-from-head.sh" "$SCRIPT_DIR" "$TARGET_DIR" "$INSTALL_ARTIFACT_DIR"
+python3 "$SCRIPT_DIR/scripts/install-artifact-manifest.py" verify "$INSTALL_ARTIFACT_DIR" "$INSTALL_ARTIFACT_DIR/manifest.json"
+say "built server + CLI from pinned source"
 
 # ── 3. Install binaries ─────────────────────────────────────────────────────
-mkdir -p "$BIN_DIR"
-# install(1) replaces the file atomically enough for the server's
-# self-adoption watcher: a running server notices its binary changed and
-# exits for launchd to relaunch the new build.
-install -m 0755 "$TARGET_DIR/release/amux-server" "$BIN_DIR/amux-server-rs"
-install -m 0755 "$TARGET_DIR/release/amux-rs" "$BIN_DIR/amux-rs"
+# Prepare and verify BOTH replacements before changing either live path. The
+# second verification detects a source mutation during either copy as well.
+mkdir "$INSTALL_ARTIFACT_DIR/publish"
+install -m 0755 "$INSTALL_ARTIFACT_DIR/amux-server" "$INSTALL_ARTIFACT_DIR/publish/amux-server"
+install -m 0755 "$INSTALL_ARTIFACT_DIR/amux-rs" "$INSTALL_ARTIFACT_DIR/publish/amux-rs"
+python3 "$SCRIPT_DIR/scripts/install-artifact-manifest.py" publish "$INSTALL_ARTIFACT_DIR/publish" "$INSTALL_ARTIFACT_DIR/manifest.json" "$BIN_DIR"
 say "installed $BIN_DIR/amux-server-rs"
 say "installed $BIN_DIR/amux-rs"
+"$SCRIPT_DIR/scripts/install-cli.sh" "$BIN_DIR"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) warn "$BIN_DIR is not on your PATH — add it to use amux-rs directly" ;;
@@ -235,9 +245,68 @@ fi
 # file, loudly, because there refusing would be worse than installing.
 install_hook_from_head() {
   local rel="$1" dest="$2"
-  local head_bytes=""
-  if head_bytes="$(git -C "$SCRIPT_DIR" show "HEAD:$rel" 2>/dev/null)" && [[ -n "$head_bytes" ]]; then
-    printf '%s\n' "$head_bytes" > "$dest"
+  local head_bytes="" src_ref=""
+  # ORIGIN/MAIN FIRST, NOT HEAD. Installing committed bytes is right; taking
+  # them from HEAD is not. graft-push never advances local HEAD, so on a shared
+  # checkout HEAD lags origin by an unbounded amount and LOOKS authoritative
+  # while doing it (~/.claude/CLAUDE.md says this outright: "HEAD: IS THE SAME
+  # HAZARD AS THE WORKTREE AND HIDES IT BETTER").
+  #
+  # Measured 2026-09-08: ~/.amux/hooks/git-shared-guard.py had an mtime of
+  # 12:01 THAT DAY and was 145 lines behind the repo, missing two shipped
+  # fixes — 09c26abb (`\b` after a literal verb matches a hyphen, so
+  # `commit-tree` read as `commit`) and a391c1c6 (AF-577, refuse a `git config`
+  # write from a linked worktree). The first blocked the out-of-tree graft that
+  # mixpeek's own CLAUDE.md prescribes as THE safe pattern on a shared
+  # checkout, for every lane on this box; the second exists because
+  # `core.bare=true` took the mixpeek fleet down for ~30 minutes. Both were
+  # committed, both were installed-from-HEAD while HEAD lagged, and nothing
+  # anywhere said the running hook was old.
+  for src_ref in "origin/main" "HEAD"; do
+    if head_bytes="$(git -C "$SCRIPT_DIR" show "$src_ref:$rel" 2>/dev/null)" && [[ -n "$head_bytes" ]]; then
+      break
+    fi
+    head_bytes=""
+  done
+  if [[ -n "$head_bytes" ]]; then
+    # ATOMIC, because $dest is a hook every lane on this box executes on every
+    # Bash call, and this runs while they are running. A plain `> "$dest"` opens
+    # the destination with O_TRUNC and REUSES the inode, so a hook that fires
+    # mid-write reads a truncated file. `scripts/atomic-replace.sh` is rename(2):
+    # a new inode and an atomic directory-entry swap, so anything already reading
+    # finishes on the bytes it started with (AF-597; the rule is in the fleet
+    # CLAUDE.md and this call site was the counter-example to it).
+    local _stage
+    # Stage in the DESTINATION's own directory. rename(2) is only atomic within
+    # one filesystem, and a cross-device `mv` degrades to open(O_TRUNC)+copy,
+    # which is the very write this is avoiding.
+    mkdir -p "$(dirname "$dest")"
+    _stage="$(mktemp "$(dirname "$dest")/.install-hook.XXXXXX")"
+    printf '%s\n' "$head_bytes" > "$_stage"
+    if [[ -f "$dest" && -x "$SCRIPT_DIR/scripts/atomic-replace.sh" ]]; then
+      "$SCRIPT_DIR/scripts/atomic-replace.sh" "$_stage" "$dest" >/dev/null
+      rm -f "$_stage"
+    else
+      # FIRST INSTALL, or a checkout predating the helper. Nothing can be
+      # executing a file that does not exist yet, and `mv` within one
+      # filesystem is the same rename(2) the helper performs.
+      #
+      # mktemp gives 0600 where the old `> "$dest"` gave 0644, and every call
+      # site chmods +x afterwards, so without this line a first install lands
+      # 0700 instead of 0755. Same result as before, stated rather than
+      # inherited from a umask.
+      chmod 0755 "$_stage"
+      mv -f "$_stage" "$dest"
+    fi
+    echo "  installed $rel from $src_ref"
+    if [[ "$src_ref" == "HEAD" ]]; then
+      echo "  NOTE: origin/main has no $rel (or no origin) — installed from HEAD,"
+      echo "        which on a graft-push checkout can lag origin by any amount."
+    elif ! git -C "$SCRIPT_DIR" diff --quiet "origin/main" "HEAD" -- "$rel" 2>/dev/null; then
+      echo "  NOTE: your HEAD's $rel differs from origin/main. Installed ORIGIN's"
+      echo "        bytes, which is what the rest of the fleet runs. If your local"
+      echo "        commit is the newer one, push it and re-run."
+    fi
     if ! git -C "$SCRIPT_DIR" diff --quiet HEAD -- "$rel" 2>/dev/null; then
       echo "  NOTE: $rel differs from HEAD in your worktree. Installed the COMMITTED"
       echo "        bytes; your uncommitted edit is NOT live. Commit it and re-run."
@@ -271,6 +340,19 @@ if [[ -f "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" ]]; then
   say "git guard: $AMUX_HOME/hooks/git-shared-guard.py (sha ${_guard_sha:0:12})"
 fi
 
+# Cheap-model read router. Full Read/cat/less/more calls over the configurable
+# line threshold are sent to `amux delegate read`; bounded reads stay with the
+# primary model for editing and debugging. Like the git guard, the bytes that
+# run are installed from HEAD and checked by a health invariant.
+if [[ -f "$SCRIPT_DIR/scripts/hooks/large-read-guard.py" ]]; then
+  mkdir -p "$AMUX_HOME/hooks"
+  install_hook_from_head scripts/hooks/large-read-guard.py "$AMUX_HOME/hooks/large-read-guard.py"
+  chmod +x "$AMUX_HOME/hooks/large-read-guard.py"
+  _read_guard_sha="$(shasum -a 256 "$AMUX_HOME/hooks/large-read-guard.py" | cut -d' ' -f1)"
+  printf '%s  large-read-guard.py\n' "$_read_guard_sha" > "$AMUX_HOME/hooks/large-read-guard.py.sha256"
+  say "read router: $AMUX_HOME/hooks/large-read-guard.py (sha ${_read_guard_sha:0:12})"
+fi
+
 # State-report hook (AMUX-2936), installed from the repo for the same reason as
 # the guard above: it was an unversioned runtime file, and unversioned runtime
 # files fork. There were already THREE spellings of "report state to amux" on
@@ -300,8 +382,9 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
   if [[ "$AMUX_HOME" == "$HOME/.amux" || -n "${AMUX_CLAUDE_SETTINGS:-}" ]]; then
     _claude_settings="${AMUX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
     if /usr/bin/python3 "$SCRIPT_DIR/scripts/hooks/install-claude-status-hooks.py" \
-      --settings "$_claude_settings" --hook-path '$HOME/.amux/hook-report.sh'; then
-      say "Claude status hooks: $_claude_settings"
+      --settings "$_claude_settings" --hook-path '$HOME/.amux/hook-report.sh' \
+      --read-guard-path '$HOME/.amux/hooks/large-read-guard.py'; then
+      say "Claude status + read-routing hooks: $_claude_settings"
     else
       warn "could not wire Claude status hooks; the report-hook invariant will remain unhealthy"
     fi
@@ -365,6 +448,38 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   # Reload systemd to recognize the new units.
   systemctl --user daemon-reload || die "systemctl daemon-reload failed"
 
+  # A systemd USER unit does not start at boot, and stops at logout, unless
+  # lingering is enabled for the user. Every unit this installer just wrote is
+  # a user unit with WantedBy=default.target, so on a headless box the whole
+  # set is silently inert until somebody logs in (AF-527).
+  #
+  # This is issue #92's report, reproduced from the other side: the reporter ran
+  # a headless Arch box, found nothing came up, and hand-wrote a SYSTEM unit at
+  # /etc/systemd/system/amux.service — which is the exact remedy
+  # docs/systemd-setup.md then calls "not recommended". They derived the heavy
+  # workaround because the one-command one was written down nowhere in this
+  # repo: `loginctl enable-linger` appeared in no script, no doc and no template.
+  # Ethos rule 1 — the capability existed in systemd and reached no installer.
+  #
+  # It WARNS rather than enabling it. Lingering changes state for the user
+  # account beyond this repo, and an installer that silently does that is the
+  # kind of thing you discover later; naming it costs one line and leaves the
+  # decision where it belongs.
+  linger_advice() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    local state
+    state="$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" || return 0
+    [ "$state" = "yes" ] && return 0
+    printf '%s\n' "LINGER IS OFF for $(id -un). The units just written are USER units, so"
+    printf '%s\n' "they will NOT start at boot and will stop when you log out. On a headless"
+    printf '%s\n' "box that means nothing above comes back after a reboot. Enable it with:"
+    printf '%s\n' "    sudo loginctl enable-linger $(id -un)"
+    printf '%s\n' "Without this, the usual next step is hand-writing a /etc/systemd/system unit,"
+    printf '%s\n' "which needs root and is not what these templates are for (issue #92)."
+    return 1
+  }
+  if ! linger_advice; then LINGER_OFF=1; else LINGER_OFF=0; fi
+
   say "systemd user services created:"
   say "  $SYSTEMD_DIR/amux-server.service"
   say "  $SYSTEMD_DIR/amux-builder.service"
@@ -389,6 +504,9 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   echo ""
   echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
   echo ""
+  if [ "${LINGER_OFF:-0}" = "1" ]; then
+    warn "lingering is OFF — re-read the LINGER note above before rebooting"
+  fi
   say "See docs/systemd-setup.md for full documentation"
   echo ""
   # Deliberate, not incidental (review @esteininger, PR #166): this path
@@ -451,6 +569,23 @@ launchctl_reload_agent() {
 # terminal you debug from.
 LAUNCHD_PATH="$HOME/.cargo/bin:$BIN_DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 
+# NO LimitLoadToSessionType KEY BELOW — worth saying explicitly, because its
+# absence is itself a property, not a gap. It defaults the server agent (and
+# the builder and fleet-start below) to `Aqua`: launchd loads it at GUI
+# LOGIN, same "starts at login, not at boot" property the fleet-start note
+# further down names for the WORKERS. AEAB-28/AF-656, real: the machine was
+# up and on the network at 15:18 after a hardware fault, but amux did not
+# start until the console login at 18:28 — a ~75-minute hardware outage
+# became a 4h26m amux one, unbounded on a headless box.
+#
+# `LimitLoadToSessionType = Background` would start the server at BOOT
+# instead. Not set here, and this is deliberately a NAMED trade rather than
+# a default (ethos rule 8): Background sessions load before the login
+# keychain unlocks, so any lane whose provider credentials live in the
+# keychain can fail in a way that reads as a broken lane, not a locked
+# keychain. Automatic login (see the fleet-start note below) fixes both
+# starts-at-login properties at once but is the bigger posture change —
+# incompatible with FileVault, and this machine is Tailscale-reachable.
 cat > "$SERVER_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -477,10 +612,23 @@ PLIST
 # (Re)load: bootout is a no-op complaint when the label isn't loaded yet.
 launchctl_reload_agent "$LABEL" "$SERVER_PLIST"
 say "launchd agent loaded: $LABEL"
+say "  NOTE (AEAB-28/AF-656): this agent has no LimitLoadToSessionType, so it"
+say "  loads at GUI LOGIN, not at boot — an unattended reboot leaves the"
+say "  server itself down, not just the fleet (see the fleet-start note below"
+say "  for the same property on the workers). LimitLoadToSessionType=Background"
+say "  starts it at boot instead, but the login keychain is still locked at"
+say "  that point, so provider-credential lookups can fail in a way that reads"
+say "  as a broken lane. Not set here — your call, not this installer's."
 
 if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
   BUILDER_LABEL="$LABEL-builder"
   BUILDER_PLIST="$PLIST_DIR/$BUILDER_LABEL.plist"
+  # Keep the launchd activation entrypoint outside the mutable checkout. The
+  # wrapper itself selects a clean detached origin/main worktree, so a locally
+  # ahead shared checkout cannot turn the 60s timer into an unreviewed deploy.
+  AUTHORITY_BUILDER="$AMUX_HOME/bin/amux-build-authority"
+  mkdir -p "$(dirname "$AUTHORITY_BUILDER")"
+  install -m 0755 "$SCRIPT_DIR/scripts/rust-auto-build-authority.sh" "$AUTHORITY_BUILDER"
   cat > "$BUILDER_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -488,7 +636,12 @@ if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
 <dict>
   <key>Label</key><string>$BUILDER_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>$SCRIPT_DIR/scripts/rust-auto-build.sh</string></array>
+  <array><string>$AUTHORITY_BUILDER</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AMUX_AUTHORITY_REPO</key><string>$SCRIPT_DIR</string>
+    <key>AMUX_RS_ACTIVATION_REF</key><string>origin/main</string>
+  </dict>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$AMUX_HOME/logs/rust-auto-build.log</string>
@@ -497,7 +650,7 @@ if [[ "${AMUX_NO_BUILDER:-}" != "1" ]]; then
 </plist>
 PLIST
   launchctl_reload_agent "$BUILDER_LABEL" "$BUILDER_PLIST"
-  say "launchd agent loaded: $BUILDER_LABEL (rebuilds + redeploys on new commits in $SCRIPT_DIR)"
+  say "launchd agent loaded: $BUILDER_LABEL (activates only detached origin/main)"
 fi
 
 # ── Fleet cold-start ────────────────────────────────────────────────────────

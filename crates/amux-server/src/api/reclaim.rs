@@ -27,6 +27,7 @@
 //!    they would free (ethos rule 8 — never bulk-delete user content).
 
 use super::AppState;
+use crate::runtime_jobs::storage::{local_snapshots, SNAPSHOT_UNMEASURED};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -387,22 +388,33 @@ pub(crate) fn df_bytes(path: &FsPath) -> Option<(u64, u64)> {
     Some((st.f_bavail * bsize, st.f_blocks * bsize))
 }
 
-/// APFS local snapshots. These retain blocks belonging to deleted files, which
-/// is why a delete can free `du` space without freeing `df` space.
-fn local_snapshots() -> Vec<String> {
-    std::process::Command::new("/usr/bin/tmutil")
-        .args(["listlocalsnapshots", "/"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.contains("com.apple.TimeMachine"))
-                .map(|l| l.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+/// The native probe is bounded and never occupies an async executor thread.
+async fn read_snapshots() -> Option<Vec<String>> {
+    match tokio::task::spawn_blocking(local_snapshots).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(%error, measured = false, n_considered = 0,
+                "reclaim_snapshot_probe: blocking task failed; measurement unknown");
+            None
+        }
+    }
+}
+
+fn snapshot_payload(snaps: Option<Vec<String>>, free: u64, total: u64) -> serde_json::Value {
+    let count = snaps.as_ref().map(Vec::len);
+    json!({
+        "snapshots": snaps,
+        "count": count,
+        "measured": count.is_some(),
+        "n_considered": count.unwrap_or(0),
+        "why_unmeasured": if count.is_none() { Some(SNAPSHOT_UNMEASURED) } else { None },
+        "df_free": free,
+        "df_total": total,
+        "note": count.map(crate::runtime_jobs::storage::apfs_snapshot_note)
+            .unwrap_or_else(|| SNAPSHOT_UNMEASURED.into()),
+        "thin_command": "sudo tmutil thinlocalsnapshots / 21474836480 4",
+        "thin_command_requires_backup_review": true,
+    })
 }
 
 // ── classification ───────────────────────────────────────────────────────────
@@ -485,6 +497,46 @@ pub(crate) fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into()))
 }
 
+/// The two roots whose direct children are, by OS convention, meant to be
+/// single-use scratch space: `/private/tmp` and the per-user Darwin temp dir
+/// (`$TMPDIR`, e.g. `/private/var/folders/xx/.../T`). Compared with the
+/// trailing slash trimmed since `std::env::temp_dir()` returns one and a
+/// walked directory path never does.
+fn ephemeral_tmp_roots() -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/private/tmp")];
+    let t = std::env::temp_dir();
+    let trimmed = t.to_string_lossy().trim_end_matches('/').to_string();
+    if !trimmed.is_empty() {
+        roots.push(PathBuf::from(trimmed));
+    }
+    roots
+}
+
+fn is_ephemeral_tmp_root(p: &FsPath) -> bool {
+    ephemeral_tmp_roots().iter().any(|r| r == p)
+}
+
+/// A directory sitting directly in `/private/tmp` or `$TMPDIR` must be
+/// orphaned after this long untouched, measured in HOURS rather than the
+/// 90-day default `stale_age_secs` used everywhere else.
+///
+/// Measured 2026-09-11: 590GB+ across both roots, from mktemp-style snapshot
+/// dirs that pre-push gates and graft-push create per invocation
+/// (`pushed-tree-guards-*`, `*tgt.*`, `tmp.*`, `treeguard.*`, naming varies by
+/// script and is not worth enumerating — see CLAUDE.md's own record of the
+/// fleet inventing a new suffix rather than reusing a documented one). Each is
+/// single-use: a gate run finishes in minutes or it crashed, so unlike a
+/// shared persistent cache (the fleet's cargo target dir, `~/.cache`) that is
+/// "hot" somewhere on the fleet every day and must not be swept on an hours
+/// timescale, a uniquely-named directory made by exactly one invocation has no
+/// "still in use" case past a few hours. `0` disables this arm entirely.
+fn tmp_orphan_stale_secs() -> i64 {
+    std::env::var("AMUX_RECLAIM_TMP_ORPHAN_STALE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(3 * 3600)
+}
+
 /// Coarse file-type bucket, used to color the treemap.
 fn kind_of(name: &str) -> &'static str {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
@@ -553,6 +605,15 @@ fn guard_path(p: &FsPath) -> Result<(), String> {
     }
     if s.contains("/.git/") || s.ends_with("/.git") {
         return Err("git metadata".into());
+    }
+    // Live scratchpad space for every currently-running Claude Code session on
+    // this machine, not a cleanup target. Its own top-level mtime can look
+    // stale for hours while sessions write deep inside their own subdirs
+    // (APFS only bumps a directory's mtime when its direct entries change),
+    // so age-based heuristics over it are unreliable in exactly the direction
+    // that would move someone's live working files.
+    if s == "/private/tmp/claude-501" || s.starts_with("/private/tmp/claude-501/") {
+        return Err("live Claude Code session scratchpad (claude-501)".into());
     }
     Ok(())
 }
@@ -796,6 +857,39 @@ fn walk(
                                 mtime: sub.newest_mtime,
                                 regenerable: true,
                                 detail: format!("{name} · untouched {age_d}d · rebuildable"),
+                            });
+                        }
+                        continue;
+                    }
+                    // Prune at a direct child of an ephemeral tmp root: see
+                    // `tmp_orphan_stale_secs` for why this needs its own,
+                    // much shorter staleness bar than BUILD_DIRS above.
+                    if is_ephemeral_tmp_root(&dir) {
+                        let sub = subtree_totals(&path, root_dev, cancel, pos);
+                        pos.set(&dir, "entries"); // back out of the pruned subtree
+                        out.bytes += sub.bytes;
+                        out.files += sub.files;
+                        local.bytes += sub.bytes;
+                        local.files += sub.files;
+                        *local.kinds.entry("build").or_default() += sub.bytes;
+                        let age = (now - sub.newest_mtime).max(0);
+                        let threshold = tmp_orphan_stale_secs();
+                        if threshold > 0
+                            && sub.bytes >= 100 * 1024 * 1024
+                            && age >= threshold
+                            && guard_path(&path).is_ok()
+                        {
+                            let age_h = age / 3600;
+                            out.findings.push(Finding {
+                                category: "tmp-orphan",
+                                path: path.clone(),
+                                bytes: sub.bytes,
+                                file_count: sub.files,
+                                mtime: sub.newest_mtime,
+                                regenerable: true,
+                                detail: format!(
+                                    "{name} · untouched {age_h}h · orphaned gate/build snapshot"
+                                ),
                             });
                         }
                         continue;
@@ -1094,7 +1188,7 @@ async fn begin_scan(
     };
 
     let (free, total) = df_bytes(&home_dir()).unwrap_or((0, 0));
-    let snaps = local_snapshots().len() as i64;
+    let snaps = read_snapshots().await.map(|v| v.len() as i64);
     let roots_json = serde_json::to_string(
         &roots.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
     )
@@ -1393,7 +1487,7 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
         for f in &out.findings {
             insert_finding(c, &sid, f)?;
         }
-        if !snaps.is_empty() {
+        if let Some(snaps) = snaps.as_ref().filter(|v| !v.is_empty()) {
             c.execute(
                 "INSERT OR REPLACE INTO reclaim_findings
                    (scan_id, category, path, bytes, file_count, mtime, regenerable, detail)
@@ -1402,10 +1496,8 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
                     sid,
                     snaps.len() as i64,
                     format!(
-                        "{} hourly local Time Machine snapshots retain blocks from deleted files. \
-                         Until these expire or are thinned, deleting files will NOT increase free space. \
-                         Oldest: {}",
-                        snaps.len(),
+                        "{} Oldest: {}",
+                        crate::runtime_jobs::storage::apfs_snapshot_note(snaps.len()),
                         snaps.first().map(|s| s.as_str()).unwrap_or("?")
                     )
                 ],
@@ -1440,7 +1532,7 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
         // that arrived twenty minutes late claiming success.
         c.execute(
             "UPDATE reclaim_scans SET status=?2, finished_at=?3, dirs_walked=?4, files_walked=?5,
-                 bytes_seen=?6, current_path=NULL, current_phase=NULL, df_free=?7
+                 bytes_seen=?6, current_path=NULL, current_phase=NULL, df_free=?7, snapshot_count=?8
              WHERE id=?1 AND status='running'",
             rusqlite::params![
                 sid,
@@ -1449,7 +1541,8 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
                 out.dirs as i64,
                 out.files as i64,
                 out.bytes as i64,
-                free_now as i64
+                free_now as i64,
+                snaps.as_ref().map(|v| v.len() as i64)
             ],
         )?;
         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
@@ -1497,6 +1590,7 @@ async fn list_scans(State(state): State<AppState>) -> Response {
             "df_total": r.get::<_, Option<i64>>(8)?,
             "df_free": r.get::<_, Option<i64>>(9)?,
             "snapshot_count": r.get::<_, Option<i64>>(10)?,
+            "snapshots_measured": r.get::<_, Option<i64>>(10)?.is_some(),
         }))
     });
     let list: Vec<_> = rows.map(|r| r.flatten().collect()).unwrap_or_default();
@@ -1552,6 +1646,7 @@ async fn get_scan(
                 "df_total": r.get::<_, Option<i64>>(10)?,
                 "df_free": r.get::<_, Option<i64>>(11)?,
                 "snapshot_count": r.get::<_, Option<i64>>(12)?,
+                "snapshots_measured": r.get::<_, Option<i64>>(12)?.is_some(),
                 // Which of the two identical-looking stalls this was. Absent
                 // from the first version, which is why a wedged scan could only
                 // report that it had stopped, never where or in what.
@@ -1792,18 +1887,9 @@ async fn get_tree(
 }
 
 async fn list_snapshots(State(_state): State<AppState>) -> Response {
-    let snaps = local_snapshots();
+    let snaps = read_snapshots().await;
     let (free, total) = df_bytes(&home_dir()).unwrap_or((0, 0));
-    Json(json!({
-        "snapshots": snaps,
-        "count": snaps.len(),
-        "df_free": free,
-        "df_total": total,
-        "note": "Local APFS snapshots retain blocks from deleted files. While these exist, \
-                 deleting files can free `du` space without freeing `df` space.",
-        "thin_command": "sudo tmutil thinlocalsnapshots / 21474836480 4",
-    }))
-    .into_response()
+    Json(snapshot_payload(snaps, free, total)).into_response()
 }
 
 // ── quarantine ───────────────────────────────────────────────────────────────
@@ -1880,7 +1966,7 @@ async fn create_quarantine(
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::rename(&p, &dest) {
+        match crate::cargo_target_guard::rename(&p, &dest) {
             Ok(_) => {
                 total += sz;
                 moved.push((p.to_string_lossy().into_owned(), dest.to_string_lossy().into_owned(), sz));
@@ -2016,6 +2102,7 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
     };
 
     let mut restored = 0usize;
+    let mut restored_paths = Vec::new();
     let mut failed = Vec::new();
     for (orig, staged) in &pairs {
         let op = PathBuf::from(orig);
@@ -2026,8 +2113,11 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
         if let Some(parent) = op.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::rename(staged, &op) {
-            Ok(_) => restored += 1,
+        match crate::cargo_target_guard::rename(FsPath::new(staged), &op) {
+            Ok(_) => {
+                restored += 1;
+                restored_paths.push(orig.clone());
+            }
             Err(e) => failed.push(json!({"path": orig, "reason": e.to_string()})),
         }
     }
@@ -2037,10 +2127,13 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
     let _ = state
         .store
         .write_async(move |c| {
-            c.execute(
-                "UPDATE reclaim_quarantine_items SET status='restored' WHERE batch_id=?1 AND status='staged'",
-                [&bid],
-            )?;
+            // A Cargo guard refusal must remain staged and retryable.
+            for original in &restored_paths {
+                c.execute(
+                    "UPDATE reclaim_quarantine_items SET status='restored' WHERE batch_id=?1 AND original_path=?2 AND status='staged'",
+                    rusqlite::params![bid, original],
+                )?;
+            }
             c.execute(
                 "UPDATE reclaim_quarantine SET status=?2 WHERE id=?1",
                 rusqlite::params![bid, if ok_all { "restored" } else { "failed" }],
@@ -2083,18 +2176,28 @@ async fn purge_quarantine(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad batch id"}))).into_response();
     }
     let (free_before, _) = df_bytes(&home_dir()).unwrap_or((0, 0));
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::error!(batch = %id, error = %e, "reclaim purge failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response();
+    // Older versions could stage a live Cargo target. Keep the original paths
+    // in the guard even though the bytes are now under quarantine/.
+    let originals: Vec<String> = {
+        let conn = match state.store.read() {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+        };
+        let result = (|| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = conn.prepare("SELECT original_path FROM reclaim_quarantine_items WHERE batch_id=?1")?;
+            let rows = stmt.query_map([&id], |row| row.get(0))?;
+            rows.collect()
+        })();
+        match result {
+            Ok(paths) => paths,
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
         }
+    };
+    if let Err(e) = crate::cargo_target_guard::purge(&dir, &originals) {
+        return (StatusCode::CONFLICT, Json(json!({"error": e, "verdict": "cargo_reclaim_deferred"}))).into_response();
     }
     let (free_after, _) = df_bytes(&home_dir()).unwrap_or((0, 0));
-    let snaps = local_snapshots().len();
+    let snaps = read_snapshots().await.map(|v| v.len());
 
     let bid = id.clone();
     let _ = state
@@ -2113,19 +2216,22 @@ async fn purge_quarantine(
         .await;
 
     let freed: u64 = free_after.saturating_sub(free_before);
-    tracing::info!(batch = %id, freed, snapshots = snaps, "reclaim quarantine purged");
+    tracing::info!(batch = %id, freed, snapshots = ?snaps, snapshots_measured = snaps.is_some(), "reclaim quarantine purged");
     Json(json!({
         "ok": true,
         "batch_id": id,
         "actually_freed": freed,
         "df_free": free_after,
         "snapshot_count": snaps,
+        "snapshots_measured": snaps.is_some(),
+        "snapshots_why_unmeasured": if snaps.is_none() { Some(SNAPSHOT_UNMEASURED) } else { None },
         // Say it at the moment the number disappoints, not in a doc nobody
         // reads: this is exactly where a user concludes the feature is broken.
-        "note": if snaps > 0 && freed < 1024 * 1024 * 64 {
-            format!("Files are deleted, but free space barely moved because {snaps} APFS local snapshots \
-                     still reference the blocks. Run `sudo tmutil thinlocalsnapshots / 21474836480 4` \
-                     to release them.")
+        "note": if snaps.is_none() {
+            SNAPSHOT_UNMEASURED.to_owned()
+        } else if snaps.is_some_and(|n| n > 0) && freed < 1024 * 1024 * 64 {
+            format!("Files were deleted and free space moved little. {}",
+                crate::runtime_jobs::storage::apfs_snapshot_note(snaps.unwrap_or(0)))
         } else {
             String::new()
         }
@@ -2136,6 +2242,25 @@ async fn purge_quarantine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_response_never_turns_failed_measurement_into_zero() {
+        let unknown = snapshot_payload(None, 100, 200);
+        assert_eq!(unknown["measured"], false);
+        assert!(unknown["count"].is_null());
+        assert!(unknown["snapshots"].is_null());
+        assert_eq!(unknown["n_considered"], 0);
+        assert!(unknown["why_unmeasured"].as_str().unwrap().contains("unmeasured"));
+        let zero = snapshot_payload(Some(vec![]), 100, 200);
+        assert_eq!(zero["measured"], true);
+        assert_eq!(zero["count"], 0);
+        assert_eq!(zero["snapshots"], json!([]));
+        assert!(zero["why_unmeasured"].is_null());
+        let positive = snapshot_payload(Some(vec!["snapshot".into()]), 100, 200);
+        assert_eq!(positive["count"], 1);
+        assert_eq!(positive["n_considered"], 1);
+        assert_eq!(positive["snapshots"], json!(["snapshot"]));
+    }
 
     /// The guard is the only thing standing between a size-ranking heuristic
     /// and the user's data, so it gets a check that can actually fail. Each
@@ -2163,6 +2288,8 @@ mod tests {
             PathBuf::from("/Volumes/Backup"),
             PathBuf::from("relative/path"),
             PathBuf::from("/Users/ethan/Dev/../../etc"),
+            PathBuf::from("/private/tmp/claude-501"),
+            PathBuf::from("/private/tmp/claude-501/-Users-ethan-Dev/some-session/scratchpad/file.txt"),
         ];
         for p in must_refuse {
             assert!(
@@ -2198,6 +2325,18 @@ mod tests {
                 guard_path(&p)
             );
         }
+    }
+
+    /// Only the two literal roots match — a child, a sibling, or a
+    /// look-alike path must not, or every orphan-classification decision
+    /// downstream is built on a predicate that is quietly too broad.
+    #[test]
+    fn ephemeral_tmp_root_matches_only_the_roots_themselves() {
+        assert!(is_ephemeral_tmp_root(FsPath::new("/private/tmp")));
+        assert!(is_ephemeral_tmp_root(&std::env::temp_dir()));
+        assert!(!is_ephemeral_tmp_root(FsPath::new("/private/tmp/some-orphan-dir")));
+        assert!(!is_ephemeral_tmp_root(FsPath::new("/private")));
+        assert!(!is_ephemeral_tmp_root(&home_dir()));
     }
 
     /// `df_bytes` is the honest-reclaim measurement. If it silently returns

@@ -13,11 +13,23 @@
 # SHIPPED script through its dry-run seam rather than restating the logic.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 SCRIPT="$(pwd)/scripts/rust-auto-build.sh"
+SELF="$(pwd)/scripts/test-build-disk-clear.sh"
 PASS=0; FAIL=0
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/amux-cargo-guard-test.XXXXXX");
+export AMUX_CARGO_GUARD_TEST_FIXTURE="$TMP"; trap 'rm -rf "$TMP"' EXIT
+# AF-675: an abort under `set -euo pipefail` used to print NOTHING before this
+# -- the only signal was the ABSENCE of the summary line at the bottom, which
+# is exactly the symptom that made the original AMUX-134 outage hard to read
+# (a suite's own "N passed, 0 failed" followed by a bare nonzero exit, nothing
+# in between). Name the abort so it announces itself instead of being read
+# from a hole (ethos rule 4).
+trap 'echo "test-build-disk-clear: ABORTED at line $LINENO (\`$BASH_COMMAND\`) -- $PASS passed, $FAIL failed before the abort" >&2' ERR
+# Cleanup diagnostics cannot depend on a running server or an inherited fleet
+# endpoint. This also reproduces CI, where no deployment-permit server exists.
+export AMUX_URL=http://127.0.0.1:1
 
 # The script redirects its whole build block to $LOG, so stdout is empty by
 # design — read the log it actually writes. AMUX_RS_BUILD_LOG is the existing
@@ -50,8 +62,8 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; echo "  got: ${2:-<empty>}"; }
 # --- (a) both caches present: the IDLE one must be named FIRST -------------
 H="$TMP/both"; mkdir -p "$H/.amux/rust-build-target" "$H/.amux/rust-build-target-e2e-head"
 out=$(run "$H")
-idle_line=$(printf '%s\n' "$out" | grep -n "idle e2e target dir" | head -1 | cut -d: -f1)
-shared_line=$(printf '%s\n' "$out" | grep -n "SHARED target dir" | head -1 | cut -d: -f1)
+idle_line=$(printf '%s\n' "$out" | grep -n "idle e2e target dir" | head -1 | cut -d: -f1 || true)
+shared_line=$(printf '%s\n' "$out" | grep -n "SHARED target dir" | head -1 | cut -d: -f1 || true)
 if [ -n "$idle_line" ] && [ -n "$shared_line" ] && [ "$idle_line" -lt "$shared_line" ]; then ok
 else bad "(a) the idle e2e cache must be cleared BEFORE the shared one" "$out"; fi
 
@@ -81,31 +93,16 @@ if printf '%s\n' "$out3" | grep -qE "DISK LOW"; then
   bad "(d) with free space above the floor nothing may be cleared" "$out3"
 else ok; fi
 
-# --- (g) AF-415: the disk-low arm clears EVEN WITH A PEER BUILD IN FLIGHT --
-#     The neighbouring debug-SIZE arm defers while any rustc/cargo runs
-#     (AF-303). This one deliberately does not, because below the sacrifice
-#     floor ENOSPC breaks every lane anyway — so a peer build dies either way,
-#     and the difference is whether it dies diagnosably or with a full disk.
-#
-#     That asymmetry reads as an oversight, and the obvious "fix" is to add the
-#     same gate here. This cell is what makes that a deliberate choice somebody
-#     has to argue with rather than one they can quietly reverse: if a peer gate
-#     is ever added to the low-disk arm, this fails and says why.
-#     ASSERT THE EFFECT, NOT THE LOG LINE. The first version of this cell
-#     grepped for "SHARED target dir" — and the echo runs BEFORE the rm, so a
-#     peer gate inserted between them left the line intact and the cell passed
-#     while the clear was skipped. Verified by mutation: adding
-#     `[ -n "$AMUX_BUILD_PEER_PIDS_OVERRIDE" ] && continue` before the rm scored
-#     23 passed. So this runs WITHOUT the dry-run seam, against throwaway dirs
-#     under $TMP, and asks the filesystem.
+# --- (g) ATE-92: even severe disk pressure must defer an active build. ----
+# Real mutations of temp fixtures, so a misleading "deferred" log cannot pass.
 H4="$TMP/peerbuilding"; mkdir -p "$H4/.amux/rust-build-target" "$H4/.amux/rust-build-target-e2e-head"
 HOME="$H4" AMUX_RS_BUILD_LOG="$H4/build.log" AMUX_BUILD_MIN_FREE_GB=999999 \
   AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=999999 \
   AMUX_BUILD_PEER_PIDS_OVERRIDE="4242 4243" \
   AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1
 out4=$(cat "$H4/build.log" 2>/dev/null)
-if [ ! -d "$H4/.amux/rust-build-target" ]; then ok
-else bad "(g) the low-disk arm must still CLEAR with peers building — below the sacrifice floor ENOSPC breaks them anyway (AF-415)" "$out4"; fi
+if [ -d "$H4/.amux/rust-build-target" ] && printf '%s\n' "$out4" | grep -q cargo_reclaim_deferred; then ok
+else bad "(g) an active build must retain its target even below the disk floor" "$out4"; fi
 # PRECONDITION, so (g) cannot pass because the script never reached the arm:
 # the low-disk branch must actually have run.
 if printf '%s\n' "$out4" | grep -q "DISK LOW"; then ok
@@ -250,14 +247,12 @@ if [ -f "$TMP/nopeer/.amux/rust-build-target/debug/marker" ]; then
   bad "(k) debug/ should have been removed when no peer is building" "$out7"
 else ok; fi
 
-# (l) A peer IS building but disk is BELOW the fleet floor: ENOSPC outranks the
-#     peer, because running out of disk breaks the lane being protected too.
-#     A deferral with no override is a disk-full outage with better manners.
+# (l) Disk pressure never overrides active debug builds (ATE-92).
 out8=$(dbg_run peerbutfull 999999 "4242")
-if printf '%s\n' "$out8" | grep -q "Clearing"; then ok
-else bad "(l) below the fleet floor the clear must override a peer build" "$out8"; fi
-if printf '%s\n' "$out8" | grep -q "ENOSPC outranks"; then ok
-else bad "(l) the override must SAY it overrode a peer, not clear silently" "$out8"; fi
+if printf '%s\n' "$out8" | grep -q "cargo_reclaim_deferred"; then ok
+else bad "(l) below the fleet floor the clear must still defer" "$out8"; fi
+if [ -f "$TMP/peerbutfull/.amux/rust-build-target/debug/marker" ]; then ok
+else bad "(l) active debug artifacts must survive severe disk pressure" "$out8"; fi
 
 # (m) THE DETECTOR'S PRECISION, exercised for real with NO override. A process
 #     whose COMMAND LINE merely mentions cargo must not read as a build: the
@@ -282,8 +277,35 @@ else bad "(l) the override must SAY it overrode a peer, not clear silently" "$ou
 # Recorded rather than deleted, because the next reader will be tempted to
 # "fix" this back to an exit-code test.)
 #
+# AMUX-134: "read the output, not the exit code" describes what the IF BELOW
+# does, not what this ASSIGNMENT does. `{ pgrep -x rustc; pgrep -x cargo; }`
+# exits 1 (from the last pgrep, per the note above) on the overwhelmingly
+# common "no real build running" host — under `pipefail` that 1 survives the
+# pipe into `tr`, and under this script's own `set -euo pipefail` a plain
+# assignment statement that ends nonzero kills the WHOLE SCRIPT right here,
+# silently (bash's own errexit trap leaves no trace beyond the EXIT trap
+# firing) — before the `if` below ever gets to read the output at all. Caught
+# 2026-09-07 (CI red, AMUX-134) because CI runners never have a stray cargo/
+# rustc process to accidentally mask it; this dev box does, most of the time,
+# which is exactly backwards from the host-dependence the comment above
+# already worried about. `|| true` makes "nothing found" the unremarkable
+# case it always was semantically, without changing what the `if` reads.
+#
 # The shipped detector consumes the output too, so it is unaffected either way.
-_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]')"
+# `|| true` on EACH pgrep, because the STATUS IS IGNORED here: the decision below
+# reads the OUTPUT ($_real_builds being empty or not), never the exit code. On an
+# IDLE host both pgreps exit 1, `pipefail` propagates that through the
+# substitution, and `set -euo pipefail` then aborts the whole harness BEFORE it
+# prints anything. That is what turned CI red from 39ac1877 to 55920e07: it could
+# not reproduce on this box, where a builder keeps a cargo process alive so the
+# pgrep matches and the status is 0. Green here, red on any idle runner.
+#
+# MERGE NOTE: amux-frustrations and the 1133c2f2 author fixed this independently
+# within the hour, mine as `)" || true` on the assignment and theirs per-command.
+# Both work; theirs is kept because it leaves the assignment's own status
+# meaningful instead of blanketing it, and this comment is kept because it
+# carries the measured cause.
+_real_builds="$( { pgrep -x rustc || true; pgrep -x cargo || true; } 2>/dev/null | tr -d '[:space:]')"
 if [ -n "$_real_builds" ]; then
   echo "SKIP (m): a real cargo/rustc is running on this host, so the no-peer"
   echo "         precondition cannot be established. Not counted as a pass."
@@ -294,8 +316,10 @@ else
   : > "$h/.amux/rust-build-target/debug/marker"
   out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
     AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
-    AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
-  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null
+    AMUX_CARGO_GUARD_TEST_FIXTURE= AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
+  # A successfully killed decoy makes `wait` report its signal status. That is
+  # expected cleanup, not a harness failure under `set -e`.
+  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
   # PROVE THE PROBE RAN before believing its negative (ethos rule 4). This cell
   # asserted only the ABSENCE of "DEFERRED", and a script that died before
   # reaching the decision produces exactly that log. It did: the first cut of
@@ -304,9 +328,60 @@ else
   # the negative is the clear line itself.
   if printf '%s\n' "$out9" | grep -q "DEBUG ARTIFACTS"; then ok
   else bad "(m) the script must REACH the debug decision, not die before it" "$out9"; fi
+  # READ THE REASON, do not infer it from the symptom (AMUX-134 follow-up).
+  # This cell asserted "no DEFERRED at all" and blamed every deferral on the
+  # cargo mention. On a GitHub runner it fired for a different cause entirely:
+  #   {"verdict":"cargo_reclaim_deferred","measured":false,"n_considered":0,
+  #    "reason":"process executable unmeasured: pid 994"}
+  # That is the guard failing CLOSED on a process whose /proc/<pid>/exe it
+  # cannot read, which is deliberate and documented in process_executable's
+  # own docstring ("Truncated/custom names do not resolve and therefore
+  # continue to fail closed"). Correct behaviour, reported as the bug it is
+  # not, and it reddened `checks` on main and on every PR that merged main.
+  #
+  # So: an unmeasured PROBE is an environment limit, reported and not counted
+  # as a pass (ethos rule 4 -- do not read a negative from a probe that could
+  # not run). Any OTHER deferral still fails, which is the property this cell
+  # exists for.
   if printf '%s\n' "$out9" | grep -q "DEFERRED"; then
-    bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+    if printf '%s\n' "$out9" | grep -q "process executable unmeasured"; then
+      echo "SKIP (m): the process probe came back UNMEASURED on this host"
+      echo "         ($(printf '%s\n' "$out9" | grep -o 'process executable unmeasured: pid [0-9]*' | head -1)),"
+      echo "         so the cargo-mention property was NOT exercised. Not counted as a pass."
+    else
+      bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+    fi
   else ok; fi
+fi
+
+# (n) THE IDLE-HOST CELL, and it must not depend on whether this host is idle.
+# Every cell above that could catch the abort is inside the `else` branch that
+# only runs when nothing is building, so on a machine with a live builder the
+# whole population is unreachable and the suite reports PASS. This cell runs the
+# same construct with names that can never match, under the same shell options,
+# so it reproduces the idle-runner condition on any host.
+#
+# AF-675: this used to be a HAND-TYPED COPY of the pattern rather than the
+# SHIPPED line above, so a regression to that line's own `|| true` placement
+# or pipefail safety kept its own separately-maintained fix regardless of what
+# happened to the real one -- invisible on any box with a live builder, which
+# is every box that runs the auto-builder. Extract the actual assignment line
+# from $SELF and substitute names that can never match, so this cell fails
+# when the SHIPPED text regresses, not only when a hand-copy of it does.
+_shipped_line=$(grep -F '_real_builds="$( { pgrep -x rustc || true' "$SELF" | head -1)
+if [ -z "$_shipped_line" ]; then
+  bad "(n) could not find the shipped assignment line in $SELF to test" ""
+else
+  _probe_line=$(printf '%s\n' "$_shipped_line" | sed \
+    -e 's/pgrep -x rustc/pgrep -x amux_no_such_rustc/' \
+    -e 's/pgrep -x cargo/pgrep -x amux_no_such_cargo/')
+  if out_n=$(bash -c "set -euo pipefail
+$_probe_line
+printf 'REACHED[%s]' \"\$_real_builds\"" 2>/dev/null) && [ "$out_n" = "REACHED[]" ]; then
+    ok
+  else
+    bad "(n) the SHIPPED assignment line must reach its decision under set -euo pipefail" "$out_n"
+  fi
 fi
 
 echo

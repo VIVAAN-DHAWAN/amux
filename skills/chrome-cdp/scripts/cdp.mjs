@@ -21,11 +21,23 @@ const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
-const RUNTIME_DIR = IS_WINDOWS
+const RUNTIME_BASE = IS_WINDOWS
   ? resolve(homedir(), '.cache', 'cdp')
   : process.env.XDG_RUNTIME_DIR
     ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
     : resolve(homedir(), '.cache', 'cdp');
+// One cache/socket namespace per explicitly selected browser. `pages.json`
+// used to be shared across every CDP_PORT, so `list` on profile C overwrote
+// the targets that the next command for profiles A/B resolved against. That
+// made the documented AMUX_PROFILE/CDP_PORT path single-browser in practice.
+// Default Chrome keeps the historical path; only explicit multi-browser
+// callers get a scoped directory.
+const RUNTIME_SCOPE = process.env.CDP_PORT
+  ? `port-${String(process.env.CDP_PORT).replace(/[^0-9]/g, '')}`
+  : process.env.AMUX_PROFILE
+    ? `amux-${process.env.AMUX_PROFILE.replace(/[^a-zA-Z0-9_.-]/g, '_')}`
+    : '';
+const RUNTIME_DIR = RUNTIME_SCOPE ? resolve(RUNTIME_BASE, RUNTIME_SCOPE) : RUNTIME_BASE;
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
@@ -73,23 +85,30 @@ function amuxCdpPort() {
   }
   let st;
   try { st = JSON.parse(body); } catch { throw new Error(`AMUX_PROFILE=${want}: amux returned non-JSON: ${body.slice(0, 200)}`); }
-  if (!st.running || !st.cdp_port) {
+  const browsers = Array.isArray(st.browsers) && st.browsers.length
+    ? st.browsers
+    : (st.running && st.cdp_port ? [st] : []);
+  if (!browsers.length) {
     throw new Error(
       `AMUX_PROFILE=${want}: no amux browser is running. Start one:\n` +
       `  curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $AMUX_SESSION" \\\n` +
       `       -d '{"profile":"${want}","url":"about:blank"}' ${base}/api/browser/start`);
   }
-  // NAME THE MISMATCH rather than driving the wrong profile. One browser runs
-  // at a time, so asking for `netsuite` while `lob` is up must not silently
-  // hand you `lob`'s logged-in session — that is somebody else's staged state.
-  if (st.profile && st.profile !== want) {
+  const selected = browsers.find(b => b.profile === want);
+  // NAME THE MISMATCH rather than driving the wrong profile. The server now
+  // supports multiple simultaneous saved profiles; the legacy top-level
+  // `profile`/`cdp_port` fields describe only one of them and therefore cannot
+  // answer this lookup safely.
+  if (!selected) {
+    const available = browsers.map(b => b.profile || '(unnamed)').join(', ');
     throw new Error(
-      `AMUX_PROFILE=${want}: the running amux browser is profile '${st.profile}' ` +
-      `(started by ${st.started_by || 'unknown'}). Refusing to drive a different profile ` +
-      `than you asked for. Use AMUX_PROFILE=${st.profile}, or take it over deliberately ` +
-      `with {"profile":"${want}","takeover":true} on /api/browser/start.`);
+      `AMUX_PROFILE=${want}: no running browser matches that profile. ` +
+      `Running profiles: ${available}. Refusing to drive a different saved login.`);
   }
-  return Number(st.cdp_port);
+  if (!selected.cdp_port) {
+    throw new Error(`AMUX_PROFILE=${want}: the matching browser reported no cdp_port`);
+  }
+  return Number(selected.cdp_port);
 }
 
 function getWsUrl() {
@@ -834,11 +853,82 @@ const NEEDS_TARGET = new Set([
   'net','network','click','clickxy','type','loadall','evalraw',
 ]);
 
+// Tell amux this browser is being driven (AMUX-4685).
+//
+// The activity reaper counts amux browser VERBS and closes a profile with none
+// for AMUX_BROWSER_ACTIVITY_REAP_S (300 by default). Everything this file does
+// goes straight to Chrome over raw CDP, which the server cannot see, so a
+// browser under continuous use read as idle and was closed. Measured
+// 2026-09-15: three kills while driving dashboard overlays, one mid-sweep with
+// results half-collected.
+//
+// The reaper cannot learn this by looking. Chrome's HTTP endpoints expose no
+// attachment state: verified with a debugger attached AND executing
+// Runtime.evaluate, /json/list still reports webSocketDebuggerUrl on the driven
+// target and /json/version carries version strings only, identical to detached.
+// So the driver has to say so, and it says so HERE rather than in a doc,
+// because a keepalive a caller must remember is one nobody sends.
+//
+// Best-effort and never fatal, deliberately: a keepalive that fails must not
+// break the command it was protecting. No amux server, no AMUX_URL, a 404 on an
+// older build, a slow reply - all of them fall through silently and the CDP
+// command proceeds.
+//
+// NOT `fetch`, AND THAT IS THE WHOLE POINT. amux serves HTTPS with a SELF-SIGNED
+// certificate (every documented call in CLAUDE.md is `curl -sk`), and Node's
+// fetch rejects those: measured against the live server, it throws
+// DEPTH_ZERO_SELF_SIGNED_CERT. Combined with the best-effort catch above, the
+// first cut of this function was a silent no-op on every real amux server,
+// indistinguishable from working. Caught by running it rather than reading it.
+//
+// `rejectUnauthorized: false` is scoped to THIS request, never
+// NODE_TLS_REJECT_UNAUTHORIZED, which would disable verification for the whole
+// process including anything a page command later talks to.
+async function amuxKeepalive() {
+  const base = process.env.AMUX_URL || process.env.AMUX_API;
+  if (!base) return;
+  const session = process.env.AMUX_SESSION || process.env.AMUX_WORKER || '';
+  let url;
+  try {
+    url = new URL(`${base.replace(/\/+$/, '')}/api/browser/keepalive`);
+  } catch {
+    return; // a malformed AMUX_URL is not worth failing a browser command over
+  }
+  const mod = url.protocol === 'https:' ? await import('node:https') : await import('node:http');
+  await new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    try {
+      const req = mod.request(
+        {
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname + url.search,
+          method: 'POST',
+          rejectUnauthorized: false,
+          headers: { 'content-length': 0, ...(session ? { 'x-amux-session': session } : {}) },
+        },
+        res => { res.resume(); res.on('end', finish); res.on('error', finish); },
+      );
+      req.setTimeout(1500, () => { req.destroy(); finish(); });
+      req.on('error', finish);
+      req.end();
+    } catch {
+      finish();
+    }
+  });
+}
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
   // Daemon mode (internal)
   if (cmd === '_daemon') { await runDaemon(args[0]); return; }
+
+  // Every real command counts as driving. Placed after the daemon branch so the
+  // long-lived daemon does not send one per poll, and before the help/usage
+  // exits so a `help` invocation does not pretend a browser is in use.
+  if (cmd && !['help', '--help', '-h'].includes(cmd)) await amuxKeepalive();
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);

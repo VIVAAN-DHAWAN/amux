@@ -105,10 +105,16 @@
 })();
 // ── Auth token injection (must be first — before any fetch calls) ──
 const _authToken = window._AMUX_AUTH_TOKEN || '';
+// AF-639. An empty _authToken has two causes with opposite consequences, and
+// the empty string cannot tell them apart: auth is off entirely (nothing will
+// 401, say nothing) or the server withheld the bearer from this browser
+// because it is remote (EVERY /api call will 401, for the life of this
+// window, and no reload can change it). The server answers which one.
+const _authWithheld = !!window._AMUX_AUTH_WITHHELD;
 function _authHeaders(headers) {
-  const h = headers ? { ...headers } : {};
-  if (_authToken) h['Authorization'] = 'Bearer ' + _authToken;
-  return h;
+  const h = new Headers(headers || {});
+  if (_authToken) h.set('Authorization', 'Bearer ' + _authToken);
+  return Object.fromEntries(h.entries());
 }
 function _authUrl(url) {
   if (!_authToken) return url;
@@ -213,16 +219,6 @@ function toggleTheme(checked) {
   _applyTheme(preferLight);
 })();
 
-// ── Auto-compact toggle ──
-async function toggleAutoCompact(checked) {
-  await fetch('/api/prefs', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ key: 'auto_compact_enabled', value: checked ? '1' : '0' })
-  });
-  // No-silent-actions: the checkbox flips natively even when the save fails,
-  // so say the save happened (same idiom as toggleAutotask below).
-  showToast(checked ? 'Auto-compact on' : 'Auto-compact off');
-}
 async function toggleAutotask(checked) {
   await fetch('/api/prefs', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -288,16 +284,6 @@ async function toggleAutofix(checked) {
   } catch (e) {}
 })();
 
-(async function initAutoCompact() {
-  try {
-    const r = await fetch('/api/prefs?key=auto_compact_enabled');
-    const d = await r.json();
-    const enabled = d.value !== '0';  // default ON
-    const cb = document.getElementById('auto-compact-checkbox');
-    if (cb) cb.checked = enabled;
-  } catch(e) {}
-})();
-
 // ── YOLO by default for new workers (Ethan 2026-08-19) ──
 // A global pref like the toggles above. The create flow reads _yoloDefault and,
 // when on, enables YOLO on the freshly-created worker via the SAME toggle_yolo
@@ -305,9 +291,9 @@ async function toggleAutofix(checked) {
 // dropping the server-resolved --model (passing `flags` at create would replace
 // it). Default OFF: skipping permission prompts is opt-in, per worker or globally.
 let _yoloDefault = false;
-// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer, which
-// `cross_group_send_ok` resolves at worker > group > global — so a per-worker
-// setting still wins and this is genuinely a default rather than an override.
+// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer.
+// Nonempty global/group/worker allow-lists compose; only a visible explicit
+// empty lower-level value denies. The worker row shows that effective source.
 //
 // No X-Amux-Session header: the server refuses this write from a worker origin,
 // because a session that could set it would be granting itself and every peer a
@@ -355,8 +341,10 @@ async function toggleCrossGroupDefault(checked) {
     }
     if (cb) cb.checked = !!saved.enabled;
     showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
-    if (note && saved.gate_enforcing === false) {
-      note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
+    if (note) {
+      note.textContent = saved.gate_enforcing === false
+        ? 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.'
+        : (saved.note || 'An explicit empty group or worker setting can deny this for that scope.');
     }
   } catch (e) {
     rollback();
@@ -372,9 +360,11 @@ async function toggleCrossGroupDefault(checked) {
     // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
     // operator reads an OFF switch as a closed door that is not there.
     const note = document.getElementById('crossgroup-default-note');
-    if (note && d.gate_enforcing === false) {
-      note.textContent = 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.';
-      note.style.color = '#b8860b';
+    if (note) {
+      note.textContent = d.gate_enforcing === false
+        ? 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.'
+        : (d.note || 'An explicit empty group or worker setting can deny this for that scope.');
+      if (d.gate_enforcing === false) note.style.color = '#b8860b';
     }
   } catch (e) {}
 })();
@@ -489,7 +479,7 @@ function _showUpgradeModal(d) {
   wrap.id = 'upgrade-modal';
   wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(5,5,10,0.88);display:flex;align-items:center;justify-content:center;padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom));';
   wrap.innerHTML =
-    '<div style="background:#14142a;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90dvh;overflow-y:auto;">' +
+    '<div style="background:#14142a;color:#e6edf3;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90dvh;overflow-y:auto;">' +
       '<div style="font-size:1.15rem;font-weight:700;margin-bottom:6px;">' +
         (isBudget ? 'Your trial budget is used up' : 'Your trial has ended') + '</div>' +
       (isBudget && spent ? '<div style="color:#f0b429;font-size:1.05rem;font-weight:600;margin-bottom:10px;">$' + spent + ' of $' + budget + ' used</div>' : '') +
@@ -582,8 +572,15 @@ async function _upgradeCheckout(billing) {
 }
 
 let sessions = [];
+// A stream update and a poll response are two snapshots of the same runtime
+// truth. A request begun before an SSE update must not finish later and put the
+// old task attribution back on screen.
+let _sessionsSnapshotEpoch = 0;
+let pausedExpanded = false;
+let expiredExpanded = false;
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
+let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
 let _initialLoad = true;   // true until first data arrives from server
 let _lastDataTime = null;  // timestamp of last successful data
 // AC-275: when NO data has ever arrived, _lastDataTime stays null and every
@@ -602,23 +599,134 @@ let _logMatches = {};       // name -> matched snippet string
 let _logSearchTimer = null;
 let _logSearchAbort = null;
 // Filters modal facets (session list). Multi-select within a facet.
-let filterProviders = new Set();   // 'claude' | 'codex' | 'gemini' | 'iterm2' | 'ollama' | 'grok'
-let filterStatuses = new Set();    // 'working' | 'waiting' | 'idle' | 'stopped'
+let filterProviders = new Set();   // 'claude' | 'codex' | 'gemini' | 'iterm2' | 'ollama' | 'grok' | 'muse'
+let filterStatuses = new Set();    // 'working' | 'blocked' | 'waiting' | 'idle' | 'stopped'
 // Stable status key for filtering: card WORKING = 'active' internally.
 function _sessStatusKey(s) {
+  if (s.status === 'starting') return 'starting';
   if (!s.running) return 'stopped';
   if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'api_error') return 'api_error';
+  if (s.status === 'error') return 'error';
+  if (s.status === 'unattributed') {
+    const rb = s.runtime_board || {};
+    return rb.runtime_status === 'active' ? 'working' : 'waiting';
+  }
+  if (s.status === 'blocked') return 'blocked';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
 }
-let filterModels = new Set();      // coarse model class: opus/sonnet/haiku/gpt/gemini/...
-// Coarse model class for a model string, so "claude-opus-4-8" and a future
-// "claude-opus-5" both filter as "opus".
+let filterModels = new Set();      // typed model family/capability from /api/models
+let _modelCatalog = [];
+let _modelCatalogLoad = null;
+
+// One provider catalog feeds create, edit, settings, and model filters. The
+// server's WorkerConfig.model remains an open string: the catalog is guidance,
+// never a gate on a model released after this client was built.
+function _loadModelCatalog() {
+  if (_modelCatalogLoad) return _modelCatalogLoad;
+  _modelCatalogLoad = fetch(API + '/api/models', { headers: _authHeaders() })
+    .then(async r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      _modelCatalog = Array.isArray(d.models) ? d.models : [];
+      if (!d.measured || d.n_considered !== _modelCatalog.length) {
+        throw new Error('catalog measurement contract failed');
+      }
+      return _modelCatalog;
+    })
+    .catch(e => {
+      _modelCatalogLoad = null; // a later open retries after a transient failure
+      try {
+        fetch(API + '/api/client-debug', {
+          method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }), keepalive: true,
+          body: JSON.stringify({ kind: 'model-catalog-load-failed', error: String(e).slice(0, 200),
+            ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?') })
+        }).catch(() => {});
+      } catch (_) {}
+      throw e;
+    });
+  return _modelCatalogLoad;
+}
+
+function _modelTypeLabel(value) {
+  return String(value || 'other').split('-').map(x => x ? x[0].toUpperCase() + x.slice(1) : '').join(' ');
+}
+
+async function _workerModelsFor(provider) {
+  if (provider === 'ollama') {
+    const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    return (d.models || []).filter(Boolean).map(id => ({ id, model_type: 'local' }));
+  }
+  const models = await _loadModelCatalog();
+  return models.filter(m => m.provider === provider && m.worker_selectable);
+}
+
+async function _fillWorkerModelSelect(sel, provider, current, defaultLabel, allowCustom) {
+  if (!sel) return;
+  const request = (sel._amuxModelRequest || 0) + 1;
+  sel._amuxModelRequest = request;
+  sel.innerHTML = '<option value="">Loading models…</option>';
+  try {
+    const models = await _workerModelsFor(provider);
+    // Ollama is fetched independently. If the user changes provider while it
+    // is in flight, its late response must not repaint the new provider's list.
+    if (sel._amuxModelRequest !== request) return;
+    sel.innerHTML = '';
+    const def = document.createElement('option');
+    def.value = '';
+    def.textContent = defaultLabel || 'Default';
+    if (sel.id === 'edit-select') def.id = 'model-default-opt';
+    sel.appendChild(def);
+    const groups = new Map();
+    models.forEach(model => {
+      const type = model.model_type || 'other';
+      let group = groups.get(type);
+      if (!group) {
+        group = document.createElement('optgroup');
+        group.label = _modelTypeLabel(type);
+        groups.set(type, group);
+        sel.appendChild(group);
+      }
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.id;
+      group.appendChild(option);
+    });
+    if (allowCustom) {
+      const custom = document.createElement('option');
+      custom.value = '__custom__';
+      custom.textContent = 'Custom model ID…';
+      sel.appendChild(custom);
+    }
+    const known = Array.from(sel.options).some(option => option.value === current);
+    sel.value = known ? (current || '') : (current && allowCustom ? '__custom__' : '');
+    if (current && !known && allowCustom) {
+      const input = document.getElementById('edit-input');
+      if (input) input.value = current;
+    }
+  } catch (e) {
+    if (sel._amuxModelRequest !== request) return;
+    sel.innerHTML = '';
+    const custom = document.createElement('option');
+    custom.value = '__custom__';
+    custom.textContent = 'Catalog unavailable — enter model ID';
+    sel.appendChild(custom);
+    sel.value = '__custom__';
+    if (editState && editState.field === 'model') _editSelectChanged();
+  }
+}
+
+// Prefer the catalog's explicit type. The fallback is intentionally open-ended
+// for saved/custom ids newer than this build.
 function _modelClass(m) {
   m = (m || '').toLowerCase();
   if (!m) return 'other';
+  const typed = _modelCatalog.find(model => String(model.id).toLowerCase() === m);
+  if (typed && typed.model_type) return typed.model_type;
   if (m.includes('opus')) return 'opus';
   if (m.includes('sonnet')) return 'sonnet';
   if (m.includes('haiku')) return 'haiku';
@@ -629,13 +737,40 @@ function _modelClass(m) {
   return m.split(/[-\s]/)[0] || 'other';
 }
 let peekSession = null;
+// Every open/close is a new UI life, even when it names the same worker. Async
+// peek/log/IDB responses must match BOTH coordinates before touching shared
+// view state. A name-only check let a delayed response from a prior open land
+// after reconnect, including one live specimen where mixpeek-cicd output was
+// painted under amux-testing-e2e's header.
+let _peekOpenGeneration = 0;
+function _peekIdentity(name) {
+  return { name: name || peekSession || '', generation: _peekOpenGeneration };
+}
+function _peekIdentityCurrent(identity) {
+  return !!identity && !!identity.name && peekSession === identity.name
+    && _peekOpenGeneration === identity.generation;
+}
+function _peekIdentityDiscard(kind, identity, responseSession) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'peek-identity-discard', surface: kind,
+        requested_session: identity && identity.name || null,
+        response_session: responseSession || null, current_session: peekSession || null,
+        request_generation: identity && identity.generation,
+        current_generation: _peekOpenGeneration, verdict: 'stale_or_cross_worker_response_refused',
+        measured: true, n_considered: 1,
+        ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?') })
+    }).catch(() => {});
+  } catch (e) {}
+}
 // Last session whose peek was opened — remembered across closePeek so the
 // Messages view can pre-scope its filter to "the session you came from".
 let _lastPeekedSession = '';
 let peekTimer = null;
 let peekSessionDir = '';
 let peekSearchQuery = '';
-let _peekPendingFindScroll = false;   // one-shot scroll-to-match after a ⌖ Locate open
+let _peekPendingFindScroll = false;   // one-shot Locate/Find jump when history supplies a match
 let peekSearchIndex = 0;
 let _peekMatches = [];
 let lastPeekHTML = '';
@@ -648,8 +783,10 @@ let _peekEtag = null;    // ETag of last FULL peek response — enables conditio
 let _peekLiveEtag = null; // ETag of last live=1 response — keeps idle polls a cheap 304
 // Adaptive peek polling: fast while the session generates, back off when idle
 // (each idle poll is a cheap 304 anyway), and pause entirely when the tab is hidden.
+let _peekUrgentUntil = 0;    // bounded low-latency window after local input
 let _peekLastChangeMs = 0;   // performance.now() of the last time the live frame ACTUALLY changed
 function _peekPollInterval() {
+  if (performance.now() < _peekUrgentUntil) return 100;
   const s = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(x => x.name === peekSession) : null;
   const st = s && s.status;
   // CHANGE-DRIVEN cadence. A live=1 poll is ~650B (trimmed frame) / ~33ms server
@@ -670,7 +807,8 @@ function _peekPollInterval() {
 // without waiting for the ~2s-stale SSE status to flip to 'active'.
 function _peekKickFast() {
   _peekLastChangeMs = performance.now();
-  if (peekSession && !document.hidden) _schedulePeekPoll();
+  _peekUrgentUntil = _peekLastChangeMs + 1500;
+  if (peekSession && !document.hidden) _schedulePeekPoll(40);
 }
 let _peekPollGen = 0;
 // Raw timer clear, used on every reschedule, so it must stay beacon-free.
@@ -688,6 +826,9 @@ function _peekPollBeacon(action, session, extra) {
     fetch(API + '/api/client-debug', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
       body: JSON.stringify(Object.assign({ kind: 'peek-poll', action, session: session || null,
+        // AF-640: a merge resurrected the reverted parser. Expose its presence
+        // on the existing lifecycle beacon so a sweep can identify that build.
+        input_chunk_parser_present: typeof window._peekRenderChunks === 'function',
         ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?'), hidden: document.hidden ? 1 : 0 }, extra || {}))
     }).catch(() => {});
   } catch (e) {}
@@ -700,9 +841,10 @@ function _peekPollStop(reason) {
   if (_peekPollActive) { _peekPollBeacon('stop', _peekPollSession, { reason: reason || 'stop' }); _peekPollActive = false; _peekPollSession = null; }
 }
 let _peekLastFullMs = 0;    // when the FULL payload (history) was last fetched
+let _peekFullPending = false; // retain a turn-end history refresh through the input burst
 let _peekPrevStatus = '';   // peeked session's status on the previous poll tick
 const _PEEK_HISTORY_REFRESH_MS = 30000;  // fallback full-refresh cadence while open
-function _schedulePeekPoll() {
+function _schedulePeekPoll(delay) {
   _stopPeekPoll();
   if (!peekSession || document.hidden) {
     // Winding down (no open peek, or tab backgrounded): close out the lifecycle
@@ -720,7 +862,10 @@ function _schedulePeekPoll() {
       const _st = (_s && _s.status) || '';
       const turnEnded = _peekPrevStatus === 'active' && _st !== 'active';
       _peekPrevStatus = _st;
-      const needFull = turnEnded || (performance.now() - _peekLastFullMs > _PEEK_HISTORY_REFRESH_MS);
+      if (turnEnded) _peekFullPending = true;
+      const needFull = performance.now() >= _peekUrgentUntil
+        && (_peekFullPending || (performance.now() - _peekLastFullMs > _PEEK_HISTORY_REFRESH_MS));
+      if (needFull) _peekFullPending = false;
       await refreshPeek(!needFull);
       _peekUpdateBranch();
       // Keep the open view's STATUS indicator live too, not just the log. The
@@ -731,7 +876,7 @@ function _schedulePeekPoll() {
     } catch(e) {}
     if (gen !== _peekPollGen) return;
     _schedulePeekPoll();
-  }, _peekPollInterval());
+  }, delay ?? _peekPollInterval());
 }
 // Composer drafts live in ONE place: _draftGet/_draftSave, keyed by session.
 // There used to be three stores (this in-memory map, the peekState snapshot's
@@ -740,6 +885,24 @@ function _schedulePeekPoll() {
 // got sent twice. One store cannot disagree with itself.
 
 // ═══════ ZOOM ═══════
+// AMUX-4801. THE statuses a card can hold while a lane can NO LONGER act on
+// it. One list, because this fact previously lived in nine places here in four
+// different spellings, and every one of them was wrong:
+//   - all of them omitted `quarantined`, which is what `amux board fail`
+//     produces and is parked FOR THE OWNER, so it rendered as still-open;
+//   - two invented `cancelled`, which is not in the server's TaskStatus enum
+//     at all and could never match;
+//   - one was ['done','verified'], treating discarded cards as open.
+// Mirrors the server's `board_store::live_work_status_list()` by complement;
+// `dashboard_assets.rs` fails the build if the two ever disagree.
+//
+// NOT the same question as "is the lifecycle finished" (`is_terminal` there),
+// which excludes `done` because done still awaits verification. The two
+// predicates disagree on `done` and `armed`, which is exactly how a reader
+// picks the wrong one.
+const _CLOSED_STATUSES = new Set(['done', 'verified', 'discarded', 'armed', 'quarantined']);
+const _isClosedStatus = (st) => _CLOSED_STATUSES.has(_statusCanon(st));
+
 const ZOOM_STEPS = [50, 60, 70, 75, 80, 85, 90, 95, 100, 110, 120, 130, 150, 175, 200];
 let _zoomLevel = parseInt(localStorage.getItem('amux_zoom')) || 100;
 if (!ZOOM_STEPS.includes(_zoomLevel)) _zoomLevel = 100;
@@ -781,8 +944,22 @@ document.addEventListener('keydown', function(e) {
 
 // Connection & offline state
 let online = true;
+let _writeError = '';
+let _localWriteError = '';
+let _boardReadError = '';
+let _syncReadError = '';
+let _syncFlight = null;
+let _syncRetryTimer = null;
+const _outboxActive = new Set();
 window.addEventListener('offline', () => setOnline(false));
-window.addEventListener('online', () => { consecutiveFailures = 0; setOnline(true); });
+window.addEventListener('online', () => {
+  consecutiveFailures = 0;
+  setOnline(true);
+  // setOnline only drains on a false->true EDGE, and `online` is often still
+  // true here because nothing had failed yet. Drain on the event itself, which
+  // is the browser telling us the network is back.
+  try { _syncBackoffReset(); _scheduleSyncRetry(); } catch (e) {}
+});
 // Migrate localStorage keys from cc_ to amux_
 ['offline_queue','sessions_cache','drafts'].forEach(k => {
   const old = localStorage.getItem('cc_' + k);
@@ -791,14 +968,135 @@ window.addEventListener('online', () => { consecutiveFailures = 0; setOnline(tru
     localStorage.removeItem('cc_' + k);
   }
 });
-let offlineQueue = JSON.parse(localStorage.getItem('amux_offline_queue') || '[]');
-function saveQueue() {
-  localStorage.setItem('amux_offline_queue', JSON.stringify(offlineQueue));
-  if (typeof _idb !== 'undefined') _idb.set('offline_queue', offlineQueue);
-  // Keep pending-message visibility live (Messages tab badge + composer pill)
-  try { if (typeof _peekMessagesBadge === 'function') _peekMessagesBadge(); } catch(e) {}
-  try { if (typeof _peekTab !== 'undefined' && _peekTab === 'messages') _peekMessagesRender(); } catch(e) {}
+let offlineQueue = [];
+try { offlineQueue = _readQueue(); } catch (error) { _writeError = error.message; }
+// Queue changes use a short storage lock. Delivery has a separate lock so a
+// slow server never holds up a new local edit. Always reread under the lock:
+// a tab's in-memory queue is a view, not authority to overwrite another tab.
+function _readQueue() {
+  let value;
+  try { value = JSON.parse(localStorage.getItem('amux_offline_queue') || '[]'); }
+  catch (_) { throw new Error('Pending changes need recovery: invalid queue'); }
+  if (!Array.isArray(value)) throw new Error('Pending changes need recovery: invalid queue');
+  return value;
 }
+function _outboxLock(name, work) {
+  if (!navigator.locks) return Promise.reject(new Error('Safe pending-change storage is unavailable in this browser; keep your draft and use a secure connection'));
+  return navigator.locks.request(name, work);
+}
+// User intent has priority over reproducible offline caches. Safari's measured
+// 5.19 MB of caches left ~50 KB for the mandatory local send (AMUX-4417).
+// Retry the SAME atomic setItem after reclaiming caches; never prune drafts,
+// pending operations, attachment journals, credentials or command history.
+function _localStorageBytes() {
+  let bytes = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    bytes += 2 * (key.length + (localStorage.getItem(key) || '').length);
+  }
+  return bytes;
+}
+/// The sync banner, recorded (AMUX-4682).
+///
+/// Ethan screenshotted "Syncing 0/2" over two messages the server had already
+/// delivered, and read the worker as stuck. When I went to find out which two
+/// operations it was counting, the answer was that NOTHING recorded it: the
+/// client beacons a composer accept and a display join, and says nothing when
+/// it tells the reader that N operations are unsynced, or for how long. The
+/// most alarming thing this UI can say about delivery was the one thing it
+/// never wrote down (ethos rule 4: an output that can read "0 of 2" must
+/// publish whether the measurement ran).
+///
+/// SHAPE, NEVER TEXT. This card's own next_action asked for "the op labels",
+/// and that would have been wrong: `describeOp` embeds a 30-character preview
+/// of the message body for a send, so beaconing labels would ship worker
+/// message text to /api/client-debug. What goes out is the action, the target
+/// lane, and how long the entry has been queued — enough to identify the
+/// operations afterwards, with none of their content.
+let _syncBannerShownAt = 0;
+function _syncBannerBeacon(phase, items) {
+  try {
+    const list = Array.isArray(items) ? items : [];
+    const now = Date.now();
+    if (phase === 'shown') _syncBannerShownAt = now;
+    const shape = list.slice(0, 12).map(i => {
+      const q = i.item || {};
+      const url = String(q.url || '');
+      const m = url.match(/\/api\/sessions\/([^/?]+)(?:\/(\w+))?/);
+      return {
+        type: i.type || '',
+        status: i.status || '',
+        action: (m && m[2]) || ((q.options && q.options.method) || '').toLowerCase() || '',
+        target: m ? decodeURIComponent(m[1]).slice(0, 40) : '',
+        queued_s: q.queued_at ? Math.round((now - q.queued_at) / 1000) : null,
+        uncertain: !!(q.delivery_uncertain),
+      };
+    });
+    _outboxDiagnostic('sync_banner_' + phase, {
+      items: list.length,
+      done: list.filter(i => i.status === 'done').length,
+      failed: list.filter(i => i.status === 'failed').length,
+      skipped: list.filter(i => i.status === 'skipped').length,
+      up_ms: phase === 'cleared' && _syncBannerShownAt ? now - _syncBannerShownAt : 0,
+      ops: shape,
+      n_considered: list.length,
+    });
+    if (phase === 'cleared') _syncBannerShownAt = 0;
+  } catch (e) {}
+}
+
+function _outboxDiagnostic(verdict, fields) {
+  try {
+    fetch(API + '/api/client-debug', {method:'POST', _skipOutbox:true,
+      headers:{'Content-Type':'application/json'},
+      // DEFAULTS FIRST, then the caller's fields, so a caller that knows its
+      // real population can say so. This was the other way round, and the
+      // hardcoded `n_considered: 1` silently overwrote any caller that passed
+      // one — a constant standing where the diagnostic contract asks for a
+      // measurement, which is the shape that cannot disagree with the run
+      // whatever happened (found while building the banner beacon, AMUX-4682).
+      body:JSON.stringify({kind:'outbox-storage', verdict,
+        measured:true, n_considered:1, ver:APP_VER, ...fields})}).catch(() => {});
+  } catch (_) {}
+}
+function _writeUserStorage(key, value) {
+  try { localStorage.setItem(key, value); return; }
+  catch (error) { if (error.name !== 'QuotaExceededError') throw error; }
+  const before = _localStorageBytes();
+  let removed = 0;
+  // Preserve the fleet's offline worker list; its cache is not a candidate.
+  for (const cache of ['amux_app_html', 'amux_board_cache', 'amux_schedules_cache', 'amux_sched_runs_cache']) {
+    if (localStorage.getItem(cache) === null) continue;
+    localStorage.removeItem(cache);
+    removed++;
+    try {
+      localStorage.setItem(key, value);
+      _outboxDiagnostic('cache_reclaimed', {storage_bytes_before:before,
+        write_bytes:value.length * 2, caches_removed:removed});
+      return;
+    } catch (error) { if (error.name !== 'QuotaExceededError') throw error; }
+  }
+  // Re-throw the browser's real failure after exhausting disposable data.
+  localStorage.setItem(key, value);
+}
+async function _mutateQueue(change) {
+  return _outboxLock('amux-outbox-storage', () => {
+    const current = _readQueue();
+    for (const entry of current) if (!entry.id) entry.id = crypto.randomUUID();
+    const result = change(current);
+    _writeUserStorage('amux_offline_queue', JSON.stringify(current));
+    offlineQueue = current;
+    if (typeof _idb !== 'undefined') _idb.set('offline_queue', current);
+    try { _peekMessagesBadge(); } catch (_) {}
+    try { if (_peekTab === 'messages') _peekMessagesRender(); } catch (_) {}
+    return result;
+  });
+}
+window.addEventListener('storage', event => {
+  if (event.key !== 'amux_offline_queue') return;
+  try { offlineQueue = _readQueue(); updateConnectionStatus(); _scheduleSyncRetry(); }
+  catch (error) { _writeError = error.message; updateConnectionStatus(); }
+});
 
 // ═══════ CONNECTION HISTORY ═══════
 // Log every connection-state transition (live ↔ polling ↔ offline) with a
@@ -837,7 +1135,7 @@ function _connEpisodes() {
       // the first as the second is what would let an old sleep keep posing as
       // an outage with a confident new label on it.
       if (!cur) cur = { start: e.ts, worst: e.to, hid: ('hid' in e) ? !!e.hid : null };
-      else if (e.to === 'offline') cur.worst = 'offline';
+      else if (['offline', 'auth', 'error'].includes(e.to)) cur.worst = e.to;
     } else if (cur) {
       cur.end = e.ts; eps.push(cur); cur = null;
     }
@@ -860,7 +1158,7 @@ const _CONN_BLIP_MS = 5000;
 function _connEpisodeKind(ep, now) {
   const dur = (ep.end || now) - ep.start;
   if (ep.worst === 'offline' && ep.hid === true) return 'sleep';
-  if (ep.worst !== 'offline' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
+  if (ep.worst === 'polling' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
   return 'outage';
 }
 // _fmtDur lives once, further down. A second copy was declared here; the last
@@ -932,10 +1230,14 @@ async function _runPing(n) {
   }
 }
 
+function _localWriteNotice() {
+  return _localWriteError ? '<div role="alert" style="padding:10px 0;color:var(--red);">'
+    + esc(_localWriteError) + '. The message has not left this device. Keep the draft and retry Send.</div>' : '';
+}
 function showConnHistory() {
   const eps = _connEpisodes();
-  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
-  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149' }[_connState] || 'var(--dim)';
+  const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline', auth: '● Access required', error: '● Sync error' }[_connState] || '● —';
+  const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149', auth: '#f85149', error: '#f85149' }[_connState] || 'var(--dim)';
   const _now = Date.now();
   const kinds = eps.map(ep => _connEpisodeKind(ep, _now));
   const blips = eps.filter((_, i) => kinds[i] === 'blip');
@@ -953,7 +1255,9 @@ function showConnHistory() {
       const isOff = ep.worst === 'offline';
       const sleep = kind === 'sleep';
       const ico = sleep ? '🌙' : isOff ? '🔴' : '🟡';
-      const label = sleep ? 'Device asleep or app backgrounded'
+      const label = ep.worst === 'auth' ? 'Workspace access required'
+                  : ep.worst === 'error' ? 'Worker updates unavailable'
+                  : sleep ? 'Device asleep or app backgrounded'
                   : isOff ? 'Disconnected (offline)'
                   : 'Degraded to polling';
       const when = _fmtClock(ep.start) + ' → ' + (ongoing ? '<span style="color:' + (isOff ? '#f85149' : '#facc15') + '">ongoing</span>' : _fmtClock(ep.end));
@@ -983,9 +1287,41 @@ function showConnHistory() {
       + Math.round(_CONN_BLIP_MS / 1000) + 's each, recovered automatically. Not listed above.</div></div>'
     : '';
   const pending = offlineQueue.length + drafts.length;
-  const pendingHtml = pending
-    ? '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:0.8rem;color:var(--dim);">' + pending + ' operation' + (pending === 1 ? '' : 's') + ' queued while offline. <a href="#" onclick="event.preventDefault();document.getElementById(\'conn-hist-modal\').remove();showQueueModal();" style="color:var(--accent);">View queue</a></div>'
-    : '';
+  // Render pending outbox items inline in the connection modal so the user
+  // can see what "N pending" means without opening a second modal (Ethan
+  // 2026-09-14: "this should be in the 1 pending modal").
+  let pendingHtml = '';
+  if (pending) {
+    const itemRows = offlineQueue.map(q => {
+      const age = Math.floor((Date.now() - q.timestamp) / 60000);
+      const timeStr = age < 1 ? 'just now' : age + 'm ago';
+      const uncertain = _outboxUncertainMessage(q);
+      const blocked = q.state === 'blocked' && !uncertain;
+      const ico = blocked ? '🔴' : uncertain ? '🟡' : '⏳';
+      const status = blocked ? 'failed' : uncertain ? 'checking' : 'queued';
+      const dismissId = 'conn-dismiss-' + esc(q.id);
+      return '<div style="display:flex;gap:8px;align-items:baseline;padding:5px 2px;font-size:0.82rem;">'
+        + '<span style="flex-shrink:0;">' + ico + '</span>'
+        + '<div style="flex:1;min-width:0;"><div>' + esc(describeOp(q)) + '</div>'
+        + (q.error ? '<div style="color:' + (uncertain ? 'var(--yellow,#d29922)' : 'var(--red,#e55)') + ';font-size:0.72rem;">' + esc(q.error).substring(0, 100) + '</div>' : '')
+        + '</div>'
+        + '<span style="color:var(--dim);flex-shrink:0;font-variant-numeric:tabular-nums;font-size:0.76rem;">' + timeStr + '</span>'
+        + (blocked ? ' <button type="button" onclick="_dismissQueuedOp(\'' + escJs(q.id) + '\');document.getElementById(\'conn-hist-modal\')?.remove();showConnHistory();" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.85rem;padding:0 2px;" title="Dismiss">&#x2715;</button>' : '')
+        + '</div>';
+    }).join('');
+    const draftRows = drafts.map(d =>
+      '<div style="display:flex;gap:8px;align-items:baseline;padding:5px 2px;font-size:0.82rem;">'
+        + '<span style="flex-shrink:0;">📝</span>'
+        + '<div style="flex:1;min-width:0;">Create &amp; start ' + esc(d.name) + '</div>'
+        + '<span style="color:var(--dim);flex-shrink:0;font-size:0.76rem;">draft</span></div>'
+    ).join('');
+    pendingHtml = '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">'
+      + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;"><b style="font-size:0.85rem;">Pending operations</b>'
+      + '<span style="font-size:0.72rem;color:var(--dim);">' + pending + '</span></div>'
+      + draftRows + itemRows
+      + '<div style="margin-top:6px;"><button class="btn" onclick="event.preventDefault();document.getElementById(\'conn-hist-modal\').remove();runSyncBanner();" style="font-size:0.75rem;">Retry now</button></div>'
+      + '</div>';
+  }
   const clearHtml = _connEvents.length
     ? '<button onclick="_connEvents=[];localStorage.removeItem(\'amux_conn_events\');document.getElementById(\'conn-hist-modal\').remove();" style="margin-top:12px;background:none;border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.75rem;color:var(--dim);cursor:pointer;">Clear history</button>'
     : '';
@@ -995,23 +1331,27 @@ function showConnHistory() {
   modal.onclick = e => { if (e.target === modal) modal.remove(); };
   modal.innerHTML = '<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:440px;width:100%;max-height:80dvh;overflow:auto;padding:1.2rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);">'
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><b style="font-size:1rem;flex:1;">Connection</b>'
-    + '<span style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span></div>'
+    + '<span id="conn-modal-status" style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span><button class="btn" id="conn-modal-close" aria-label="Close connection history" onclick="this.closest(\'#conn-hist-modal\').remove()">&#x2715;</button></div>'
     + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Connection interruptions on this device (this browser)</div>'
-    + _pingWidgetHtml() + rows + blipHtml + pendingHtml + clearHtml + '</div>';
+    + _pingWidgetHtml() + '<div id="conn-modal-read-notice">' + _sessionReadNotice() + '</div><div id="conn-modal-write-notice">' + _localWriteNotice() + '</div>' + rows + blipHtml + pendingHtml + clearHtml + '</div>';
   document.body.appendChild(modal);
+  modal.querySelector('#conn-modal-read-notice')._noticeHTML = _sessionReadNotice();
 }
 
 // ═══════ DEVICE NAME / CLOUD IDENTITY ═══════
 let _cloudEmail = '';
+let _localMemberEmail = '';
+let _localMemberScope = null;
+let _localMemberTeam = null;
 let _gatewayOrgs = [];
 
 async function _initIdentity() {
   try {
     const r = await fetch('/api/identity');
     if (r.status === 401) {
-      // 401 means we're behind the cloud gateway (local server never returns 401 here).
-      // Redirect to login — but not on self-hosted Tailscale/LAN hosts where 401 could
-      // be a transient network issue.
+      // A 401 is an authentication refusal, including on self-hosted remote
+      // browsers. The worker read owns the local access/recovery message; cloud
+      // gateways retain their existing login redirect.
       if (location.hostname.endsWith('.amux.io')) {
         window.location.replace('/api/cloud-logout');
       }
@@ -1019,7 +1359,10 @@ async function _initIdentity() {
     }
     if (!r.ok) return;
     const d = await r.json();
-    _cloudEmail = d.email || '';
+    _cloudEmail = d.is_cloud ? (d.email || '') : '';
+    _localMemberEmail = d.is_local_member ? (d.email || '') : '';
+    _localMemberScope = d.is_local_member ? (d.access_scope || {level:'global', name:''}) : null;
+    _localMemberTeam = d.is_local_member ? (d.team || null) : null;
     if (!d.has_api_key) {
       if (d.is_cloud) {
         // Blocking modal for cloud users — must set key before using the app
@@ -1035,6 +1378,12 @@ async function _initIdentity() {
       _showKeyWarning(d.key_error);
     }
     _applyIdentityToSettings();
+    // Settings can open before this async identity request returns. Refresh an
+    // already-open Team section so a scoped member never keeps the owner's
+    // controls from that brief pre-identity render.
+    if (document.getElementById('settings-menu')?.classList.contains('open')) {
+      loadTeamSection();
+    }
     if (_cloudEmail) {
       const lb = document.getElementById('logout-btn');
       if (lb) lb.style.display = '';
@@ -1204,7 +1553,13 @@ function _renderOrgSwitcher() {
 
   // Banner: you have access to other workspaces (but aren't in one yet)
   const dismissed = JSON.parse(localStorage.getItem('amux_dismissed_org_banners') || '[]');
-  const undismissedOrgs = otherOrgs.filter(o => !dismissed.includes(o.id));
+  // God-mode visibility is not an invitation. Admins may inspect every
+  // workspace, but rendering all of those inherited rows as a giant green
+  // "You have access to" banner exposed the whole customer directory and
+  // pushed the actual dashboard below the fold. Explicit memberships retain
+  // the banner; inherited god-mode rows remain available in the settings
+  // switcher where the operator deliberately looks for them.
+  const undismissedOrgs = otherOrgs.filter(o => !o.via_god_mode && !dismissed.includes(o.id));
   if (inviteBanner && inviteBannerText && !inOtherOrg && undismissedOrgs.length > 0) {
     const names = undismissedOrgs.map(o => o.name || o.id).join(', ');
     inviteBannerText.innerHTML = `You have access to: <strong>${esc(names)}</strong> &nbsp;`;
@@ -1222,12 +1577,36 @@ function _renderOrgSwitcher() {
 }
 
 async function _switchOrg(orgId) {
-  await fetch('/api/gateway/switch-org', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({org_id: orgId || ''})
-  }).catch(() => {});
-  location.reload();
+  const ctl = new AbortController();
+  const timeout = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch('/api/gateway/switch-org', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', 'Accept':'application/json'},
+      body: JSON.stringify({org_id: orgId || ''}),
+      // A workspace switch changes where every subsequent API call goes and
+      // needs its response now. Replaying it minutes later from the offline
+      // outbox silently moves a person while they are doing other work.
+      _skipOutbox: true,
+      signal: ctl.signal,
+    });
+    if (_isLocallyQueued(r)) throw new Error('workspace switch was queued locally');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const ack = await r.json();
+    if (ack?.ok !== true) throw new Error('gateway did not acknowledge workspace switch');
+    location.reload();
+  } catch (e) {
+    console.warn('workspace switch failed; staying in the current workspace', e);
+    try {
+      amuxTrack('workspace_switch_failed', {
+        target: orgId ? 'other' : 'personal',
+        err: String(e).slice(0, 200),
+      });
+    } catch (_) {}
+    showToast('Workspace switch failed — still viewing the current workspace');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ── Org invite banner dismiss ──────────────────────────────────────────────
@@ -1350,21 +1729,29 @@ function _applyIdentityToSettings() {
   const label = document.getElementById('settings-device-label');
   const row = document.getElementById('settings-device-row');
   const cur = document.getElementById('settings-device-current');
-  if (_cloudEmail) {
-    if (label) label.textContent = 'Account';
+  if (_cloudEmail || _localMemberEmail) {
+    if (label) label.textContent = _cloudEmail ? 'Account' : 'Member';
     if (row) row.style.display = 'none';
-    if (cur) cur.textContent = _cloudEmail;
+    if (cur) cur.textContent = _cloudEmail || _localMemberEmail;
   } else {
     if (label) label.textContent = 'Device';
     if (row) row.style.display = '';
   }
+  // The location control belongs to the DEVICE either way: an account holder
+  // still sends from a particular phone, and it is that phone that granted or
+  // refused the permission.
+  try { _settingsRenderGeo(); } catch (e) {}
 }
 
 _initIdentity();
+// A device that already opted in gets a fresh fix without being asked again.
+// Deferred off the boot path: a geolocation call during startup competes with
+// first paint for a value no send needs until the reader types something.
+setTimeout(() => { try { _geoRefresh(); } catch (e) {} }, 4000);
 _renderInstanceSwitcher();
 
 function _getDeviceName() {
-  if (_cloudEmail) return _cloudEmail;
+  if (_cloudEmail || _localMemberEmail) return _cloudEmail || _localMemberEmail;
   const custom = localStorage.getItem('amux_device_name');
   if (custom) return custom;
   const ua = navigator.userAgent;
@@ -1375,6 +1762,124 @@ function _getDeviceName() {
   if (/Mac/.test(ua)) return 'Mac';
   if (/Linux/.test(ua)) return 'Linux';
   return 'Unknown';
+}
+
+// ═══════ SEND CONTEXT — what a message was composed in (AMUX-4693) ═══════
+//
+// Ethan, 2026-09-15: "all messages, carrying Meta data such as EXIF data like
+// location for where the message is sent from as well as other things like
+// times".
+//
+// The server records when a message ARRIVED and which lane it came from. It
+// cannot know the human end: which device, in what timezone, at what local
+// hour. `ts` is a server epoch, so "was I sending this at 2am" is unanswerable
+// for a sender in another timezone, which is the "times" half of the ask.
+//
+// GEOLOCATION IS OPT-IN, PER DEVICE, AND NEVER ASKED BY A SEND. A composer that
+// triggers a permission prompt has turned typing a message into a system
+// dialog. The prompt happens once, from a control the reader chose to press
+// (_sendContextEnableGeo), and everything here reads only what that already
+// granted.
+const _GEO_FIX_MAX_AGE_MS = 60_000;   // one fix per minute, not one per message
+const _GEO_TIMEOUT_MS = 8_000;
+let _geoFix = null;                   // {lat, lon, accuracy_m, at}
+
+/// What this client knows about the send. Never throws: a message must go out
+/// even if every optional source here fails.
+function _sendContext() {
+  try {
+    const now = new Date();
+    const ctx = {
+      device: _getDeviceName(),
+      platform: navigator.platform || '',
+      app_ver: APP_VER,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+      // Minutes EAST of UTC, the opposite sign to getTimezoneOffset, because
+      // the stored value is read by humans and by a model. "-480" for Los
+      // Angeles matches every other place an offset is written down.
+      tz_offset_min: -now.getTimezoneOffset(),
+      local_time: now.toLocaleString(),
+    };
+    // A fix older than the window is STALE, and stale location is worse than
+    // none: it says the message came from where the reader was, not where they
+    // are. Dropped rather than aged, and the absence of the key is the signal.
+    if (_geoFix && Date.now() - _geoFix.at <= _GEO_FIX_MAX_AGE_MS) {
+      ctx.geo = {lat: _geoFix.lat, lon: _geoFix.lon, accuracy_m: _geoFix.accuracy_m};
+    }
+    return ctx;
+  } catch (e) {
+    return {app_ver: typeof APP_VER === 'string' ? APP_VER : ''};
+  }
+}
+
+/// Grant this device's geolocation, once, from a control the reader pressed.
+/// Returns the reason it did not happen, or '' on success, so the caller can
+/// say what went wrong rather than silently appearing to work.
+async function _sendContextEnableGeo() {
+  if (!navigator.geolocation) return 'this browser has no geolocation';
+  try {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject,
+        {enableHighAccuracy: false, timeout: _GEO_TIMEOUT_MS, maximumAge: _GEO_FIX_MAX_AGE_MS}));
+    _geoFix = {lat: +pos.coords.latitude.toFixed(5), lon: +pos.coords.longitude.toFixed(5),
+               accuracy_m: Math.round(pos.coords.accuracy || 0), at: Date.now()};
+    try { localStorage.setItem('amux_geo_optin', '1'); } catch (e) {}
+    _geoRefresh();
+    return '';
+  } catch (error) {
+    return (error && error.message) || 'permission refused';
+  }
+}
+
+/// Keep a fresh fix while the reader has opted in, without asking again. A
+/// refusal here is silent on purpose: they already answered the question, and
+/// re-raising it on a timer is how an app trains someone to deny it forever.
+function _geoRefresh() {
+  let optedIn = false;
+  try { optedIn = localStorage.getItem('amux_geo_optin') === '1'; } catch (e) {}
+  if (!optedIn || !navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(
+    pos => { _geoFix = {lat: +pos.coords.latitude.toFixed(5), lon: +pos.coords.longitude.toFixed(5),
+                        accuracy_m: Math.round(pos.coords.accuracy || 0), at: Date.now()}; },
+    () => {},
+    {enableHighAccuracy: false, timeout: _GEO_TIMEOUT_MS, maximumAge: _GEO_FIX_MAX_AGE_MS});
+}
+
+/// The opt-in control, per device, in Settings > Device.
+///
+/// It exists so the capability reaches the reader: a `_sendContextEnableGeo`
+/// nobody can press is a feature nobody has. Turning it OFF is local and
+/// immediate — the stored preference goes, the cached fix is dropped, and the
+/// next send carries no `geo` key. It does not revoke the browser permission,
+/// which only the browser's own settings can do, and the label says so rather
+/// than implying amux can take it back.
+function _settingsGeoOptedIn() {
+  try { return localStorage.getItem('amux_geo_optin') === '1'; } catch (e) { return false; }
+}
+function _settingsRenderGeo(note) {
+  const btn = document.getElementById('settings-geo-btn');
+  const status = document.getElementById('settings-geo-status');
+  if (!btn) return;
+  const on = _settingsGeoOptedIn();
+  btn.textContent = on ? 'Stop attaching location' : 'Attach location to my messages';
+  if (!status) return;
+  if (note) { status.textContent = note; return; }
+  status.textContent = on
+    ? (_geoFix ? 'On. Last fix ' + Math.round((Date.now() - _geoFix.at) / 1000) + 's ago, accurate to ~'
+                 + _geoFix.accuracy_m + 'm. Messages you send carry it; this device keeps the browser permission until you revoke it there.'
+               : 'On, but no fix yet on this device.')
+    : 'Off. Messages carry your device, timezone and local time, and no location.';
+}
+async function _settingsToggleGeo() {
+  if (_settingsGeoOptedIn()) {
+    try { localStorage.removeItem('amux_geo_optin'); } catch (e) {}
+    _geoFix = null;
+    _settingsRenderGeo('Off. Location will not be attached from this device.');
+    return;
+  }
+  _settingsRenderGeo('Asking this device for permission…');
+  const failure = await _sendContextEnableGeo();
+  _settingsRenderGeo(failure ? 'Not enabled: ' + failure : '');
 }
 
 // ═══════ DRAFTS — offline-created sessions ═══════
@@ -1433,6 +1938,308 @@ function showToast(msg) {
     else el.classList.remove('visible');
   }, 3000);
 }
+
+// AF-754: the guide renders production classes, so it cannot quietly become a second theme.
+function openStyleGuide() {
+  closeSettings();
+  if (document.getElementById('ui-guide-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'ui-guide-overlay'; overlay.className = 'modal-overlay active';
+  overlay.dataset.originalLight = String(document.body.classList.contains('light'));
+  overlay.innerHTML = `<section class="modal ui-guide" role="dialog" aria-modal="true" aria-labelledby="ui-guide-title">
+    <header class="modal-header"><div><h3 id="ui-guide-title">Style guide</h3><p class="ui-help">The components used throughout amux</p></div><button class="modal-close" aria-label="Close style guide" onclick="closeStyleGuide()">×</button></header>
+    <div class="modal-body">
+      <section class="ui-guide-section"><h4>One shared visual language</h4><p class="ui-help">Original icons. Clear actions. Compact layouts with room to tap. These examples use the same CSS as the app; preview changes here before applying them across screens.</p><div class="ui-guide-row"><button id="ui-guide-theme" class="btn" onclick="_uiGuideTheme()">Preview other theme</button><span class="ui-help">Theme preview is restored when you close this guide.</span></div></section>
+      <section class="ui-guide-section"><h4>Color and surfaces</h4><div class="ui-guide-grid">${['bg','card','text','dim','accent','green','red','yellow'].map(token=>`<div class="ui-guide-swatch"><i style="background:var(--${token})" aria-hidden="true"></i><code>--${token}</code></div>`).join('')}</div><p class="ui-help">Use surface and text tokens in both themes. Pair accent fills with <code>--on-accent</code>. Status colors always have a text label.</p></section>
+      <section class="ui-guide-section"><h4>Actions</h4><div class="ui-guide-row"><button id="ui-guide-primary" class="btn primary" onclick="_uiGuideAction(this)">Primary action</button><button class="btn" onclick="_uiGuideAction(this)">Secondary action</button><button class="btn danger" onclick="_uiGuideAction(this)">Destructive example</button><button class="btn" disabled>Unavailable</button><button class="btn" aria-busy="true" disabled>Working…</button></div><p class="ui-help">Use one primary action per group. Destructive actions keep a clear label and require confirmation when they affect real data. Examples here change no account or worker data.</p><output id="ui-guide-feedback" class="ui-help" role="status" aria-live="polite">Try an action to preview feedback.</output></section>
+      <section class="ui-guide-section"><h4>Fields and validation</h4><div class="ui-guide-grid"><label class="ui-field">Name<input class="input" placeholder="Example name" autocomplete="off"><span class="ui-help">A label stays visible after typing.</span></label><label class="ui-field">Choice<select class="input"><option>First option</option><option>Second option</option></select><span class="ui-help">Use the native picker on mobile.</span></label><label class="ui-field">Invalid example<input class="input" value="Example" aria-invalid="true" aria-describedby="ui-guide-error"><span id="ui-guide-error" class="ui-error">Explain what to change, beside the field.</span></label><label class="ui-field">Notes<textarea class="input" rows="3" placeholder="An example draft"></textarea><span class="ui-help">Long content scrolls without hiding actions.</span></label></div></section>
+      <section class="ui-guide-section"><h4>Icons and status</h4><div class="ui-guide-row"><button class="settings-btn" aria-label="Example settings" onclick="_uiGuideAction(this)">&#x2699;</button><button class="btn" aria-label="Example notifications" onclick="_uiGuideAction(this)">&#x1F514;</button><span class="status-badge active">Working</span><span class="status-badge idle">Idle</span><span class="ui-help"><span style="color:var(--red)">18</span> limited</span></div><p class="ui-help">Keep the original toolbar symbols. Icon-only controls need an accessible label and a 44-pixel touch target. The compact mobile header uses a, a live dot, and counts.</p></section>
+      <section class="ui-guide-section"><h4>Dialogs and menus</h4><div class="ui-guide-rule">Use a heading, an obvious Close control, a scrolling body, and an action row that stays reachable above the keyboard. Menus anchor to their trigger and fit inside the viewport.</div><div class="ui-guide-row"><button class="btn" onclick="_uiGuideDialog()">Try confirmation dialog</button><code>.modal-overlay → .modal → .modal-header / .modal-body / .modal-footer</code></div></section>
+      <section class="ui-guide-section"><h4>Spacing and interaction</h4><div class="ui-guide-rule">Spacing: 4, 8, 12, 16, 24 pixels. Controls: 8-pixel corners. Dialogs: 12-pixel corners. Controls grow to at least 44 pixels on phones. Inputs use 16-pixel text on phones. Focus is visible; loading and disabled states explain why an action is unavailable.</div><p class="ui-help">Specialized editors, terminal output, maps, and media keep their own content layout. Their surrounding controls follow these same rules.</p></section>
+    </div><footer class="modal-footer"><span class="ui-help">Shared styles · live components</span><button class="btn" onclick="closeStyleGuide()">Close</button></footer>
+  </section>`;
+  overlay.onclick = event => { if (event.target === overlay) closeStyleGuide(); };
+  overlay.onkeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeStyleGuide(); }
+    if (event.key !== 'Tab') return;
+    const controls = [...overlay.querySelectorAll('button:not(:disabled),input,select,textarea')].filter(el=>el.getBoundingClientRect().height);
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  };
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-close').focus();
+}
+function closeStyleGuide() {
+  const overlay = document.getElementById('ui-guide-overlay');
+  if (!overlay) return;
+  document.body.classList.toggle('light', overlay.dataset.originalLight === 'true');
+  overlay.remove(); document.getElementById('settings-btn')?.focus();
+}
+function _uiGuideTheme() { document.body.classList.toggle('light'); }
+function _uiGuideAction(button) {
+  document.getElementById('ui-guide-feedback').textContent = (button.getAttribute('aria-label') || button.textContent) + ' completed. Example only; no data changed.';
+}
+async function _uiGuideDialog() {
+  const confirmed = await showConfirm('Example confirmation. This changes no account or worker data.');
+  const output = document.getElementById('ui-guide-feedback');
+  if (output) output.textContent = confirmed ? 'Example confirmed.' : 'Example cancelled.';
+}
+function _uiComponentCheck(root = document) {
+  let considered = 0;
+  const issues = [];
+  const luminance = color => color.slice(0,3).reduce((sum,value,index)=>{
+    value /= 255; return sum + [0.2126,0.7152,0.0722][index] * (value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+  },0);
+  root.querySelectorAll('.btn,.input,.modal-close').forEach(button=>{
+    const rect = button.getBoundingClientRect(), style = getComputedStyle(button);
+    if (!rect.width || !rect.height || style.visibility === 'hidden' || style.opacity === '0') return;
+    considered++;
+    if (innerWidth <= 600 && rect.height < 43.5) issues.push((button.id || button.tagName.toLowerCase()) + ':small-control');
+    if (!button.matches('.btn.primary:not(:disabled)')) return;
+    const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
+    const bg = rgb(style.backgroundColor), fg = rgb(style.color);
+    if (bg.length < 3 || fg.length < 3 || (bg.length === 4 && bg[3] !== 1)) return;
+    const a = luminance(bg), b = luminance(fg);
+    if ((Math.max(a,b)+.05)/(Math.min(a,b)+.05) < 4.5) issues.push((button.id || 'primary-button') + ':low-contrast');
+  });
+  root.querySelectorAll('.peek-issue-item').forEach(row => {
+    const box = row.getBoundingClientRect(), title = row.querySelector('.peek-issue-title');
+    const overlay = row.closest('.overlay');
+    if (!title || !box.width || !box.height || box.bottom < 0 || box.top > innerHeight ||
+        (overlay && !overlay.classList.contains('active'))) return;
+    considered++;
+    if (title.getBoundingClientRect().bottom > box.bottom + 1)
+      issues.push((row.dataset.id || 'board-row') + ':board-row-content-overflow');
+  });
+  const boardHost = root.querySelector('#board-columns');
+  if (boardHost && boardHost.getClientRects().length && _boardActivityEntries().length) {
+    considered++;
+    const strip = root.querySelector('#board-columns-activity');
+    if (!strip || strip.hidden || !strip.getClientRects().length)
+      issues.push('board-columns:active-work-missing');
+  }
+  root.querySelectorAll('.board-activity-task').forEach(task => {
+    if (!task.getClientRects().length) return;
+    considered++;
+    const style = getComputedStyle(task);
+    const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.35;
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    if (task.getBoundingClientRect().height > line * 3 + padding + 2)
+      issues.push((task.closest('.board-activity-item')?.dataset.cardId || 'board-activity') + ':activity-summary-too-tall');
+  });
+  return {measured:true,n_considered:considered,issues};
+}
+
+// AF-749: measure open dialogs against the keyboard-visible viewport. Keep
+// diagnostics free of dialog text (worker messages and credentials live here).
+const _dialogSelector = '.amux-dialog-backdrop,.amux-workspace-dialog,#cmd-history-modal,#filters-modal,#saved-messages-modal,#skill-edit-modal,#file-overlay,#mdai-overlay,#channel-drawer,#board-detail-overlay,#apikey-setup-modal,#upgrade-modal,#video-overlay,.modal-backdrop,.edit-overlay,.queue-overlay,.board-edit-overlay,.map-modal,.modal-overlay,#conn-hist-modal,#team-scope-modal,#jrnl-config-overlay,#peek-lookup-modal,[data-ical-modal],.chip-picker-overlay,.tts-overlay,.focus-overlay,.conn-picker-overlay,.mdai-picker-overlay';
+function _modalLayoutCheck() {
+  const viewport = window.visualViewport;
+  const top = viewport?.offsetTop || 0, height = viewport?.height || innerHeight;
+  let n = 0;
+  const clipped = [];
+  document.querySelectorAll(_dialogSelector).forEach(root => {
+    const style = getComputedStyle(root);
+    if (root.id === 'proxy-form-overlay' && root.style.display === 'flex' && !root.classList.contains('active')) {
+      n++; clipped.push('proxy-form-overlay:inactive'); return;
+    }
+    if (style.display === 'none' || style.opacity === '0' || style.pointerEvents === 'none') return;
+    const box = root.firstElementChild;
+    if (!box || getComputedStyle(box).opacity === '0') return;
+    const r = box.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    n++;
+    if (root.id === 'modal-backdrop') {
+      const action = box.querySelector('.modal-btns button');
+      if (action) {
+        const a = action.getBoundingClientRect(), hit = document.elementFromPoint(a.left+a.width/2,a.top+a.height/2);
+        if (!root.contains(hit) && hit?.closest('.modal-overlay.active')) clipped.push('modal-backdrop:covered-actions');
+      }
+    }
+    const heading = box.querySelector('.modal-header h3');
+    if (heading) {
+      const h = heading.getBoundingClientRect();
+      const cover = document.elementFromPoint(h.left + h.width/2, h.top + Math.min(2,h.height/2));
+      if (cover?.closest('.chrome-tabs-bar')) clipped.push((root.id || root.classList[0]) + ':behind-tab-bar');
+    }
+    const surface = box.matches('.conn-picker') || root.matches('#team-scope-modal,#jrnl-config-overlay,.amux-workspace-dialog,#upgrade-modal') ? getComputedStyle(box) : null;
+    if (surface) {
+      const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
+      const bg = rgb(surface.backgroundColor), fg = rgb(surface.color);
+      const lum = color => color.slice(0,3).reduce((sum, v, i) => {
+        v /= 255; return sum + [0.2126,0.7152,0.0722][i] * (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+      }, 0);
+      if (bg.length === 4 && bg[3] < 1) clipped.push((root.id || root.classList[0]) + ':transparent');
+      else if (bg.length >= 3 && fg.length >= 3) {
+        const a = lum(bg), b = lum(fg);
+        if ((Math.max(a,b) + 0.05) / (Math.min(a,b) + 0.05) < 4.5) clipped.push((root.id || root.classList[0]) + ':low-contrast');
+      }
+    }
+    const dismiss = root.id === 'orch-overlay' ? 'button[onclick="_orchClose()"]'
+      : root.id === 'video-overlay' ? '.vp-heading button[onclick="_closeVideo()"]'
+      : root.id === 'conn-hist-modal' ? '#conn-modal-close'
+      : root.classList.contains('chip-picker-overlay') ? 'button[onclick="closeChipPicker()"]' : null;
+    if (dismiss && !root.querySelector(dismiss)) clipped.push((root.id || root.classList[0]) + ':no-dismiss');
+    const foot = box.querySelector(':scope > .edit-actions,:scope > .board-edit-actions,:scope > .queue-actions,:scope > .map-modal-actions,:scope > .amux-modal-foot');
+    const warning = document.getElementById('sw-fail-bar');
+    if (foot && warning) {
+      const w = warning.getBoundingClientRect();
+      // A button's centre can remain tappable while its lower edge is covered.
+      // Probe the actual overlapping area, not only the centre or CSS visibility.
+      const covered = Array.from(foot.querySelectorAll('button')).some(button => {
+        const a = button.getBoundingClientRect();
+        const left = Math.max(a.left, w.left), right = Math.min(a.right, w.right);
+        const top = Math.max(a.top, w.top), bottom = Math.min(a.bottom, w.bottom);
+        if (right <= left || bottom <= top) return false;
+        return !!document.elementFromPoint((left + right) / 2, (top + bottom) / 2)?.closest('#sw-fail-bar');
+      });
+      if (covered) clipped.push((root.id || root.classList[0]) + ':footer-covered-by-warning');
+    }
+    if (foot && box.scrollHeight > box.clientHeight + 8 && getComputedStyle(foot).position === 'sticky') {
+      const f = foot.getBoundingClientRect();
+      if (f.height && r.bottom - f.bottom > 3) clipped.push((root.id || root.classList[0]) + ':footer-gap');
+    }
+    // Safari pans the fixed containing block with the keyboard; offsetTop
+    // is not in the same coordinate space as its rendered child rectangles.
+    const visibleTop = root.classList.contains('amux-dialog-viewport') ? root.getBoundingClientRect().top : top;
+    if (r.top < visibleTop - 2 || r.bottom > visibleTop + height + 2 || r.left < -2 || r.right > innerWidth + 2)
+      clipped.push(root.id || root.classList[0]);
+    for (const issue of _dialogReachCheck(root)) clipped.push((root.id || root.classList[0]) + ':' + issue);
+  });
+  return { measured: true, n_considered: n, clipped, viewport_height: height };
+}
+
+/// Can the reader get to the LAST LINE of this window?
+///
+/// Every check above this one measures the dialog's frame: is the box inside
+/// the viewport, is a footer covered, is the contrast readable. None of them
+/// looks at the content, and `box` is `root.firstElementChild`, which for
+/// `#file-overlay` is the 40px header. So a window could hold text nobody could
+/// reach and the only thing this diagnostic would report is the id.
+///
+/// Ethan, 2026-09-15, screenshotting a markdown file whose last table row was
+/// cut off: "make sure these windows can be scrolled down to the bottom test
+/// every window". This is that question, asked of every open dialog, on every
+/// mutation, in whatever browser the reader is actually using.
+///
+/// It is READ-ONLY. It never scrolls anything: moving a reader's scroll
+/// position to measure it would be the diagnostic changing what it measures.
+function _dialogReachCheck(root) {
+  const issues = [];
+  const cs = el => getComputedStyle(el);
+  // A box is not a view. A collapsed <details> is 80px tall with overflow
+  // hidden and a 1400px child inside it, and that child's rect runs a thousand
+  // pixels past the fold while being painted nowhere. Intersect with every
+  // clipping ancestor before believing an element is on screen.
+  const shown = el => {
+    const s = cs(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    const r = el.getBoundingClientRect();
+    if (r.height <= 0 || r.width <= 0) return false;
+    let top = r.top, bottom = r.bottom, left = r.left, right = r.right;
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      const ps = cs(p);
+      if (ps.overflowY === 'visible' && ps.overflowX === 'visible') continue;
+      const pr = p.getBoundingClientRect();
+      top = Math.max(top, pr.top); bottom = Math.min(bottom, pr.bottom);
+      left = Math.max(left, pr.left); right = Math.min(right, pr.right);
+      if (bottom - top <= 0 || right - left <= 0) return false;
+    }
+    return true;
+  };
+  const all = [root, ...root.querySelectorAll('*')];
+  const scrollers = [];
+  for (const el of all) {
+    if (el.scrollHeight <= el.clientHeight + 4 || !shown(el)) continue;
+    const oy = cs(el).overflowY;
+    if (oy === 'auto' || oy === 'scroll') { scrollers.push(el); continue; }
+    if (oy !== 'hidden' && oy !== 'clip') continue;
+    // Clipped content is fine when an ancestor scrolls it into view, which is
+    // what a collapsed section is. With no such ancestor it is content that no
+    // gesture can reach.
+    let saved = false;
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      const po = cs(p).overflowY;
+      if ((po === 'auto' || po === 'scroll') && p.scrollHeight > p.clientHeight + 4) { saved = true; break; }
+    }
+    if (!saved) issues.push('content-unreachable');
+  }
+  // The lowest visible line, by position rather than by DOM order.
+  //
+  // Cheap pass first. `shown` walks ancestors calling getComputedStyle, so
+  // running it over every text leaf costs 6ms on a 704-element card detail and
+  // scales with the dialog; the peek overlay is an order of magnitude bigger,
+  // and this runs on every mutation. Rank by rectangle, which needs one layout
+  // for the whole set, then pay for visibility only from the bottom up and
+  // stop at the first element that is really on screen.
+  const candidates = [];
+  for (const el of all) {
+    if (el.children.length || !(el.textContent || '').trim()) continue;
+    const b = el.getBoundingClientRect();
+    if (b.height > 0 && b.width > 0) candidates.push([b.bottom, el]);
+  }
+  candidates.sort((a, b) => b[0] - a[0]);
+  let last = null;
+  for (let i = 0; i < candidates.length && i < 200; i++) {
+    if (shown(candidates[i][1])) { last = candidates[i][1]; break; }
+  }
+  if (last) {
+    const holder = scrollers.find(s => s.contains(last));
+    // Only meaningful once the reader HAS scrolled to the end: a footer below
+    // the scroll area (Clear all / Done) is not a defect, and neither is a
+    // window the reader simply has not scrolled yet.
+    if (holder && Math.abs(holder.scrollTop - (holder.scrollHeight - holder.clientHeight)) < 2) {
+      const lb = last.getBoundingClientRect(), hb = holder.getBoundingClientRect();
+      if (lb.bottom - hb.bottom > 1) issues.push('last-line-below-scroller');
+      const hit = document.elementFromPoint(
+        Math.round(lb.left + Math.min(lb.width / 2, 40)),
+        Math.round(lb.bottom - Math.min(lb.height / 2, 6)));
+      if (hit && hit !== last && !last.contains(hit) && !hit.contains(last)) issues.push('last-line-covered');
+    }
+  }
+  return issues;
+}
+(function observeDialogs() {
+  let timer, previous = '', previousComponents = '';
+  const refresh = () => {
+    const vv = window.visualViewport;
+    // Pinch zoom is a reading action, not a keyboard layout change.
+    if (!vv || vv.scale <= 1.02) {
+      document.documentElement.style.setProperty('--dialog-viewport-height', (vv?.height || innerHeight) + 'px');
+      document.documentElement.style.setProperty('--dialog-viewport-top', (vv?.offsetTop || 0) + 'px');
+    }
+    document.querySelectorAll(_dialogSelector).forEach(root => { if (!root.classList.contains('amux-dialog-viewport')) root.classList.add('amux-dialog-viewport'); });
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const result = _modalLayoutCheck(), signature = result.clipped.join(',');
+      if (signature && signature !== previous) {
+        console.warn('[amux] dialog visibility defect', result);
+        fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'modal-layout-clipped',...result,ver:APP_VER})}).catch(() => {});
+      }
+      previous = signature;
+      const components = _uiComponentCheck(), componentSignature = components.issues.join(',');
+      if (componentSignature && componentSignature !== previousComponents) {
+        console.warn('[amux] shared component drift', components);
+        fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'ui-component-drift',...components,ver:APP_VER})}).catch(() => {});
+      }
+      previousComponents = componentSignature;
+    }, 350);
+  };
+  new MutationObserver(records => {
+    if (records.some(r => r.type === 'childList' ? r.target === document.body || r.target.matches?.('[data-component="board-list"],#peek-issues-list') :
+      r.target.matches?.(_dialogSelector) && !r.target.classList.contains('amux-dialog-viewport'))) refresh();
+    else if (records.some(r => r.type === 'attributes' && (r.target === document.body || r.target.matches?.(_dialogSelector)))) {
+      clearTimeout(timer); timer = setTimeout(refresh, 50);
+    }
+  }).observe(document.body, {childList:true,subtree:true,attributes:true,attributeFilter:['class','style']});
+  window.visualViewport?.addEventListener('resize', refresh);
+  window.visualViewport?.addEventListener('scroll', refresh);
+  window.addEventListener('resize', refresh);
+  refresh();
+})();
 
 // Modal: replaces confirm() / alert() — both blocked in PWA standalone mode
 let _modalResolve = null;
@@ -1648,9 +2455,10 @@ async function bulkSendContinue(cappedOnly) {
   let sent = 0;
   for (const s of matched) {
     try {
-      await fetch(API + '/api/sessions/' + encodeURIComponent(s.name) + '/send', {
+      await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(s.name) + '/send', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({text: 'continue'})
+        body: JSON.stringify({text: 'continue'}),
+        signal: AbortSignal.timeout(10000)
       });
       sent++;
     } catch(e) {}
@@ -1668,9 +2476,10 @@ async function bulkSendContinueApiErr() {
   let sent = 0, failed = 0;
   for (const s of matched) {
     try {
-      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(s.name) + '/send', {
+      const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(s.name) + '/send', {
         method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({text: 'continue'})
+        body: JSON.stringify({text: 'continue'}),
+        signal: AbortSignal.timeout(10000)
       });
       const d = await r.json().catch(() => ({}));
       // Count what the SERVER accepted, not what we attempted — a bulk action
@@ -1738,16 +2547,58 @@ function describeOp(item) {
   return method + ' ' + name + (action ? '/' + action : '');
 }
 
+// Normal outbox transport stays in Messages; connection warnings describe a
+// delayed or refused operation, not every brief local acceptance.
+function _outboxNeedsAttention(q) {
+  // A saved error remains reviewable until acknowledgement clears it. Age
+  // alone uses the longer stall window so ordinary delivery remains quiet.
+  return q.state === 'blocked' || !!q.error || _outboxIsStalled(q);
+}
+function _outboxAgeMs(q) { return Date.now() - (q.timestamp || 0); }
+// AN OP THAT HAS BEEN "SENDING" FOR HOURS IS NOT SENDING.
+//
+// Ethan, 2026-09-11 ("this is not ok terrible ux"): the banner read
+// "1 sending, 1 failed" over ops timestamped 215m ago, and offered "Retry now"
+// — for a 409 that says "previous message acceptance is uncertain; inspect the
+// worker terminal before sending a new message", which no amount of retrying
+// can resolve. The word "sending" was doing the damage: it promises the thing
+// is still on its way, so there is nothing to act on, so it sits there for
+// three and a half hours.
+//
+// Past this age an op is STALLED and is presented as needing a decision, not
+// as in-flight. The retry loop is unchanged — this is about not describing a
+// stuck message as a moving one.
+const _OUTBOX_STALLED_MS = 600000;   // 10 minutes; the send deadline is 600s
+function _outboxIsStalled(q) {
+  return q.state !== 'blocked' && _outboxAgeMs(q) > _OUTBOX_STALLED_MS;
+}
+function _outboxAgeLabel(q) {
+  const m = Math.floor(_outboxAgeMs(q) / 60000);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  return h < 24 ? h + 'h ' + (m % 60) + 'm' : Math.floor(h / 24) + 'd';
+}
 // Connection status
 function updateConnectionStatus() {
   // Log the state transition (for the click-to-view disconnection history).
-  _recordConnState(!online ? 'offline' : (_liveSSE ? 'live' : 'polling'));
+  // _writeError is a failed offline-queue op, not a connectivity issue.
+  // The offline-banner already surfaces it; don't also flip the conn badge red.
+  const readState = _sessionLoadError ? (_sessionLoadError.status === 401 ? 'auth' : 'error')
+    : (_boardReadError || _syncReadError ? 'error' : null);
+  _recordConnState(readState || (!online ? 'offline' : (_liveSSE ? 'live' : 'polling')));
   // Update all connection status indicators (main + peek)
-  document.querySelectorAll('#conn-status').forEach(el => {
-    if (!online) {
+  document.querySelectorAll('#conn-status, #conn-modal-status').forEach(el => {
+    if (el.id === 'conn-modal-status') el.style.color = '';
+    if (readState || _localWriteError) {
+      el.className = 'conn-status offline';
+      el.textContent = readState === 'auth' ? 'Access required' : 'Sync error';
+    } else if (!online) {
       el.className = 'conn-status offline';
       const total = offlineQueue.length + drafts.length;
       el.textContent = total ? total + ' pending' : 'Offline';
+    } else if (offlineQueue.some(_outboxNeedsAttention)) {
+      el.className = 'conn-status polling';
+      el.textContent = offlineQueue.length + ' pending';
     } else if (_liveSSE) {
       el.className = 'conn-status online';
       el.textContent = 'Live';
@@ -1755,22 +2606,86 @@ function updateConnectionStatus() {
       el.className = 'conn-status polling';
       el.textContent = 'Polling';
     }
+    el.setAttribute('aria-label', el.textContent + ' — connection details');
+    if (el.id === 'conn-status') el.title = el.textContent + ' — connection details';
   });
+  const notice = document.getElementById('session-read-notice');
+  if (notice && notice.innerHTML) { notice.innerHTML = ''; notice._noticeHTML = ''; }
+  // Keep an open error modal current, including successful Retry. Preserve
+  // expanded details while the error is unchanged.
+  const modalNotice = document.getElementById('conn-modal-read-notice');
+  if (modalNotice) {
+    const html = _sessionReadNotice();
+    if (modalNotice.innerHTML !== html && modalNotice._noticeHTML !== html) {
+      modalNotice.innerHTML = html;
+    }
+    modalNotice._noticeHTML = html;
+  }
+  const writeNotice = document.getElementById('conn-modal-write-notice');
+  if (writeNotice) writeNotice.innerHTML = _localWriteNotice();
   // Update offline banner
   const banner = document.getElementById('offline-banner');
   const ops = document.getElementById('offline-ops');
   const title = document.getElementById('offline-banner-title');
   if (!banner) return;
   const hasPending = offlineQueue.length || drafts.length;
-  if (online || !hasPending) {
+  // A QUEUED MESSAGE IS NORMAL. ONLY A STUCK ONE IS NEWS.
+  //
+  // This raised a warning banner the instant anything entered the queue, so
+  // the ordinary path — type, queue, send 300ms later — flashed "Unsaved
+  // changes" every single time (Ethan: "unsaved changes is too much"). The
+  // queue is the transport, not an incident.
+  //
+  // Announce only what the user can actually act on: we are offline, an op
+  // failed, or an op has been waiting long enough that it is no longer "about
+  // to send". Anything younger is in flight and stays silent.
+  //
+  // Items that are only "awaiting confirmation" (uncertain delivery) are not
+  // actionable from the banner. They belong in the connection badge and
+  // the connection modal, not in a persistent banner that eats screen space
+  // (Ethan 2026-09-14: "takes up too much real estate, should be in the
+  // pending modal"). Exclude them from the stuck count that triggers the banner.
+  const stuck = offlineQueue.filter(q => _outboxNeedsAttention(q) && !_outboxUncertainMessage(q));
+  const worthShowing = !online || stuck.length || drafts.length;
+  if (!hasPending || !worthShowing) {
     banner.classList.remove('active');
     return;
   }
   banner.classList.add('active');
-  const parts = [];
-  if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
-  if (offlineQueue.length) parts.push(offlineQueue.length + ' op' + (offlineQueue.length === 1 ? '' : 's'));
-  title.innerHTML = '&#x26A0; Offline &mdash; ' + parts.join(', ') + ' pending';
+  const blockedOps = offlineQueue.filter(q => q.state === 'blocked' && !_outboxUncertainMessage(q));
+  const pendingOps = offlineQueue.filter(q => q.state !== 'blocked' || _outboxUncertainMessage(q));
+  if (blockedOps.length && !pendingOps.length && !drafts.length) {
+    title.innerHTML = '&#x26A0; ' + (online ? '' : 'Offline &mdash; ') + blockedOps.length + ' failed op' + (blockedOps.length === 1 ? '' : 's') +
+      ' <a href="#" onclick="event.preventDefault();showQueueModal();" style="color:inherit;text-decoration:underline;">review</a>' +
+      ' or <a href="#" onclick="event.preventDefault();_clearBlockedOps();" style="color:inherit;text-decoration:underline;">dismiss</a>';
+  } else if (online) {
+    const confirmingOps = pendingOps.filter(_outboxUncertainMessage);
+    const stalledOps = pendingOps.filter(q => !_outboxUncertainMessage(q) && _outboxIsStalled(q));
+    const movingOps = pendingOps.filter(q => !_outboxUncertainMessage(q) && !_outboxIsStalled(q));
+    const parts = [];
+    if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
+    if (movingOps.length) parts.push(movingOps.length + ' sending');
+    if (confirmingOps.length) parts.push(confirmingOps.length + ' awaiting confirmation · checking automatically');
+    // Named by how long it has been stuck, because "sending" for 3.5 hours is
+    // the claim that stopped anyone acting on it.
+    if (stalledOps.length) {
+      const oldest = stalledOps.reduce((a, b) => (_outboxAgeMs(a) > _outboxAgeMs(b) ? a : b));
+      parts.push(stalledOps.length + ' stalled ' + _outboxAgeLabel(oldest));
+    }
+    if (blockedOps.length) parts.push(blockedOps.length + ' failed');
+    const needsDecision = stalledOps.length || blockedOps.length;
+    title.innerHTML = (needsDecision ? '&#x26A0; ' : '&#x21BB; ') + parts.join(', ')
+      + (needsDecision
+          ? ' <a href="#" onclick="event.preventDefault();showQueueModal();" style="color:inherit;text-decoration:underline;">review</a>'
+            + (blockedOps.length ? ' or <a href="#" onclick="event.preventDefault();_clearBlockedOps();" style="color:inherit;text-decoration:underline;">dismiss failed</a>' : '')
+          : '');
+  } else {
+    const parts = [];
+    if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
+    if (pendingOps.length) parts.push(pendingOps.length + ' queued, will send on reconnect');
+    if (blockedOps.length) parts.push(blockedOps.length + ' failed');
+    title.innerHTML = '&#x26A0; Offline &mdash; ' + parts.join(' &middot; ');
+  }
   const rows = [];
   drafts.forEach(d => {
     rows.push('<div class="offline-op">' +
@@ -1781,9 +2696,13 @@ function updateConnectionStatus() {
   offlineQueue.forEach(item => {
     const age = Math.floor((Date.now() - item.timestamp) / 60000);
     const timeStr = age < 1 ? 'just now' : age + 'm ago';
-    rows.push('<div class="offline-op">' +
-      '<span class="op-action">' + esc(describeOp(item)) + '</span>' +
-      '<span class="op-time">' + timeStr + '</span>' +
+    const isBlocked = item.state === 'blocked' && !_outboxUncertainMessage(item);
+    const dismissBtn = isBlocked
+      ? ' <button type="button" class="offline-op-dismiss" onclick="_dismissQueuedOp(\'' + escJs(item.id) + '\')" aria-label="Dismiss failed change" title="Dismiss">&#x2715;</button>'
+      : '';
+    rows.push('<div class="offline-op' + (isBlocked ? ' blocked' : '') + '">' +
+      '<span class="op-action">' + esc(describeOp(item)) + (item.error ? ' <span style="color:' + (_outboxUncertainMessage(item) ? 'var(--yellow,#d29922)' : 'var(--red,#e55)') + '">[' + esc(item.error).substring(0, 80) + ']</span>' : '') + '</span>' +
+      '<span class="op-time">' + timeStr + dismissBtn + '</span>' +
     '</div>');
   });
   // Accordion (Ethan 08:39): once the queued list exceeds 5, collapse it by
@@ -1825,59 +2744,69 @@ function _toggleOfflineQueue() {
 const _UPQ_KEY = 'upload_queue';
 
 async function _upqList() {
-  try { return (await _idb.get(_UPQ_KEY)) || []; } catch (e) { return []; }
+  const current = (await _idb.getUploads()).filter(row => row.surface === 'directory');
+  // Retain pre-upgrade entries until they have actually been delivered.
+  const legacy = (await _idb.get(_UPQ_KEY)) || [];
+  return [...current, ...legacy.map(row => ({...row,
+    blob:row.bytes ? new Blob([row.bytes], {type:row.mime}) : row.blob}))];
+}
+function _uploadStorageError(action, error) {
+  const reason = error?.name || 'StorageError';
+  console.warn('[amux] upload-storage', action, reason);
+  fetch(API + '/api/client-debug', {method:'POST', _skipOutbox:true,
+    headers:_authHeaders({'Content-Type':'application/json'}), signal:AbortSignal.timeout(5000),
+    body:JSON.stringify({kind:'upload-storage', action, reason, measured:true, ver:APP_VER})}).catch(() => {});
 }
 async function _upqAdd(file, dir, kind) {
-  const q = await _upqList();
-  q.push({ id: 'up-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
-           name: file.name || (kind === 'audio' ? 'recording.webm' : 'upload.bin'),
-           mime: file.type || '', dir: dir || '', kind: kind || 'file',
-           size: file.size || 0, ts: Date.now(), blob: file });
-  await _idb.set(_UPQ_KEY, q);
+  const id = crypto.randomUUID();
+  const interactionId = 'int_upload_' + id;
+  _interactions.accept({interactionId, command:{id:interactionId,kind:'filesystem.upload',target:{primitive:'filesystem',id,label:file.name}}, request:{method:'POST',path:'/api/upload/start'}});
+  try {
+    await _idb.putUpload({id, surface:'directory', name:file.name || 'upload.bin',
+      dir:dir || '', kind:kind || 'file', size:file.size, mime:file.type, ts:Date.now(), file,
+      totalChunks:Math.ceil(file.size / CHUNK_SIZE) || 1});
+  } catch (error) { _interactionFail(interactionId,error,false); _uploadStorageError('enqueue-failed', error); throw error; }
+  _interactionSet(interactionId, {phase:'queued', feedback:{message:'File saved on this device; queued for upload'}});
   _upqRenderBadge();
-  return q.length;
+  return (await _upqList()).length;
 }
 async function _upqRemove(id) {
-  const q = (await _upqList()).filter(x => x.id !== id);
-  await _idb.set(_UPQ_KEY, q);
+  await _idb.deleteUpload(id);
+  await _idb.update(_UPQ_KEY, current => (current || []).filter(x => x.id !== id));
   _upqRenderBadge();
 }
 async function _upqCancel(id) {
   await _upqRemove(id);
+  _interactionSet('int_upload_' + id, {phase:'refused', feedback:{message:'Upload cancelled'}});
   showToast('Removed from the upload queue (NOT uploaded)');
 }
 
-// Drain is idempotent and single-flight: a second call while draining is a
-// no-op rather than a double upload.
-let _upqDraining = false;
-async function _upqDrain() {
-  if (_upqDraining || !online) return;
-  const q = await _upqList();
-  if (!q.length) return;
-  _upqDraining = true;
-  let sent = 0, failed = 0;
-  try {
-    for (const item of q) {
-      try {
-        const fd = new FormData();
-        fd.append('dir', item.dir);
-        fd.append('file', item.blob, item.name);
-        const r = await fetch(API + '/api/fs/upload',
-                              { method: 'POST', body: fd, _skipOutbox: true });
-        const d = await r.json().catch(() => ({}));
-        if (r.ok && (d.saved || []).length) { await _upqRemove(item.id); sent++; }
-        else failed++;
-      } catch (e) { failed++; }
+// Files share the reconnect checklist and replay flight with ordinary writes.
+// The byte store stays separate: it is chunked IDB, never JSON/localStorage.
+let _uploadSyncPending = false;
+function _upqDrain() { return runSyncBanner(true); }
+async function _syncOneUpload(item) {
+  const deliver = async () => {
+    const current = (await _upqList()).find(row => row.id === item.id);
+    if (!current) throw new Error('Upload changed in another tab — refresh to review');
+    if (current.surface === 'directory') {
+      const f = {...current, file:_storedUploadFile(current), stored:true, chunk:0};
+      // A finish receipt may already be durable if the page closed before removal.
+      if (!f.path || !f.url) await _runUpload(f, {render:() => {}});
+      if (!f.path || !f.url) throw new Error(f.error || 'Server has not confirmed this file');
+    } else {
+      const fd = new FormData();
+      fd.append('dir', current.dir);
+      fd.append('file', current.blob, current.name);
+      const response = await fetch(API + '/api/fs/upload', {
+        method:'POST', body:fd, _skipOutbox:true, signal:AbortSignal.timeout(30000)});
+      const result = await response.json();
+      if (!response.ok || !(result.saved || []).length) throw new Error('Server has not confirmed this file');
     }
-  } finally { _upqDraining = false; }
-  if (sent) {
-    showToast('Uploaded ' + sent + ' queued file' + (sent === 1 ? '' : 's')
-              + (failed ? ' \u00b7 ' + failed + ' still queued' : ''));
-    if (typeof loadExplore === 'function' && typeof _explorePath !== 'undefined') {
-      try { loadExplore(_explorePath); } catch (e) {}
-    }
-  }
-  _upqRenderBadge();
+    await _upqRemove(item.id);
+  };
+  if (navigator.locks?.request) return navigator.locks.request('amux-upload-replay', deliver);
+  return deliver();
 }
 
 // ONE pending count over BOTH offline stores (AMUX-2317).
@@ -1924,33 +2853,41 @@ async function _upqRenderBadge() {
 
 // One entry point for BOTH surfaces, so audio and file uploads cannot drift.
 async function _uploadOrQueue(files, dir, kind) {
-  let uploaded = 0, queued = 0, failed = 0;
+  let queued = 0, failed = 0;
   for (const file of Array.from(files || [])) {
-    if (!online) { await _upqAdd(file, dir, kind); queued++; continue; }
-    try {
-      const fd = new FormData();
-      fd.append('dir', dir);
-      fd.append('file', file, file.name);
-      const r = await fetch(API + '/api/fs/upload',
-                            { method: 'POST', body: fd, _skipOutbox: true });
-      const d = await r.json().catch(() => ({}));
-      if (r.ok && (d.saved || []).length) uploaded++;
-      else { await _upqAdd(file, dir, kind); queued++; }   // server said no: keep the bytes
-    } catch (e) { await _upqAdd(file, dir, kind); queued++; }  // network died mid-flight
+    try { await _upqAdd(file, dir, kind); queued++; }
+    catch (error) { failed++; showToast('File not saved locally — keep the original and retry'); }
   }
-  return { uploaded, queued, failed };
+  _resumePendingUploads();
+  return {uploaded:0, queued, failed};
+}
+
+function _resumePendingUploads() {
+  if (document.hidden || navigator.onLine === false) return;
+  _upqDrain().catch(error => _uploadStorageError('resume-failed', error));
+  _restoreAttachments().then(() => {
+    for (const {f, sink} of _durableAttachments.values()) {
+      if (!f.path && !f.cancelled && !f.inflight && !f.queued && f.retryable !== false) _queueAttachment(f, sink);
+    }
+  }).catch(error => _uploadStorageError('restore-failed', error));
 }
 
 function setOnline(val) {
+  // A response started before the offline event can finish after it. It is
+  // evidence about that request, not permission to clear the current outage.
+  if (val && navigator.onLine === false) {
+    amuxTrack('connectivity_stale_success', {verdict:'offline_preserved', measured:true, n_considered:1});
+    return;
+  }
   const was = online;
   online = val;
   if (val) consecutiveFailures = 0;
   if (!val) _liveSSE = false;
   updateConnectionStatus();
   if (!was && val) {
-    showToast('Reconnected — syncing...');
-    try { _upqDrain(); } catch (e) {}
-    runSyncBanner();
+    // The visible sync checklist is the receipt; a toast would cover its rows.
+    if (!offlineQueue.length && !drafts.length) showToast('Reconnected');
+    runSyncBanner(false);
     // Reconnect SSE (reset fallback so we can get back to Live mode)
     _sseFallback = false; _sseRetries = 0;
     if (!_sse) connectSSE();
@@ -1960,81 +2897,143 @@ function setOnline(val) {
 }
 
 // ═══════ SYNC BANNER ORCHESTRATOR ═══════
-async function runSyncBanner() {
+// FIRE AND FORGET: THE NETWORK DECIDES, NOT OUR BELIEF ABOUT IT.
+//
+// This used to retry only `if (online)`, and `online` is this client's own
+// inference. It is wrong in both directions: it stays true through a real
+// outage until some fetch happens to fail, and it stays false after the
+// network returns until something else flips it. While it was false the timer
+// re-armed WITHOUT ever attempting a send, so a queued message could sit
+// forever with the network perfectly healthy — measured 2026-09-10, a queued
+// send survived reconnection and a healthy server and still read 1 of 1
+// pending until the user pressed Retry. That is the opposite of fire and
+// forget (Ethan: "it should just queue and send").
+//
+// A send attempt IS the connectivity probe, and it is cheap. So attempt
+// unconditionally and let the result drive the interval: fast while it is
+// working, backing off to a minute while it is not, so an offline phone is
+// not retrying every 2s all night.
+let _syncBackoffMs = 0;
+const _SYNC_MIN_MS = 2000, _SYNC_MAX_MS = 60000;
+function _syncBackoffReset() { _syncBackoffMs = 0; }
+function _scheduleSyncRetry() {
+  clearTimeout(_syncRetryTimer);
+  const pending = offlineQueue.some(q => q.state !== 'blocked' || _outboxUncertainMessage(q)) || drafts.length || _uploadSyncPending;
+  if (!pending) { _syncBackoffMs = 0; return; }
+  _syncBackoffMs = _syncBackoffMs ? Math.min(_syncBackoffMs * 2, _SYNC_MAX_MS) : _SYNC_MIN_MS;
+  _syncRetryTimer = setTimeout(() => { runSyncBanner(true); }, _syncBackoffMs);
+}
+function runSyncBanner(quiet = false) {
+  if (_syncFlight) return _syncFlight;
+  const before = offlineQueue.length, draftsBefore = drafts.length;
+  const queuedAtStart = new Set(offlineQueue.map(q => q.id));
+  const run = async () => { await _mutateQueue(() => {}); return _runSyncBanner(quiet); };
+  _syncFlight = (navigator.locks
+    ? navigator.locks.request('amux-outbox-replay', run) : run())
+    .catch(e => { _writeError = String(e.message || e); showToast('Sync failed: ' + _writeError); })
+    .finally(() => {
+      _syncFlight = null;
+      // Progress resets the backoff: an interval earned during an outage must
+      // not persist into a working server.
+      if (offlineQueue.length < before || drafts.length < draftsBefore) _syncBackoffReset();
+      updateConnectionStatus();
+      // New input missed the in-flight snapshot: dispatch on the next tick,
+      // preserving order and the delivery lock without earning outage backoff.
+      const freshInput = offlineQueue.some(q => !queuedAtStart.has(q.id)
+        && q.not_attempted && !q.attempted_at && q.state !== 'blocked');
+      if (freshInput) {
+        clearTimeout(_syncRetryTimer);
+        _syncRetryTimer = setTimeout(() => runSyncBanner(true), 0);
+      } else _scheduleSyncRetry();
+    });
+  return _syncFlight;
+}
+function _clearSyncTransientToast() {
+  const toast = document.getElementById('toast');
+  if (!toast || !/^(Queued \(|Reconnected$|Server unreachable — offline mode$)/.test(toast.textContent)) return;
+  clearTimeout(toastTimer);
+  toast.getAnimations?.().forEach(animation => animation.cancel());
+  toast.style.opacity = ''; toast.style.transform = '';
+  toast.classList.remove('visible');
+}
+let _syncChecklist = [];
+async function _runSyncBanner(quiet = false) {
+  // A real browser offline switch cannot deliver anything. Keep work durable
+  // without painting a failed checklist over the editor on each timer tick.
+  // Server reachability still retries freely when the browser is online.
+  if (navigator.onLine === false) return;
   const banner = document.getElementById('sync-banner');
   const itemsEl = document.getElementById('sync-items');
   const titleEl = document.getElementById('sync-title-text');
   const draftCount = drafts.length;
-  const rawQueue = [...offlineQueue];
-  offlineQueue = [];
-  saveQueue();
-  let queue = reconcileQueue(rawQueue);
-  // Drop anything unreplayable that a PREVIOUS client version persisted — the
-  // pre-2026-08-11 apiCall queued GETs (and FormData bodies) that no replay
-  // can honestly re-issue. This is the half of the fix that reaches users who
-  // already have a poisoned localStorage: the enqueue guard stops new ones,
-  // this clears the ones already on disk. Beacons from HERE are the reliable
-  // signal, because replay only ever runs while online.
-  const unreplayable = queue.filter(q => !_outboxQueueable(q.url, q.options || {}));
-  if (unreplayable.length) {
-    queue = queue.filter(q => _outboxQueueable(q.url, q.options || {}));
-    try {
-      amuxTrack('outbox_unreplayable_dropped', {
-        n: unreplayable.length,
-        sample: unreplayable.slice(0, 5).map(q =>
-          ((q.options && q.options.method) || 'GET') + ' ' + String(q.url).split('?')[0]).join(', '),
-      });
-    } catch (e) {}
-  }
-  const skipped = rawQueue.length - queue.length;
-  const totalOps = draftCount + queue.length;
+  // Keep every operation durable until its individual acknowledgement. A
+  // reload, timeout, or second replay must never erase an in-flight write.
+  const blockedResources = new Set();
+  const queue = offlineQueue.filter(q => {
+    if (q.state === 'blocked' && !_outboxUncertainMessage(q)) blockedResources.add(q.url);
+    // Uncertain sends STAY IN REPLAY (AMUX-4594). This list is what the loop
+    // below re-checks, so filtering them here (d69efdef) meant a stuck send
+    // was never re-read and never timed out. Ethan's point about that change
+    // still holds ("this shouldn't be appearing when I send, too invasive"),
+    // so they are left out of the decision to SHOW the checklist instead.
+    return !blockedResources.has(q.url) && !_outboxActive.has(q.id);
+  });
+  let skipped = 0;
+  const uploads = await _upqList();
+  _uploadSyncPending = uploads.length > 0;
+  const totalOps = draftCount + queue.length + uploads.length;
   if (!totalOps) return;
 
   // Build item list
   const items = [];
-  drafts.forEach(d => items.push({ label: 'Create & start "' + d.name + '"', status: 'pending', type: 'draft', draft: d }));
-  queue.forEach(q => items.push({ label: describeOp(q), status: 'pending', type: 'queue', item: q }));
+  drafts.forEach(d => items.push({ key:'draft:' + d.name, label: 'Create & start "' + d.name + '"', status: 'pending', type: 'draft', draft: d }));
+  queue.forEach(q => items.push({ key:'queue:' + q.id, label: describeOp(q), status: 'pending', type: 'queue', item: q }));
+  uploads.forEach(file => items.push({ key:'upload:' + file.id, label: 'Upload ' + file.name, status: 'pending', type: 'upload', file }));
 
+  // A retry updates its rows; it must not erase already-acknowledged files or
+  // blocked changes from the visible reconnect receipt. Dismiss starts a new list.
+  if (banner.classList.contains('active')) {
+    const currentKeys = new Set(items.map(item => item.key));
+    items.unshift(..._syncChecklist.filter(item => !currentKeys.has(item.key)).map(item => ({...item, replay:false})));
+  }
+  _syncChecklist = items;
+  skipped = items.filter(item => item.status === 'skipped').length;
   function renderBanner() {
     const done = items.filter(i => i.status === 'done').length;
     const failed = items.filter(i => i.status === 'failed').length;
     titleEl.textContent = 'Syncing ' + done + '/' + items.length + (failed ? ' (' + failed + ' failed)' : '') + (skipped ? ' (' + skipped + ' skipped)' : '');
     itemsEl.innerHTML = items.map(i => {
-      const icon = i.status === 'done' ? '&#x2714;' : i.status === 'failed' ? '&#x2718;' : i.status === 'running' ? '&#x27A4;' : '&#x2022;';
-      return '<div class="sync-item ' + i.status + '">' + icon + ' ' + esc(i.label) + '</div>';
+      const icon = i.status === 'done' ? '&#x2714;' : i.status === 'failed' ? '&#x2718;' : i.status === 'running' ? '&#x27A4;' : i.status === 'skipped' ? '&mdash;' : '&#x2022;';
+      return '<div data-sync-id="' + esc(i.key) + '" class="sync-item ' + i.status + '">' + icon + ' ' + esc(i.label) + '</div>';
     }).join('');
   }
 
   renderBanner();
-  banner.classList.add('active');
+  const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;
+  if (show) {
+    // The checklist replaces transient queue feedback, including a toast from
+    // an offline write immediately before reconnect. Keep failure toasts intact.
+    _clearSyncTransientToast();
+    const wasUp = banner.classList.contains('active');
+    banner.classList.add('active');
+    if (!wasUp) _syncBannerBeacon('shown', items);
+  }
 
-  // Sync drafts first
-  for (const item of items.filter(i => i.type === 'draft')) {
-    item.status = 'running';
-    renderBanner();
+  // A draft is a sequence of accepted writes. Keep its completed steps and
+  // prompt identity across failure/reload; never call a failed start "synced".
+  for (const item of items.filter(i => i.type === 'draft' && i.replay !== false)) {
+    item.status = 'running'; renderBanner();
     try {
-      const draft = item.draft;
-      draft.syncing = true; saveDrafts(); render();
-      const createResp = await _origFetch(API + '/api/sessions', {
-        method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ name: draft.name, dir: draft.dir })
-      });
-      if (!createResp.ok && createResp.status !== 409) {
-        item.status = 'failed'; draft.syncing = false; saveDrafts(); renderBanner(); continue;
-      }
-      await _applyYoloDefault(draft.name);   // YOLO-by-default applies to synced drafts too
-      const startResp = await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/start', { method: 'POST', headers: _authHeaders() });
-      if (draft.prompt && startResp.ok) {
-        await new Promise(r => setTimeout(r, 5000));
-        await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/send', {
-          method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-          body: JSON.stringify({ text: draft.prompt })
-        });
-      }
-      removeDraft(draft.name); render();
+      await _syncOneDraft(item.draft);
+      removeDraft(item.draft.name); render();
       item.status = 'done';
-    } catch(e) {
-      item.status = 'failed'; item.draft.syncing = false; saveDrafts();
+    } catch (error) {
+      item.status = 'failed'; item.draft.syncing = false;
+      item.draft.error = String(error.message || error);
+      item.label += ' — ' + item.draft.error;
+      _writeError = item.draft.error;
+      saveDrafts();
+      try { amuxTrack('outbox_draft_failed', {session:item.draft.name, error:item.draft.error}); } catch (_) {}
     }
     renderBanner();
   }
@@ -2042,38 +3041,234 @@ async function runSyncBanner() {
   // Then replay queue items — via _origFetch so the outbox interceptor can't
   // re-capture its own replay (double-queue), with auth headers applied FRESH
   // (they were not stamped at queue time, and a stale token would 401).
-  for (const item of items.filter(i => i.type === 'queue')) {
+  const failedResources = new Set();
+  for (const item of items.filter(i => i.type === 'queue' && i.replay !== false)) {
+    const q = item.item;
+    if (failedResources.has(q.url)) { item.status = 'waiting'; item.label += ' — waiting for the previous message'; renderBanner(); continue; }
     item.status = 'running';
     renderBanner();
+    await _outboxLock('amux-outbox-delivery:' + q.id, async () => {
+    const fresh = _readQueue().find(entry => entry.id === q.id);
+    if (!fresh) { offlineQueue = _readQueue(); item.status = 'skipped'; item.label += ' — no longer queued in this tab'; skipped++; return; }
+    Object.assign(q, fresh);
+    if (q.state === 'blocked' && !_outboxUncertainMessage(q)) { item.status = 'failed'; return; }
+    const interaction = _interactionReplay(q);
     try {
-      const opts = { ...item.item.options, headers: _authHeaders(item.item.options.headers) };
-      const r = await _origFetch(item.item.url, opts);
-      if (r.status >= 500 || r.status === 401 || r.status === 408 || r.status === 429) {
-        offlineQueue.push(item.item); item.status = 'failed';   // transient — keep for next sync
-      } else if (!r.ok) {
-        item.status = 'failed';   // permanent 4xx — surface it, but don't retry forever
-      } else {
-        item.status = 'done';
+      if (!_outboxQueueable(q.url, q.options || {}) || (!_outboxUncertainMessage(q) && q.timestamp && Date.now() - (q.reviewed_at || q.timestamp) > 7 * 86400000)) {
+        q.state = 'blocked';
+        throw new Error('Needs review before retry: expired or unsupported operation');
       }
+      q.attempted_at ||= Date.now();
+      let stillQueued = false;
+      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) { saved.attempted_at = q.attempted_at; saved.not_attempted = false; stillQueued = true; } });
+      if (!stillQueued) { item.status = 'skipped'; item.label += ' — removed before delivery'; skipped++; return; }
+      try { if (typeof _peekMessagesRender === 'function') _peekMessagesRender(); } catch (_) {}
+      const opts = { ...q.options, headers: _authHeaders(q.options.headers) };
+      const r = _outboxUncertainMessage(q)
+        ? await _outboxConfirmMessage(q, opts) : await _boundedMutationFetch(q.url, opts);
+      if (r.status === 409 && /\/(send|steer)$/.test(q.url.split('?')[0])) {
+        const d = await r.clone().json().catch(() => ({}));
+        if (d.submission === 'uncertain') {
+          throw Object.assign(new Error('Awaiting confirmation — checking automatically'), {outboxUncertain:true});
+        }
+      }
+      if (!r.ok) {
+        if (!(r.status >= 500 || [401, 408, 429].includes(r.status))) q.state = 'blocked';
+        throw new Error(await _apiErrText(r));
+      }
+      if (/\/api\/board\/[^/?]+$/.test(q.url) && (q.options.method || '').toUpperCase() === 'PATCH') {
+        const acknowledged = await r.clone().json();
+        _validateBoardAcknowledgement(acknowledged, q.url);
+        _outboxBoardAcknowledged(acknowledged);
+      }
+      if (/\/(send|steer)$/.test(q.url.split('?')[0])) {
+        _validateMessageAcknowledgement(await r.clone().json(), q.url);
+      }
+      await _interactionAcknowledge(interaction.id, r);
+      await _mutateQueue(current => { const at = current.findIndex(entry => entry.id === q.id); if (at >= 0) current.splice(at, 1); });
+      item.status = 'done';
     } catch(e) {
-      offlineQueue.push(item.item); item.status = 'failed';
+      if (e.outboxUncertain || _outboxUncertainMessage(q)) {
+        q.delivery_uncertain = true;
+        // A receipt read is safe after reload, even for a legacy blocked entry.
+        q.state = _outboxMessageId(q) ? 'pending' : 'blocked';
+      } else if (e.outboxBlocked) q.state = 'blocked';
+      q.error = q.delivery_uncertain && _outboxMessageId(q)
+        ? 'Awaiting confirmation — checking automatically' : String(e.message || e);
+      _interactionSet(interaction.id, {phase:q.delivery_uncertain ? 'unknown' : q.state === 'blocked' ? 'refused' : 'queued',
+        ...(q.delivery_uncertain ? {measured:false, why_unmeasured:'Server has not confirmed message acceptance'} : {}), feedback:{message:q.error}});
+      q.attempts = (q.attempts || 0) + 1;
+      _writeError = q.error;
+      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts, delivery_uncertain:!!q.delivery_uncertain, checking_since:q.checking_since || 0}); });
+      failedResources.add(q.url);
+      item.status = q.delivery_uncertain ? 'checking' : 'failed';
+      item.label += ' — ' + q.error;
+      try { amuxTrack('outbox_retry_failed', {id: q.id, status: q.state || 'pending', error: q.error}); } catch (_) {}
+    }
+    });
+    renderBanner();
+  }
+  for (const item of items.filter(i => i.type === 'upload' && i.replay !== false)) {
+    item.status = 'running'; renderBanner();
+    try { await _syncOneUpload(item.file); item.status = 'done'; }
+    catch (error) {
+      item.status = 'failed'; item.label += ' — ' + String(error.message || error);
+      _uploadStorageError('sync-unconfirmed', error);
     }
     renderBanner();
   }
+  _uploadSyncPending = (await _upqList()).length > 0;
+  if (uploads.length) {
+    _upqRenderBadge();
+    if (typeof loadFiles === 'function' && typeof _filesPath !== 'undefined') loadFiles(_filesPath);
+    if (typeof loadExplore === 'function' && typeof _explorePath !== 'undefined') {
+      try { loadExplore(_explorePath); } catch (error) {}
+    }
+  }
+  if (!offlineQueue.length && !drafts.length && !_uploadSyncPending) _writeError = '';
 
-  if (offlineQueue.length) saveQueue();
   const doneCount = items.filter(i => i.status === 'done').length;
   const failCount = items.filter(i => i.status === 'failed').length;
-  titleEl.textContent = doneCount + ' synced' + (failCount ? ', ' + failCount + ' failed' : '') + (skipped ? ', ' + skipped + ' skipped' : '');
+  const checkingCount = items.filter(i => i.status === 'checking').length;
+  const waitingCount = items.filter(i => i.status === 'waiting').length;
+  titleEl.textContent = doneCount + ' synced' + (checkingCount ? ', ' + checkingCount + ' awaiting confirmation' : '') + (waitingCount ? ', ' + waitingCount + ' waiting' : '') + (failCount ? ', ' + failCount + ' failed' : '') + (skipped ? ', ' + skipped + ' skipped' : '');
   updateConnectionStatus();
   fetchSessions();
   fetchBoard();
   // Pending messages just flushed — clear the amber pending UI and re-pull the
   // server-side history so the Messages tab flips ⏳pending → delivered.
   try { _loadCmdHistoryFromServer().then(() => { _peekMessagesBadge(); if (typeof _peekTab !== 'undefined' && _peekTab === 'messages') _peekMessagesRender(); }); } catch(e) {}
-  if (doneCount) showToast(doneCount + ' queued operation' + (doneCount===1?'':'s') + ' delivered');
-  // Auto-dismiss after 4s if all succeeded
-  if (!failCount) setTimeout(() => banner.classList.remove('active'), 4000);
+  // Reconnect progress keeps failed steps reviewable until dismissed. Ordinary
+  // online sends stay quiet; only completed visible runs auto-dismiss.
+  // "Checking" (awaiting confirmation) items are surfaced by the connection
+  // badge and modal, so the sync banner does not need to stay up for them.
+  if (!failCount) {
+    _clearSyncTransientToast();
+    setTimeout(() => {
+      if (!_syncFlight) {
+        const wasUp = banner.classList.contains('active');
+        banner.classList.remove('active');
+        if (wasUp) _syncBannerBeacon('cleared', _syncChecklist);
+      }
+    }, 2000);
+  }
+}
+
+async function _syncOneDraft(draft) {
+  draft.syncing = true; saveDrafts(); render();
+  const root = API + '/api/sessions/' + encodeURIComponent(draft.name);
+  if (!draft.synced_create) {
+    const created = await _boundedMutationFetch(API + '/api/sessions', {
+      method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({name:draft.name, dir:draft.dir}),
+    });
+    if (!created.ok) throw new Error('Create worker: ' + await _apiErrText(created));
+    draft.synced_create = true; saveDrafts();
+    await _applyYoloDefault(draft.name);
+  }
+  if (!draft.synced_start) {
+    const started = await _boundedMutationFetch(root + '/start', {method:'POST', headers:_authHeaders()});
+    if (!started.ok) throw new Error('Start worker: ' + await _apiErrText(started));
+    draft.synced_start = true; saveDrafts();
+  }
+  if (draft.prompt) {
+    if (!draft.msg_id) { draft.msg_id = crypto.randomUUID(); saveDrafts(); }
+    const sent = await _boundedMutationFetch(root + '/send', {
+      method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({text:draft.prompt, msg_id:draft.msg_id}),
+    });
+    if (!sent.ok) throw new Error('Send prompt: ' + await _apiErrText(sent));
+  }
+}
+
+async function _removeQueuedOperation(id) {
+  await _mutateQueue(current => { const at = current.findIndex(q => q.id === id); if (at >= 0) current.splice(at, 1); });
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
+  updateConnectionStatus(); showQueueModal();
+}
+
+async function _dismissQueuedOp(id) {
+  let removed = false;
+  await _mutateQueue(current => {
+    // A different tab may have retried this operation since the row rendered.
+    const at = current.findIndex(q => q.id === id && q.state === 'blocked');
+    if (at >= 0) { current.splice(at, 1); removed = true; }
+  });
+  if (!removed) {
+    amuxTrack('outbox_dismiss_ignored', {reason:'no_longer_blocked'});
+    showToast('This change is no longer failed.');
+  }
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
+  updateConnectionStatus();
+}
+
+async function _clearBlockedOps() {
+  await _mutateQueue(current => {
+    for (let i = current.length - 1; i >= 0; i--) { if (current[i].state === 'blocked') current.splice(i, 1); }
+  });
+  if (!offlineQueue.length && !drafts.length) _writeError = '';
+  updateConnectionStatus();
+}
+// Unknown acceptance is neither failure nor permission to inject again. Retry
+// the durable receipt read automatically; never mint a new transport identity.
+function _outboxMessageId(q) {
+  if (!/\/api\/sessions\/[^/?]+\/(send|steer)$/.test(q.url || '')) return '';
+  try { const id = JSON.parse(q.options?.body || '{}').msg_id; return typeof id === 'string' && id.length <= 256 ? id : ''; } catch (_) { return ''; }
+}
+function _outboxUncertainMessage(q) {
+  return !!_outboxMessageId(q) && (q.delivery_uncertain === true ||
+    (q.state === 'blocked' && /acceptance is uncertain|delivery unconfirmed/i.test(q.error || '')));
+}
+// 10 minutes. After this, stop auto-checking and let the user decide.
+const _OUTBOX_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
+async function _outboxConfirmMessage(q, opts) {
+  q.delivery_uncertain = true;
+  // Counted from when THIS entry began being re-checked, not from when it was
+  // queued: an entry restored after days offline has not been checked for
+  // days, and its first read may well confirm it.
+  q.checking_since ||= Date.now();
+  const checkingSince = q.checking_since;
+  // AMUX-4594: the text lets the server settle a reservation no live send owns
+  // from the lane transcript. A steering row has no typed prompt to match.
+  let text = '';
+  try { text = /\/steer$/.test(q.url) ? '' : String(JSON.parse(q.options?.body || '{}').text || ''); } catch (_) {}
+  const msgId = (/\/steer$/.test(q.url) ? 'steer:' : '') + _outboxMessageId(q);
+  const url = q.url.replace(/\/(send|steer)$/, '/send') + '?msg_id=' + encodeURIComponent(msgId)
+    + (text && text.length <= 2000 ? '&text=' + encodeURIComponent(text) : '');
+  const response = await _boundedMutationFetch(url, {method:'GET', headers:opts.headers, cache:'no-store'});
+  const receipt = response.ok ? await response.json() : null;
+  const confirmed = receipt?.accepted === true && receipt.msg_id === msgId && typeof receipt.id === 'string' && !!receipt.id;
+  _outboxDiagnostic('acceptance_recheck', {id:q.id, measured:response.ok, n_considered:1, confirmed, status:response.status});
+  if (confirmed) {
+    _outboxDiagnostic('acceptance_recovered', {id:q.id, measured:true, n_considered:1});
+    return new Response(JSON.stringify({ok:true,deduped:true,id:receipt.id}), {status:200,headers:{'Content-Type':'application/json'}});
+  }
+  if (receipt?.released === true && receipt.msg_id === msgId) {
+    // The server showed the text never reached the worker and released the
+    // identity (AMUX-4594). Send it once with the SAME msg_id, so a repeat
+    // still dedups.
+    Object.assign(q, {delivery_uncertain:false, state:'pending', error:'', checking_since:0});
+    _outboxDiagnostic('acceptance_released', {id:q.id, measured:true, n_considered:1});
+    return _boundedMutationFetch(q.url, opts);
+  }
+  if (receipt?.stranded === true && receipt.delivered === 'unknown' && receipt.msg_id === msgId) {
+    // Nothing owns the reservation and amux has no evidence either way, so the
+    // person decides instead of the tab checking forever (AMUX-4594).
+    Object.assign(q, {delivery_uncertain:false, error:''});
+    _outboxDiagnostic('acceptance_unknown', {id:q.id, measured:false, n_considered:1});
+    throw Object.assign(new Error('Not confirmed and amux cannot check: look at the worker, then resend or dismiss'), {outboxBlocked:true});
+  }
+  // Still pending. The fallback from ba203699 stands: past the timeout, stop
+  // auto-checking and let the person decide (Ethan 2026-09-14 incident).
+  if (Date.now() - checkingSince > _OUTBOX_CONFIRM_TIMEOUT_MS) {
+    _outboxDiagnostic('acceptance_timed_out', {id:q.id, measured:true, n_considered:1,
+      age_min:Math.round((Date.now() - checkingSince) / 60000)});
+    q.delivery_uncertain = false;
+    throw Object.assign(
+      new Error('Confirmation timed out after ' + Math.round((Date.now() - checkingSince) / 60000) + 'm. Dismiss or retry.'),
+      {outboxBlocked:true});
+  }
+  throw Object.assign(new Error('Awaiting confirmation — checking automatically'), {outboxUncertain:true});
 }
 
 // Queue modal
@@ -2086,6 +3281,8 @@ function showQueueModal() {
       '<div class="queue-item">' +
         esc(describeOp(item)) +
         '<br><span class="queue-time">' + new Date(item.timestamp).toLocaleTimeString() + '</span>' +
+        (item.error ? '<div class="queue-error">' + esc(item.error) + '</div>' : '') +
+        '<button class="btn" onclick="_removeQueuedOperation(\'' + escJs(item.id) + '\')">Discard this queued change</button>' +
       '</div>'
     ).join('');
   }
@@ -2094,9 +3291,9 @@ function showQueueModal() {
 function closeQueueModal() {
   document.getElementById('queue-overlay').classList.remove('active');
 }
-function clearQueue() {
-  offlineQueue = [];
-  saveQueue();
+async function clearQueue() {
+  await _mutateQueue(current => { current.length = 0; });
+  _writeError = '';
   updateConnectionStatus();
   closeQueueModal();
   showToast('Queue cleared');
@@ -2104,6 +3301,7 @@ function clearQueue() {
 async function forceRetry() {
   closeQueueModal();
   if (!offlineQueue.length && !drafts.length) return;
+  await _mutateQueue(current => current.forEach(q => { q.state = 'pending'; q.reviewed_at = Date.now(); }));
   if (online) { runSyncBanner(); } else { setOnline(true); }
 }
 
@@ -2177,7 +3375,7 @@ function _warnIgnoredFields(r, url, options) {
 
 async function apiCall(url, options) {
   if (!online) {
-    _queueOp(url, options);
+    await _queueOp(url, options);
     return null;
   }
   try {
@@ -2209,7 +3407,8 @@ async function apiCall(url, options) {
     // The GET paths (fetchSessions, the status poll) reset unconditionally and
     // correctly: the outbox only intercepts POST/PATCH/PUT/DELETE, so a
     // successful GET really did reach the server.
-    if (!_isLocallyQueued(r)) consecutiveFailures = 0;
+    if (_isLocallyQueued(r)) return null;
+    consecutiveFailures = 0;
     // No _warnIgnoredFields call here: apiCall goes through fetch, which the
     // watch at the top of this file already wraps. Calling it here too would
     // toast twice for every apiCall mutation.
@@ -2220,11 +3419,19 @@ async function apiCall(url, options) {
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     amuxTrack('api_unreachable', { url: url.split('?')[0], err: String(e).slice(0, 200) });
-    _queueOp(url, options);
+    await _queueOp(url, options);
     return null;
   }
 }
-function _queueOp(url, options) {
+// Collapse repeated Stop intent only until another command to this worker.
+// Stop → Start → Stop must remain ordered, including across browser tabs.
+function _pendingStop(queue, url, options) {
+  if ((options?.method || '').toUpperCase() !== 'POST' || !/\/api\/sessions\/[^/?]+\/stop$/.test(url)) return null;
+  const worker = url.slice(0, -4);
+  const previous = [...queue].reverse().find(q => q.url.startsWith(worker));
+  return previous?.url === url && previous.options?.method?.toUpperCase() === 'POST' ? previous : null;
+}
+async function _queueOp(url, options) {
   // THE SINGLE ENFORCEMENT POINT for what may enter the outbox.
   //
   // There are two independent queuing paths — apiCall's `!online` branch and
@@ -2253,11 +3460,6 @@ function _queueOp(url, options) {
     } catch (e) {}
     return false;
   }
-  // Cap the outbox so localStorage can't overflow — oldest ops drop first
-  if (offlineQueue.length >= 200) {
-    offlineQueue.shift();
-    showToast('Offline queue full — oldest operation dropped');
-  }
   let body = options.body;
   // Sends/steers dedup server-side on msg_id — make sure every queued one has
   // it, so a replay after a lost response can't deliver the message twice.
@@ -2270,22 +3472,46 @@ function _queueOp(url, options) {
       }
     } catch (e) {}
   }
-  offlineQueue.push({ url, options: { method: options.method, headers: options.headers, body }, timestamp: Date.now() });
-  saveQueue();
+  const entry = { id: options._outboxId || crypto.randomUUID(), url, options: { method: options.method, headers: options.headers, body }, timestamp: Date.now(), state: 'pending', not_attempted:true };
+  try {
+    await _mutateQueue(current => {
+      if (current.some(q => q.id === entry.id)) return;
+      const pendingStop = _pendingStop(current, url, options);
+      if (pendingStop) {
+        _outboxDiagnostic('stop_intent_coalesced', {target:url.split('/').at(-2), queue_count:current.length});
+        return;
+      }
+      if (current.length >= 200) throw new Error('Queue full — this change was not queued; keep the draft');
+      current.push(entry);
+    });
+  } catch (e) {
+    _writeError = e.name === 'QuotaExceededError'
+      ? 'Device storage full — change is not safely queued; keep the draft' : e.message;
+    _localWriteError = _writeError;
+    showToast(_writeError); updateConnectionStatus();
+    let storageBytes = null;
+    try { storageBytes = _localStorageBytes(); } catch (_) {}
+    _outboxDiagnostic('write_failed', {error_name:e.name || 'Error',
+      reason:e.name === 'QuotaExceededError' ? 'quota_exceeded' :
+        !navigator.locks ? 'locks_unavailable' :
+        /Queue full/.test(e.message) ? 'queue_full' :
+        /invalid queue/.test(e.message) ? 'invalid_queue' : 'storage_failure',
+      storage_bytes:storageBytes, write_bytes:typeof body === 'string' ? body.length * 2 : 0,
+      queue_count:offlineQueue.length, secure_context:window.isSecureContext,
+      web_locks:!!navigator.locks});
+    return false;
+  }
+  _localWriteError = '';
+  _scheduleSyncRetry();
   updateConnectionStatus();
-  showToast('Queued (' + offlineQueue.length + ' pending)');
+  if (!options._outboxId && !_localMessageRequest(url, options)) showToast('Queued (' + offlineQueue.length + ' pending)');
   return true;
 }
 
 // ═══════ GLOBAL OFFLINE OUTBOX — fetch interceptor ═══════
-// Dozens of call sites issue raw fetch() mutations; offline they used to just
-// throw and the command was LOST. This wrapper implements the outbox pattern
-// at the fetch boundary so every API command flows through offline sync
-// without touching call sites. PASSIVE by design: while online it delegates
-// straight to the native fetch (zero behavioral change); only a request that
-// would otherwise fail (offline, or the network throws) gets captured into
-// the queue, and the caller receives a synthetic 202 {queued:true} so UI
-// code treats it as accepted rather than crashed.
+// Board edits persist before transmission. Transient failures keep the same
+// intent for retry; only a real acknowledgement removes it. A marked local
+// 202 means queued, and callers must not present it as saved or delivered.
 const _origFetch = window.fetch.bind(window);
 // Never queue interactive/ephemeral endpoints: telemetry, speed tests, live
 // terminal keystrokes, uploads (bodies too big for localStorage), login and
@@ -2307,7 +3533,7 @@ const _origFetch = window.fetch.bind(window);
 // deploy has its fetch fail, get queued, and report success. Ethan saw the two
 // halves separately — "mdai files are stuck at running", and a banner reading
 // `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|config\/cross-group)/;
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run|history\/ask|config\/cross-group|gateway\/switch-org)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -2335,14 +3561,286 @@ function _isLocallyQueued(r) {
   try { return !!(r && r.status === 202 && r.headers && r.headers.get('X-Amux-Outbox') === 'queued'); }
   catch (e) { return false; }
 }
-window.fetch = function(input, init) {
+
+// ── Interaction receipts: first slice of the AI-native command contract ──
+const AmuxState = window.AmuxState;
+const _stateUI = AmuxState.createStore({activityOpen:false});
+const _stateQuery = AmuxState.createQueries();
+function _interactionDiagnostic(event) {
+  console.warn('[amux] interaction', event.verdict, event.interaction_id || '');
+  let version = 'initializing';
+  try { version = APP_VER; } catch (_) {}
+  _origFetch(API + '/api/client-debug', {method:'POST',
+    headers:_authHeaders({'Content-Type':'application/json'}), signal:AbortSignal.timeout(5000),
+    body:JSON.stringify({...event, kind:event.kind || 'interaction-receipt', ver:version})}).catch(() => {});
+}
+let _receiptStorage;
+try { _receiptStorage = localStorage; } catch (_) {}
+const _interactions = AmuxState.createInteractions({storage:_receiptStorage, diagnostic:_interactionDiagnostic});
+const _stateFeedback = AmuxState.installFeedback(_interactions, _stateUI, _interactionDiagnostic);
+const _effectReconciler = AmuxState.createEffectReconciler({interactions:_interactions,
+  read:async (id, signal) => {
+    const response = await fetch(API + '/api/interactions/' + encodeURIComponent(id) + '/effects', {signal});
+    if (!response.ok) throw new Error('Effects unavailable (' + response.status + ')');
+    return response.json();
+  },
+  diagnostic:_interactionDiagnostic,
+});
+const _stateSync = AmuxState.createSync({query:_stateQuery,
+  fetchSync:async rev => {
+    const response = await fetch(API + '/api/sync?since_rev=' + rev);
+    if (!response.ok) throw new Error('State sync failed (' + response.status + ')');
+    return response.json();
+  },
+  refresh:() => Promise.all([fetchSessions(), fetchBoard()]),
+});
+function _interactionAccept(url, init = {}) {
+  const path = new URL(url, location.origin).pathname;
+  const method = (init.method || 'GET').toUpperCase();
+  const interactionId = new Headers(init.headers || {}).get('X-Amux-Interaction-Id');
+  const source = _stateFeedback.source();
+  if (source && method !== 'GET' && !source.dataset.interactionKind) {
+    _interactionDiagnostic({verdict:'unregistered_command_control', action:source.dataset.action, path, measured:true, n_considered:1});
+  }
+  const command = AmuxState.commandFor(method, path);
+  const label = source && (source.getAttribute('aria-label') || source.title || source.innerText)?.trim();
+  if (label && label.length <= 80) command.label = label;
+  return _interactions.accept({interactionId, command, request:{method,path}});
+}
+function _interactionSet(id, patch) { return _interactions.update(id, patch); }
+function _interactionRequestOptions(receipt, init) {
+  const headers = new Headers(init?.headers || {});
+  headers.set('X-Amux-Interaction-Id', receipt.id);
+  headers.set('X-Amux-Command-Kind', receipt.command.kind);
+  return {...init, headers:Object.fromEntries(headers.entries())};
+}
+async function _interactionAcknowledge(id, response) {
+  const receipt = await _interactions.acknowledge(id, response);
+  if (receipt && ['applied','noop','reconciled'].includes(receipt.phase)) {
+    const key = {worker:'sessions',message:'messages',scheduler:'schedules',group:'groups',memory:'memories',filesystem:'files',environment:'prefs',board:'board'}[receipt.command.target.primitive];
+    await _stateQuery.invalidate([key]);
+  }
+  if (response.headers.get('X-Amux-Interaction-Id') === id && !_isLocallyQueued(response)) {
+    // Failure state and diagnostics are persisted by the reconciler; the poller retries.
+    _interactionReconcile(id).catch(() => {});
+  }
+  return receipt;
+}
+async function _interactionReconcile(id) {
+  return _effectReconciler(id);
+}
+function _directInteractionFetch(input, init) { return fetch(input, {...init, _skipOutbox:true}); }
+function _interactionFail(id, error, queued) {
+  return _interactionSet(id, {phase:queued ? 'queued' : 'failed',
+    acknowledgement:{queued:!!queued, locally_queued:!!queued, error:String(error?.message || error || '')},
+    feedback:{message:queued ? 'Queued on this device' : String(error?.message || error || 'Failed')}});
+}
+function _interactionReplay(q) {
+  const receipt = _interactionAccept(q.url, q.options || {});
+  q.options = _interactionRequestOptions(receipt, q.options || {});
+  _interactionSet(receipt.id, {phase:'sending', request:{...receipt.request, outbox_id:q.id}});
+  return receipt;
+}
+window.__amuxInteractions = {recent:_interactions.recent, get:_interactions.get};
+window.__amuxState = {
+  query:{get:_stateQuery.get, state:_stateQuery.state},
+  interactions:window.__amuxInteractions,
+  effects:{forInteraction:id => _interactions.get(id)?.effects || []},
+  connection:() => ({online, conn_state:_connState, pending:offlineQueue.length + drafts.length}),
+  explain:id => _interactions.get(id),
+  events:{forInteraction:id => {
+    const receipt = _interactions.get(id);
+    return receipt ? [AmuxState.projectEvent({kind:'amux.interaction', payload:receipt}),
+      ...receipt.effects.map(effect => AmuxState.projectEvent({kind:effect.kind, payload:effect}))] : [];
+  }},
+  coverage:_stateFeedback.coverage,
+};
+setInterval(() => _interactions.expire(), 30000);
+const _interactionPoll = AmuxState.createInteractionPoller({interactions:_interactions,
+  read:async (id, signal) => {
+    const response = await fetch(API + '/api/interactions/' + encodeURIComponent(id), {signal});
+    if (!response.ok) throw new Error('Interaction status unavailable (' + response.status + ')');
+    return response.json();
+  },
+  reconcile:_interactionReconcile,
+  diagnostic:_interactionDiagnostic,
+});
+setInterval(() => {
+  if (online && !document.hidden) void _interactionPoll();
+}, 5000);
+
+function _outboxRequestOptions(url, init) {
+  // Assign the server's deduplication key before the FIRST attempt. Creating
+  // it only after a lost response makes the retry a second message.
+  if (typeof init?.body !== 'string' || !/\/(send|steer)$/.test(url.split('?')[0])) return init;
+  try {
+    const body = JSON.parse(init.body);
+    if (body.msg_id) return init;
+    return { ...init, body: JSON.stringify({ ...body, msg_id: crypto.randomUUID() }) };
+  } catch (_) { return init; }
+}
+function _validateMessageAcknowledgement(receipt, url) {
+  const steering = /\/steer$/.test(url.split('?')[0]);
+  if (receipt?.ok === true && (receipt.deduped === true ||
+      (steering ? typeof receipt.id === 'string' && !!receipt.id :
+        receipt.submitted === true || receipt.submission === 'deferred'))) return;
+  // An ambiguous HTTP 200 is not a delivery receipt. Keep the intent for
+  // explicit review instead of repeatedly injecting text into a live terminal.
+  throw Object.assign(new Error('Message delivery unconfirmed — review the queued message and terminal before retrying'), {outboxUncertain:true});
+}
+function _localMessageRequest(url, init) {
+  if ((init?.method || '').toUpperCase() !== 'POST' || !/\/api\/sessions\/[^/]+\/(send|steer)$/.test(url.split('?')[0])) return false;
+  try {
+    const text = JSON.parse(init.body).text;
+    return typeof text === 'string' && !!text.trim() && !/^\/[a-z]/.test(text.trim());
+  } catch (_) { return false; }
+}
+function _validateBoardAcknowledgement(card, url) {
+  if (card?.id !== decodeURIComponent(url.split('/').pop())) throw Object.assign(new Error('Server did not acknowledge the exact card'), {outboxBlocked:true});
+  if (card.ignored_fields?.length) throw Object.assign(new Error('Not saved: server ignored ' + card.ignored_fields.join(', ')), {outboxBlocked:true});
+}
+function _outboxBoardAcknowledged(card) {
+  const draft = _boardDrafts[card.id];
+  if (draft && !_bdDraftHasActiveEdits(draft, card) && (!draft.status || draft.status === card.status)) {
+    delete _boardDrafts[card.id];
+    _boardDraftsPersist();
+  }
+}
+// AMUX-4661 (Ethan's screenshot, "Send to self ... [Stopped]"): this used to
+// throw `new DOMException('Stopped', 'AbortError')` on both exits below. That
+// name is what `_STATUS_LABELS`/several `e.name === 'AbortError'` checks
+// elsewhere in this file rely on, so it stays — but the MESSAGE ("Stopped")
+// is what the offline-op row shows verbatim (`describeOp` + `[` + item.error
+// + `]`), and it told the reader nothing. Both exits here fire the same way:
+// `_boundedMutationFetch`'s 15s outer timeout aborted `signal` before a
+// receipt confirmed — the send itself may have landed on the server with no
+// receipt yet echoed back (this loop polls at 1s intervals and gives up at
+// 15s), which is exactly the "unconfirmed, not failed" shape
+// `_validateMessageAcknowledgement` already names in its own error a few
+// lines up. Same wording here so the two paths that can leave a message
+// ambiguous read as one fact, not two.
+const _RECEIPT_TIMEOUT_MSG = 'No delivery confirmation within 15s — the message may still have gone through; review the worker before retrying';
+async function _waitForMessageReceipt(input, init, signal) {
+  let msgId;
+  try { msgId = JSON.parse(init?.body || '{}').msg_id; } catch (_) {}
+  if (!msgId || !/\/api\/sessions\/[^/?]+\/(send|steer)$/.test(input)) return new Promise(() => {});
+  if (/\/steer$/.test(input)) msgId = 'steer:' + msgId;
+  const url = input.replace(/\/(send|steer)$/, '/send') + '?msg_id=' + encodeURIComponent(msgId);
+  while (!signal.aborted) {
+    await new Promise((resolve, reject) => {
+      const stop = () => { clearTimeout(timer); reject(new DOMException(_RECEIPT_TIMEOUT_MSG, 'AbortError')); };
+      const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, 1000);
+      signal.addEventListener('abort', stop, {once:true});
+    });
+    try {
+      const r = await _origFetch(url, {headers:init.headers, signal, cache:'no-store'});
+      const receipt = r.ok ? await r.json() : null;
+      if (receipt?.accepted === true && receipt.msg_id === msgId && typeof receipt.id === 'string' && receipt.id) {
+        try { amuxTrack('outbox_acceptance_receipt', {id:msgId}); } catch (_) {}
+        return new Response(JSON.stringify({ok:true,deduped:true,id:receipt.id}), {status:200,headers:{'Content-Type':'application/json'}});
+      }
+    } catch (e) { if (signal.aborted) throw e; }
+  }
+  throw new DOMException(_RECEIPT_TIMEOUT_MSG, 'AbortError');
+}
+async function _boundedMutationFetch(input, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('Request timed out (15s)'), 15000);
+  const signal = init && init.signal
+    ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
+  const original = (async () => {
+    try {
+      const response = await _origFetch(input, { ...init, signal });
+      const bytes = await response.arrayBuffer();
+      return new Response([204, 205, 304].includes(response.status) ? null : bytes, {status: response.status, statusText: response.statusText, headers: response.headers});
+    } finally { clearTimeout(timer); }
+  })();
+  const poll = new AbortController();
+  try {
+    return await Promise.race([original, _waitForMessageReceipt(input, init, AbortSignal.any([signal,poll.signal]))]);
+  } finally {
+    // A receipt wins without cancelling the original handler's board work.
+    // Its existing request deadline still bounds transport resources.
+    poll.abort();
+  }
+}
+
+async function _outboxFetch(input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || '';
   if (!_outboxQueueable(url, init)) return _origFetch(input, init);
-  if (!online) {
-    _queueOp(url, init || {});
-    return Promise.resolve(_outboxAccepted());
+  if (/\/api\/sessions\/[^/?]+\/stop$/.test(url) && !init?._stopLocked) {
+    return _outboxLock('amux-stop-intent:' + url, async () => {
+      if (_pendingStop(_readQueue(), url, init)) {
+        _outboxDiagnostic('stop_intent_coalesced', {target:url.split('/').at(-2)});
+        if (online) setTimeout(() => runSyncBanner(true), 0);
+        return _outboxAccepted();
+      }
+      return _outboxFetch(input, {...init, _stopLocked:true});
+    });
   }
-  return _origFetch(input, init).catch(e => {
+  init = _outboxRequestOptions(url, init || {});
+  const receipt = _interactionAccept(url, init);
+  init = _interactionRequestOptions(receipt, init);
+  if (_localMessageRequest(url, init) || /\/api\/sessions\/[^/?]+\/stop$/.test(url)) {
+    if (!await _queueOp(url, init)) {
+      _interactionFail(receipt.id, 'Queue unavailable', false);
+      return new Response('Queue unavailable', {status:507});
+    }
+    // Return after durable local acceptance. The composer must never wait for
+    // terminal submission verification or the server's model-backed intake.
+    _interactionFail(receipt.id, null, true);
+    if (online) setTimeout(() => runSyncBanner(true), 0);
+    return _outboxAccepted();
+  }
+  if (!online) {
+    const queued = await _queueOp(url, init || {});
+    _interactionFail(receipt.id, queued ? null : 'Queue unavailable', queued);
+    return Promise.resolve(queued ? _outboxAccepted() : new Response('Queue unavailable', {status: 507}));
+  }
+  _interactionSet(receipt.id, {phase:'sending'});
+  const durableId = /\/api\/board\/[^/?]+$/.test(url) && (init?.method || '').toUpperCase() === 'PATCH' ? receipt.id : null;
+  const deliver = async () => {
+  if (durableId) {
+    init = { ...init, _outboxId: durableId };
+    if (!await _queueOp(url, init)) {
+      _interactionFail(receipt.id, 'Queue unavailable', false);
+      return Promise.resolve(new Response('Queue unavailable', {status: 507}));
+    }
+    _outboxActive.add(durableId);
+  }
+  return _boundedMutationFetch(input, init).then(async r => {
+    if (r.status >= 500 || [401, 408, 429].includes(r.status)) {
+      _writeError = 'Server did not save the change (' + r.status + ')';
+      if (await _queueOp(url, init || {})) {
+        _interactionFail(receipt.id, null, true);
+        return _outboxAccepted();
+      }
+    }
+    if (durableId) {
+      const q = offlineQueue.find(q => q.id === durableId);
+      if (r.ok) {
+        const acknowledged = await r.clone().json();
+        _validateBoardAcknowledgement(acknowledged, url);
+        await _mutateQueue(current => { const at = current.findIndex(q => q.id === durableId); if (at >= 0) current.splice(at, 1); });
+        if (!offlineQueue.length && !drafts.length) _writeError = '';
+      } else if (q) {
+        q.state = 'blocked'; q.error = 'Not saved (' + r.status + ') — review this change before retry';
+        _writeError = q.error;
+        await _mutateQueue(current => { const saved = current.find(q => q.id === durableId); if (saved) Object.assign(saved, {state: q.state, error: q.error}); });
+      }
+      updateConnectionStatus();
+    }
+    await _interactionAcknowledge(receipt.id, r);
+    return r;
+  }).catch(async e => {
+    if (durableId && e.outboxBlocked) {
+      _writeError = e.message;
+      await _mutateQueue(current => { const q = current.find(q => q.id === durableId); if (q) Object.assign(q, {state:'blocked', error:e.message}); });
+      updateConnectionStatus();
+      try { amuxTrack('outbox_acknowledgement_refused', {id:durableId, error:e.message}); } catch (_) {}
+      _interactionSet(receipt.id, {phase:'refused', acknowledgement:{status:409, error:e.message}, feedback:{required:true, persistence:'durable', severity:'error', message:e.message}});
+      return new Response(e.message, {status:409});
+    }
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     // BEACON — this path queues the op and returns a synthetic 202, so the
@@ -2360,9 +3858,51 @@ window.fetch = function(input, init) {
         err: String(e).slice(0, 200),
       });
     } catch (_) {}
-    _queueOp(url, init || {});
-    return _outboxAccepted();
-  });
+    _writeError = 'Server unreachable; changes are pending';
+    const queued = await _queueOp(url, init || {});
+    _interactionFail(receipt.id, e, queued);
+    return queued ? _outboxAccepted() : new Response('Queue unavailable', {status: 507});
+  }).finally(() => { if (durableId) _outboxActive.delete(durableId); });
+  };
+  return durableId ? _outboxLock('amux-outbox-delivery:' + durableId, deliver) : deliver();
+}
+window.fetch = async function(input, init) {
+  if (input instanceof Request) {
+    const request = new Request(input, init);
+    input = request.url;
+    init = {...init, method:request.method, headers:request.headers, signal:request.signal,
+      body:['GET','HEAD'].includes(request.method) ? undefined : await request.blob()};
+  }
+  const url = new URL(String(input), location.origin);
+  const method = (init?.method || 'GET').toUpperCase();
+  if (url.origin === location.origin && url.pathname.startsWith('/api/') && method === 'GET' && _stateFeedback.source()) {
+    const receipt = _interactionAccept(url.href, init);
+    _interactionSet(receipt.id, {phase:'sending', feedback:{message:'Loading'}});
+    try {
+      const response = await _origFetch(input, init);
+      await _interactionAcknowledge(receipt.id, response);
+      return response;
+    } catch (error) { _interactionFail(receipt.id, error, false); throw error; }
+  }
+  if (url.origin !== location.origin || !url.pathname.startsWith('/api/') ||
+      !_OUTBOX_METHODS[method] || url.pathname === '/api/client-debug') return _origFetch(input, init);
+  // Upload chunks belong to their parent's workflow; do not claim that each
+  // successful chunk is a completed file upload.
+  if (init?._interactionWorkflow) return _origFetch(input, init);
+  if (_outboxQueueable(url.href, init)) return _outboxFetch(String(input), init);
+  const receipt = _interactionAccept(url.href, init);
+  const options = _interactionRequestOptions(receipt, init);
+  _interactionSet(receipt.id, {phase:'sending'});
+  try {
+    const response = await _origFetch(input, options);
+    await _interactionAcknowledge(receipt.id, response);
+    return response;
+  } catch (error) {
+    _interactionSet(receipt.id, {phase:'unknown', measured:false,
+      why_unmeasured:'Connection ended without an acknowledgement; inspect before retrying',
+      acknowledgement:{error:String(error.message || error)}});
+    throw error;
+  }
 };
 
 // Reconcile queue: remove contradictory/stale operations before replay
@@ -2659,7 +4199,10 @@ function toggleNotifPanel() {
   const panel = document.getElementById('notif-panel');
   if (!panel) return;
   panel.classList.toggle('active', _notifPanelOpen);
+  document.getElementById('notif-btn')?.setAttribute('aria-expanded', String(_notifPanelOpen));
   if (_notifPanelOpen) {
+    panel.scrollTop = 0;
+    _positionNotifPanel();
     _notifRenderPanel();
     _notifUpdateNativeBtn();
     _notifUpdateBannerBtn();
@@ -2668,6 +4211,25 @@ function toggleNotifPanel() {
     setTimeout(() => _notifUpdateBadge(), 300);
   }
 }
+
+function _positionNotifPanel() {
+  const panel = document.getElementById('notif-panel');
+  const button = document.getElementById('notif-btn');
+  if (!panel || !button || !_notifPanelOpen) return;
+  const anchor = button.getBoundingClientRect();
+  const width = panel.getBoundingClientRect().width;
+  const top = Math.min(anchor.bottom + 8, Math.max(12, innerHeight - 120));
+  panel.style.left = Math.max(12, Math.min(anchor.left, innerWidth - width - 12)) + 'px';
+  panel.style.top = top + 'px';
+  panel.style.maxHeight = Math.max(80, Math.min(520, innerHeight - top - 12)) + 'px';
+}
+window.addEventListener('resize', _positionNotifPanel);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && _notifPanelOpen) {
+    toggleNotifPanel();
+    document.getElementById('notif-btn')?.focus();
+  }
+});
 
 function _notifRenderPanel() {
   const list = document.getElementById('notif-panel-list');
@@ -2704,11 +4266,122 @@ function _notifClearAll() {
 
 document.addEventListener('click', (e) => {
   if (_notifPanelOpen && !e.target.closest('#notif-panel') && !e.target.closest('#notif-btn')) {
-    _notifPanelOpen = false;
-    const panel = document.getElementById('notif-panel');
-    if (panel) panel.classList.remove('active');
+    toggleNotifPanel();
   }
 });
+
+// ── Needs You digest (AF-510) ──
+// Read-only, dashboard-only by design: NOT wired through _notifPush, on
+// purpose, so it never fires a native/lock-screen notification regardless of
+// this browser's own notification-permission state. The channel decision on
+// AF-510 was specifically "dashboard-only, not push" — routing through the
+// existing native-capable notification pipe would quietly reintroduce the
+// push channel that was ruled out. This is its own small header indicator
+// (button/badge/panel), visually consistent with the notif panel (same CSS
+// classes) but functionally independent of it.
+let _needsYouPanelOpen = false;
+let _needsYouData = null;
+
+function toggleNeedsYouPanel() {
+  _needsYouPanelOpen = !_needsYouPanelOpen;
+  const panel = document.getElementById('needsyou-panel');
+  if (!panel) return;
+  panel.classList.toggle('active', _needsYouPanelOpen);
+  document.getElementById('needsyou-btn')?.setAttribute('aria-expanded', String(_needsYouPanelOpen));
+  if (_needsYouPanelOpen) {
+    panel.scrollTop = 0;
+    _positionNeedsYouPanel();
+    _needsYouFetch();
+  }
+}
+
+function _positionNeedsYouPanel() {
+  const panel = document.getElementById('needsyou-panel');
+  const button = document.getElementById('needsyou-btn');
+  if (!panel || !button || !_needsYouPanelOpen) return;
+  const anchor = button.getBoundingClientRect();
+  const width = panel.getBoundingClientRect().width;
+  const top = Math.min(anchor.bottom + 8, Math.max(12, innerHeight - 120));
+  panel.style.left = Math.max(12, Math.min(anchor.left, innerWidth - width - 12)) + 'px';
+  panel.style.top = top + 'px';
+  panel.style.maxHeight = Math.max(80, Math.min(520, innerHeight - top - 12)) + 'px';
+}
+window.addEventListener('resize', _positionNeedsYouPanel);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && _needsYouPanelOpen) {
+    toggleNeedsYouPanel();
+    document.getElementById('needsyou-btn')?.focus();
+  }
+});
+document.addEventListener('click', (e) => {
+  if (_needsYouPanelOpen && !e.target.closest('#needsyou-panel') && !e.target.closest('#needsyou-btn')) {
+    toggleNeedsYouPanel();
+  }
+});
+
+async function _needsYouFetch(forceRender) {
+  try {
+    const r = await fetch(API + '/api/debug/needsyou-digest', { headers: _authHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d || d.measured !== true) return;  // an unmeasured probe is not a zero (ethos rule 4)
+    _needsYouData = d;
+    _needsYouUpdateBadge();
+    if (_needsYouPanelOpen || forceRender) _needsYouRenderPanel();
+  } catch (e) { /* offline or the endpoint is unreachable — leave the last-known badge as is */ }
+}
+
+function _needsYouUpdateBadge() {
+  const badge = document.getElementById('needsyou-badge');
+  if (!badge || !_needsYouData) return;
+  // The TRUE fleet-wide count, not the capped list length — a capped badge
+  // would silently read as "that's everything" (ethos rule 4).
+  const n = _needsYouData.n_considered || 0;
+  badge.textContent = n > 99 ? '99+' : String(n);
+  badge.style.display = n > 0 ? 'flex' : 'none';
+}
+
+function _needsYouRenderPanel() {
+  const list = document.getElementById('needsyou-panel-list');
+  if (!list) return;
+  const d = _needsYouData;
+  if (!d || !d.n_considered) {
+    list.innerHTML = '<div class="notif-panel-empty">Nothing waiting on you</div>';
+    return;
+  }
+  // Render exactly the order the API already gives (oldest-first, fleet-wide)
+  // -- re-sorting client-side would drift from the one thing this list is
+  // for (age is the ordering signal AF-510 was built around).
+  let html = (d.by_lane || []).map(lane => {
+    const items = (lane.cards || []).map(c => {
+      const age = c.age_days >= 1 ? Math.round(c.age_days) + 'd' : Math.round(c.age_days * 24) + 'h';
+      const sub = c.ask_question || c.title || '';
+      return '<div class="notif-panel-item" onclick="toggleNeedsYouPanel();switchView(\'board\');setTimeout(function(){openBoardDetail(\'' + escJs(c.id) + '\')},250)">'
+        + '<span class="npi-icon">\u{1F64B}</span>'
+        + '<div class="npi-body"><div class="npi-title">' + esc(c.id) + ' — ' + esc((c.title || '').slice(0, 60)) + '</div>'
+        + '<div class="npi-text">' + esc(sub.slice(0, 90)) + '</div></div>'
+        + '<span class="npi-time">' + age + '</span></div>';
+    }).join('');
+    return '<div class="needsyou-panel-lane">' + esc(lane.session) + '</div>' + items;
+  }).join('');
+  if (d.truncated) {
+    html += '<div class="needsyou-panel-note">Showing oldest ' + d.shown + ' of ' + d.n_considered + ' fleet-wide</div>';
+  }
+  list.innerHTML = html;
+}
+
+// Boot: one fetch on load for the badge count (matches this file's own
+// DOMContentLoaded-guard convention — app.js loads at the end of body, so
+// document.body already exists by the time this line runs in the common case).
+(function () {
+  const boot = () => _needsYouFetch();
+  if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
+  // Coarse periodic refresh so the badge count does not go stale across a
+  // long-open tab. Not wired to SSE (.claude/rules/sse-realtime.md would
+  // require adding it to the polling fallback too) -- a scoped choice for
+  // this dashboard-only rollout, not a limitation of the endpoint itself.
+  setInterval(_needsYouFetch, 5 * 60 * 1000);
+})();
 
 function _fireSessionNotif(name, title, body) {
   let icon = '\U0001f535';
@@ -2744,8 +4417,11 @@ function _checkSessionTransitions(newData) {
     const statusChanged = s.status !== prev.status;
     const stoppedNow = prev.running && !s.running;
     if (statusChanged) {
-      if (s.status === 'waiting') {
-        _fireSessionNotif(s.name, s.name + ' needs input', s.task_name || 'Waiting for a response');
+      if (s.status === 'blocked') {
+        _fireSessionNotif(s.name, s.name + ' blocked on permission', s.task_name || 'Waiting on a permission dialog');
+        amuxTrack('session_blocked', { session: s.name, task: s.task_name || '' });
+      } else if (s.status === 'waiting' && s.waiting_reason !== 'rate_limit') {
+        _fireSessionNotif(s.name, s.name + ' ' + _waitingLabel(s), s.task_name || 'Worker is waiting');
         amuxTrack('session_waiting', { session: s.name, task: s.task_name || '', auto_continue: !!s.auto_continue });
       } else if (s.status === 'active' && prev.status !== 'active') {
         _fireSessionNotif(s.name, s.name + ' started working', s.task_name || '');
@@ -2765,68 +4441,287 @@ function _checkSessionTransitions(newData) {
 // on every API call and can never heal on its own — the fresh token lives in
 // the fresh shell. Nudge the SW and reload ONCE per session (rate-limited like
 // the version-mismatch reload; a broken SW must not cause a storm).
-function _staleShellRecover() {
+let _authRecoveryAttempted = false;
+async function _staleShellRecover() {
+  // AF-639: a reload heals only the case this function was written for, a
+  // SW-cached shell carrying a rotated-away token, where the fresh shell does
+  // bring a fresh one. When the server withheld the bearer deliberately the
+  // fresh shell is identical, so the reload is a no-op that repeats every ten
+  // minutes forever and tells the person at the keyboard nothing. Measured
+  // 2026-09-09: one laptop sat in this state for 22.5 hours and 28,355 401s,
+  // showing a dashboard that looked fine because it was rendering its cache.
+  if (_authWithheld) { _amuxAuthWithheldBanner(); return; }
+  if (_authRecoveryAttempted) return;
+  _authRecoveryAttempted = true;
+  // A SW update alone reuses the cached anonymous shell within the same app
+  // version. Ask the server for its actual bootstrap, under the existing owner
+  // or member cookie rules. Never evaluate returned HTML or mint credentials.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
   try {
-    const last = parseInt(sessionStorage.getItem('amux_401_reload') || '0');
-    if (Date.now() - last < 600000) return;
+    const r = await fetch('/?_fresh=auth', { cache: 'no-store', signal: controller.signal });
+    if (!r.ok) return;
+    const html = await r.text();
+    const block = html.match(/<!-- AMUX-BOOTSTRAP-BEGIN[\s\S]*?<!-- AMUX-BOOTSTRAP-END -->/);
+    const match = block && block[0].match(/window\._AMUX_AUTH_TOKEN=("(?:\\.|[^"\\])*")/);
+    const token = match ? JSON.parse(match[1]) : '';
+    // Reload only if the server supplied a DIFFERENT owner credential. A
+    // missing/revoked login cannot be repaired by repeated cache clears.
+    if (!token || token === _authToken) return;
+    const last = Number(sessionStorage.getItem('amux_401_reload') || '0');
+    if (Date.now() - last < 60000) return;
     sessionStorage.setItem('amux_401_reload', String(Date.now()));
-    console.warn('amux: API 401 with this shell’s token — refreshing the shell');
-    const upd = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
-      ? navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {})
-      : Promise.resolve();
-    upd.finally ? upd.finally(() => setTimeout(() => location.reload(), 1500))
-                : setTimeout(() => location.reload(), 1500);
-  } catch (e) {}
+    // Reload the full bootstrap so its UI guard rotates with the bearer.
+    // _fresh bypasses the SW's canonical '/' cache; preserve the user's view.
+    location.replace('/?_fresh=auth' + location.hash);
+  } catch (_) {
+    // The original 401 remains visible. Failure to fetch recovery HTML is not
+    // evidence that the access problem was repaired.
+  } finally { clearTimeout(timeout); }
+}
+
+function _sessionReadFailed(status, reason) {
+  const allowed = ['missing_credential', 'invalid_bearer', 'unverified_member_cookie',
+    'invalid_owner_session', 'owner_session_requires_bootstrap', 'unauthorized',
+    'http_error', 'invalid_json', 'invalid_payload', 'network_error'];
+  reason = allowed.includes(reason) ? reason : (status === 401 ? 'unauthorized' : 'http_error');
+  const changed = !_sessionLoadError || _sessionLoadError.status !== status || _sessionLoadError.reason !== reason;
+  _sessionLoadError = { status, reason };
+  if (changed) {
+    // No URL query, token, response body, or user content. Keep the latest
+    // failure across a bootstrap reload and deliver it after access recovers.
+    const incident = { kind: 'session-load-failure', measured: true, n_considered: 1,
+      status, reason, app_ver: APP_VER, had_data: !!lastSessionsJSON,
+      bearer_present: !!_authToken, ts: Date.now() };
+    console.warn('amux: session read failed', incident);
+    try { sessionStorage.setItem('amux_session_load_failure', JSON.stringify(incident)); } catch (_) {}
+  }
+  // A transient server overload used to leave this banner pinned forever.
+  // HTTP failures do not trip fetch's catch branch, and an otherwise-healthy
+  // SSE stream may never emit another sessions invalidation, so the only
+  // recovery path was the human clicking Retry even after the server was
+  // healthy again. Auth failures require a new credential; every other read
+  // failure retries automatically with bounded backoff.
+  if (status !== 401) _scheduleSessionReadRetry();
+  // Arm recovery before entering the large renderer. Even if an unrelated
+  // view-specific render path throws after painting the banner, the transport
+  // still gets a chance to heal itself.
+  updateConnectionStatus();
+  render();
+}
+
+function _sessionReadRecovered() {
+  const changed = !!_sessionLoadError;
+  _sessionLoadError = null;
+  _sessionRetryAttempt = 0;
+  clearTimeout(_sessionRetryTimer);
+  _sessionRetryTimer = null;
+  updateConnectionStatus();
+  if (changed) render();
+  // A 401 also rejects client-debug, so do not hammer it while unauthorized.
+  // The server records each refusal; this delayed beacon adds browser context.
+  try {
+    const saved = sessionStorage.getItem('amux_session_load_failure');
+    if (saved) {
+      sessionStorage.removeItem('amux_session_load_failure');
+      const d = JSON.parse(saved);
+      fetch('/api/client-debug', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ ...d, recovered_at: Date.now() }) }).then(r => {
+          if (!r.ok) sessionStorage.setItem('amux_session_load_failure', saved);
+        }).catch(() => { try { sessionStorage.setItem('amux_session_load_failure', saved); } catch (_) {} });
+    }
+  } catch (_) {}
+}
+
+function _retrySessionRead() {
+  _authRecoveryAttempted = false;
+  _sessionRetryAttempt = 0;
+  clearTimeout(_sessionRetryTimer);
+  _sessionRetryTimer = null;
+  fetchSessions();
+}
+
+function _sessionReadNotice() {
+  if (!_sessionLoadError) return '';
+  const auth = _sessionLoadError.status === 401;
+  const pending = offlineQueue.length + drafts.length;
+  const offlineCaps = sessions.length
+    ? ' The worker list is showing the last saved copy.' + (pending
+        ? ' ' + pending + ' queued operation' + (pending === 1 ? '' : 's') + ' will sync automatically when the server returns.'
+        : ' Commands you send will be queued and delivered when the server returns.')
+    : '';
+  const errDetail = _sessionLoadError.status ? 'HTTP ' + _sessionLoadError.status : 'Network error';
+  const troubleshoot = auth ? '' : '<div style="margin-top:8px;font-size:0.78rem;color:var(--dim);">'
+    + '<b>Troubleshooting:</b> '
+    + (_sessionLoadError.status >= 500
+      ? 'The server returned an error. Check the server health and logs if retries do not recover.'
+      : _sessionLoadError.status
+        ? 'The server responded, but its worker list could not be read. Check the response details below.'
+        : 'Cannot reach the server. Check that amux is running and this device can reach its address or VPN.')
+    + '</div>';
+  return '<div class="session-read-notice" role="alert"><strong>'
+    + (auth ? 'Access to this workspace needs to be renewed' : 'Worker updates are unavailable')
+    + '</strong><p>' + (auth
+      ? 'Open your owner access link, or ask the workspace owner for a new invite.'
+      : errDetail + ' on GET /api/sessions. Retrying automatically.')
+    + offlineCaps
+    + '</p>' + troubleshoot
+    + '<button type="button" class="btn" onclick="_retrySessionRead()">Retry connection</button>'
+    + '<details><summary>Connection details</summary><code>GET /api/sessions · '
+    + errDetail + ' · ' + esc(_sessionLoadError.reason) + '</code></details></div>';
+}
+
+// AF-639. The honest end state for a browser the server will not bootstrap:
+// say so, and hand over the one action that fixes it. One visit carrying
+// ?_token= is enough — the server swaps it for an HttpOnly owner session and
+// strips it back out of the address bar (static_files.rs::serve_shell), so
+// this survives reloads and does not leave the bearer in history.
+function _amuxAuthWithheldBanner() {
+  if (!document.body || document.getElementById('amux-auth-withheld')) return;
+  const bar = document.createElement('div');
+  bar.id = 'amux-auth-withheld';
+  // Inline styles, same reasoning as the legacy-origin banner above: this has
+  // to render even when app.css never loaded, and every /api fetch on this
+  // page is failing, so it cannot depend on anything fetched.
+  bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:100000;' +
+    'padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 12px;' +
+    'background:#7c2d12;color:#fff;font:500 13px/1.45 -apple-system,system-ui,sans-serif;' +
+    'box-shadow:0 2px 12px rgba(0,0,0,.4);';
+  bar.innerHTML = '<div style="max-width:720px;margin:0 auto;">' +
+    '<b>Not signed in to this server.</b> Everything below is cached and will not update: ' +
+    'this browser is remote, so the server did not give this page a token and every request ' +
+    'is being refused. Paste the token from <code>~/.amux/auth_token</code> on the server ' +
+    'machine to sign in for good.</div>';
+  const row = document.createElement('div');
+  row.style.cssText = 'max-width:720px;margin:8px auto 0;display:flex;gap:8px;flex-wrap:wrap;';
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.autocomplete = 'off';
+  input.placeholder = 'auth token';
+  input.style.cssText = 'flex:1;min-width:180px;min-height:44px;padding:0 12px;border-radius:8px;' +
+    'border:1px solid rgba(255,255,255,.4);background:rgba(0,0,0,.25);color:#fff;font-size:13px;';
+  const go = document.createElement('button');
+  go.textContent = 'Sign in';
+  go.style.cssText = 'min-height:44px;padding:0 16px;border-radius:8px;border:0;' +
+    'background:#fff;color:#7c2d12;font-weight:600;font-size:13px;cursor:pointer;';
+  const submit = () => {
+    const t = input.value.trim();
+    if (!t) { input.focus(); return; }
+    location.href = location.pathname + '?_token=' + encodeURIComponent(t);
+  };
+  go.onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  row.appendChild(input);
+  row.appendChild(go);
+  bar.appendChild(row);
+  document.body.appendChild(bar);
+  // Deliberately NOT dismissable. The whole failure is that the page looks
+  // fine, and a banner the user can close reproduces that within a minute.
 }
 
 let _sessEtag = null;
-async function fetchSessions() {
+let _sessionFetchInFlight = null;
+let _sessionRetryTimer = null;
+let _sessionRetryAttempt = 0;
+function _scheduleSessionReadRetry() {
+  if (_sessionRetryTimer) return;
+  const delay = Math.min(1000 * Math.pow(2, _sessionRetryAttempt++), 10000);
+  _sessionRetryTimer = setTimeout(() => {
+    _sessionRetryTimer = null;
+    fetchSessions();
+  }, delay);
+}
+// Keep the OPEN worker-details (peek) view live on every session-data update,
+// not just the card list. The server moved session updates to an
+// `invalidate:['sessions']` push that the client answers with fetchSessions
+// (AMUX-3503), and fetchSessions only re-rendered the LIST — so a status or
+// queue change showed there while the open detail view stayed stale until its
+// own slower poll tick or a manual refresh (Ethan, 2026-09-12: "there's a delay
+// and i have to refresh page to see it"). The peek-refresh that DID exist lived
+// only in the now-unused direct-payload SSE branch. One helper, called from both
+// the fetch path and that branch, so the two never drift again (ethos rule 1).
+// The frame refetch is a cheap 304 when the peeked frame is unchanged.
+function _refreshOpenPeekOnSessions() {
+  try {
+    const pov = document.getElementById('peek-overlay');
+    if (typeof peekSession !== 'undefined' && peekSession && pov && pov.classList.contains('active')) {
+      if (typeof updatePeekStatus === 'function') updatePeekStatus();
+      if (!document.hidden && typeof refreshPeek === 'function') refreshPeek();
+    }
+  } catch (e) {}
+}
+function fetchSessions() {
+  // Focus, SSE invalidation, reconnect and the fallback poll can all ask for
+  // the same list at once. One browser tab should never contribute its own
+  // request stampede during the exact recovery window it is trying to heal.
+  if (_sessionFetchInFlight) return _sessionFetchInFlight;
+  _sessionFetchInFlight = _fetchSessionsOnce().finally(() => {
+    _sessionFetchInFlight = null;
+  });
+  return _sessionFetchInFlight;
+}
+async function _fetchSessionsOnce() {
+  const snapshotEpoch = _sessionsSnapshotEpoch;
   try {
     // AMUX-3504: conditional fetch — the server hashes the (now byte-stable)
     // payload, so an unchanged fleet answers 304 with no body. That is the
     // whole cost of the reconnect/resume refetches intermittent mobile fires.
-    const r = await fetch(API + '/api/sessions', _sessEtag ? { headers: { 'If-None-Match': _sessEtag } } : undefined);
+    const r = await _stateQuery.response(['sessions', 'response'], () => fetch(API + '/api/sessions', _sessEtag ? { headers: { 'If-None-Match': _sessEtag } } : undefined));
     if (r.status === 304) {
       consecutiveFailures = 0;
       _lastDataTime = Date.now();
       if (!online) setOnline(true);
+      _sessionReadRecovered();
       return;
     }
-    _sessEtag = r.headers.get('ETag') || null;
-    const data = await r.json();
+    if (!r.ok) {
+      const error = await r.json().catch(() => ({}));
+      _sessionReadFailed(r.status, error?.reason || (r.status === 401 ? 'unauthorized' : 'http_error'));
+      if (r.status === 401) _staleShellRecover();
+      return;
+    }
+    let data;
+    try { data = await r.json(); }
+    catch (_) { _sessionReadFailed(r.status, 'invalid_json'); return; }
     // Same guard as fetchBoard (live crash 2026-08-09): a 401 error object
     // must not become `sessions` — every card render maps over it.
     if (!Array.isArray(data)) {
-      if (r.status === 401) _staleShellRecover();
-      console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
+      _sessionReadFailed(r.status, 'invalid_payload');
       return;
     }
+    if (snapshotEpoch !== _sessionsSnapshotEpoch) {
+      console.info('sessions poll completed behind a newer stream snapshot; discarded');
+      return;
+    }
+    _sessEtag = r.headers.get('ETag') || null;
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
-    if (_initialLoad) { _initialLoad = false; }
+    const firstLoad = _initialLoad;
+    _initialLoad = false;
+    _sessionReadRecovered();
+    if (firstLoad) render();
     if (!online) setOnline(true);
     const j = JSON.stringify(data);
     if (j !== lastSessionsJSON) {
       _checkSessionTransitions(data);
       lastSessionsJSON = j;
       sessions = data;
-      // Quota-full store: drop the cache rather than let the throw break rendering
+      _stateQuery.set(['sessions'], data);
+      _sessionsSnapshotEpoch++;
+      // Quota-full store: drop the cache rather than let the throw break rendering.
+      // IDB is the durable fallback (no 5MB cap), so a quota eviction here still
+      // leaves sessions recoverable on offline startup.
       try { localStorage.setItem('amux_sessions_cache', j); }
       catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
+      if (typeof _idb !== 'undefined') _idb.set('sessions_cache', data);
       render();
-      // Board live-emphasis tracks session activity: re-render the board when the
-      // ACTIVE set changes (signature-guarded so this is rare; never mid-drag).
-      try {
-        const _liveSig = data.filter(s => s.status === 'active').map(s => s.name).sort().join(',');
-        if (window._boardLiveSig !== _liveSig) {
-          window._boardLiveSig = _liveSig;
-          if (activeView === 'board' && !document.body.classList.contains('board-dragging')) renderBoard();
-        }
-      } catch(e) {}
+      _refreshOpenPeekOnSessions();   // list AND details update from the one event
+      _refreshBoardActivityOnSessions();
+      _updateFanoutTabVisibility();
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
-    console.error('fetch workers:', e);
+    _sessionReadFailed(0, 'network_error');
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
       setOnline(false);
@@ -2844,7 +4739,7 @@ function _waitingLabel(s) {
   // because the remedy is different: look at the composer, not a picker.
   if (s.composer_stuck_since) return 'unsubmitted text';
   if (wr === 'user_input') return 'needs input';
-  return 'needs input';
+  return 'waiting';
 }
 // Tooltip for a waiting badge: the stuck composer text, when that is the reason.
 function _waitingTitle(s) {
@@ -2878,30 +4773,116 @@ function _agentsChip(s) {
 let _workFrontier = {};
 let _workFrontierBusy = {};
 let _workFrontierReported = {};
+function _loadWorkFrontier(name) {
+  if (_workFrontierBusy[name]) return _workFrontierBusy[name];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  const request = fetch(API + '/api/board/ready?session=' + encodeURIComponent(name),
+    { headers: _authHeaders(), signal: controller.signal })
+    .then(async r => {
+      if (!r.ok) throw new Error('Queue request failed (' + r.status + ')');
+      const d = await r.json();
+      if (d.measured === false || !Array.isArray(d.ready) || !Array.isArray(d.wip?.holding)
+          || (d.session && d.session !== name)) throw new Error('Queue could not be measured');
+      const w = { ready: d.ready.length, readyCards: d.ready, claimable: d.claimable_now,
+        holding: d.wip.holding, cap: d.wip.cap, measured: true, ts: Date.now() };
+      _workFrontier[name] = w;
+      if (peekSession === name) updatePeekStatus();
+      return w;
+    })
+    .finally(() => { clearTimeout(timer); delete _workFrontierBusy[name]; });
+  _workFrontierBusy[name] = request;
+  return request;
+}
 function _workFrontierFor(name) {
   const c = _workFrontier[name];
   if (c && Date.now() - c.ts < 20000) return c;
-  if (!_workFrontierBusy[name]) {
-    _workFrontierBusy[name] = true;
-    fetch(API + '/api/board/ready?session=' + encodeURIComponent(name), { headers: _authHeaders() })
-      .then(r => r.json())
-      .then(d => {
-        _workFrontier[name] = {
-          ready: (d.ready || []).length,
-          readyCards: d.ready || [],
-          claimable: d.claimable_now,
-          holding: (d.wip || {}).holding || [],
-          // `measured` decides whether this may render at all: an unmeasured
-          // frontier reads as 0 ready and would quietly mean "nothing to do".
-          measured: d.measured !== false,
-          ts: Date.now(),
-        };
-        if (peekSession === name) updatePeekStatus();
-      })
-      .catch(() => {})
-      .finally(() => { _workFrontierBusy[name] = false; });
-  }
+  _loadWorkFrontier(name).catch(() => {});
   return c || null;
+}
+
+// The header badge must expose the whole queue, not just silently navigate to
+// its first holding card (AMUX-4361). Use the existing board editor for changes;
+// opening this inspector never changes task status or sends the worker a prompt.
+function _workQueueLog(name, verdict, extra = {}) {
+  fetch(API + '/api/client-debug', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'worker-queue', session: name, verdict, ...extra, ver: APP_VER }),
+  }).catch(() => {});
+}
+async function _openWorkQueue(name) {
+  document.getElementById('work-queue-dialog')?.close();
+  document.getElementById('work-queue-dialog')?.remove();
+  const dialog = document.createElement('dialog');
+  dialog.id = 'work-queue-dialog';
+  dialog.className = 'work-queue-dialog';
+  dialog.setAttribute('aria-labelledby', 'work-queue-title');
+  dialog.innerHTML = '<div class="work-queue-header"><h2 id="work-queue-title">'
+    + esc(name) + ' · Task queue</h2><button type="button" class="btn" data-queue-close aria-label="Close task queue">Close</button></div>'
+    + '<div class="work-queue-body" aria-live="polite">Loading task queue…</div>';
+  document.body.appendChild(dialog);
+  dialog.querySelector('[data-queue-close]').onclick = () => dialog.close();
+  dialog.addEventListener('keydown', e => e.stopPropagation());
+  const escape = e => {
+    if (e.key !== 'Escape' || !dialog.open) return;
+    e.preventDefault(); e.stopPropagation(); dialog.close();
+  };
+  // Refresh removes its focused button. Capture Escape even during that
+  // transition so it cannot close or send keys to the worker underneath.
+  window.addEventListener('keydown', escape, true);
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', () => {
+    window.removeEventListener('keydown', escape, true); dialog.remove();
+  }, { once: true });
+  dialog.showModal();
+  const body = dialog.querySelector('.work-queue-body');
+  const load = async () => {
+    body.textContent = 'Loading task queue…';
+    try {
+      const w = await _loadWorkFrontier(name);
+      if (!dialog.open) return;
+      const row = (id, title) => '<button type="button" class="work-queue-card" data-queue-card="'
+        + esc(id) + '"><span><strong>' + esc(id) + '</strong>'
+        + (title ? '<span class="work-queue-card-title">' + esc(title) + '</span>' : '')
+        + '</span><span class="work-queue-open">Open task →</span></button>';
+      body.innerHTML = '<p>' + (w.holding.length && w.claimable === 0
+        ? 'Current work is using all available task slots' + (Number.isFinite(w.cap) ? ' (limit: ' + w.cap + ')' : '') + '.'
+        : w.claimable > 0 ? w.claimable + ' task(s) can be picked up now.' : 'No task can be picked up right now.')
+        + ' Open a task to change its status or assigned worker. Move paused work to Backlog to free its slot.</p>'
+        + '<h3>Current work · ' + w.holding.length + '</h3>'
+        + (w.holding.map(id => row(id, (boardItems.find(i => i.id === id) || {}).title)).join('') || '<p>No current tasks.</p>')
+        + '<h3>Ready tasks · ' + w.ready + '</h3>'
+        + (w.readyCards.map(c => row(c.id, c.title)).join('') || '<p>No ready tasks.</p>')
+        + '<button type="button" class="btn" data-queue-refresh>Refresh queue</button>';
+      body.querySelector('[data-queue-refresh]').onclick = load;
+      body.querySelectorAll('[data-queue-card]').forEach(button => {
+        button.onclick = () => {
+          const id = button.dataset.queueCard;
+          _workQueueLog(name, 'open-task', { card_id: id });
+          dialog.close();
+          showToast('Opening ' + id + '…');
+          // Board details sit above peek; preserving peek preserves the worker
+          // draft and provides a useful Back target after managing the card.
+          openBoardDetail(id).then(() => {
+            if (boardDetailId === id && document.getElementById('board-detail-overlay').classList.contains('active')) {
+              boardDetailTab('edit');
+              document.getElementById('bd-tab-edit').focus({ preventScroll: true });
+            }
+          }).catch(() => showToast('Could not open ' + id, true));
+        };
+      });
+      if (!dialog.contains(document.activeElement)) dialog.querySelector('[data-queue-close]').focus();
+      _workQueueLog(name, 'loaded', { measured: true, n_considered: w.ready + w.holding.length,
+        ready: w.ready, holding: w.holding, claimable: w.claimable });
+    } catch (e) {
+      if (!dialog.open) return;
+      body.innerHTML = '<p role="alert">Could not load the task queue. Try again.</p>'
+        + '<button type="button" class="btn" data-queue-retry>Try again</button>';
+      body.querySelector('[data-queue-retry]').onclick = load;
+      _workQueueLog(name, 'load-failed', { measured: false });
+    }
+  };
+  await load();
 }
 // One diagnostic per distinct frontier shape. Both verdicts are useful in a
 // sweep: `queued-behind-wip` explains a healthy wait; `stalled` says there is
@@ -2937,12 +4918,12 @@ function _stalledChip(s) {
     const more = w.holding.length > 1 ? ' +' + (w.holding.length - 1) : '';
     _reportWorkFrontier(s, w, 'queued-behind-wip');
     return '<button type="button" class="status-badge waiting work-queued-chip" '
-      + 'onclick="event.stopPropagation();_openIssue(\'' + escJs(first) + '\')" '
+      + 'onclick="event.stopPropagation();_openWorkQueue(\'' + escJs(s.name) + '\')" '
       + 'title="' + esc(readyCard) + readyMore + ' queued behind current work: '
-      + esc(w.holding.join(', ')) + '. Open ' + esc(first) + '." '
-      + 'aria-label="' + esc(readyCard) + readyMore + ' queued behind current work ' + esc(first) + '">'
+      + esc(w.holding.join(', ')) + '. View and manage task queue." '
+      + 'aria-haspopup="dialog" aria-label="Manage task queue: ' + esc(readyCard) + readyMore + ' queued behind ' + esc(first) + '">'
       + '<span class="work-queued-wide">' + esc(readyCard) + readyMore + ' queued behind ' + esc(first) + more + '</span>'
-      + '<span class="work-queued-short">' + esc(readyCard) + readyMore + ' behind ' + esc(first) + more + '</span>'
+      + '<span class="work-queued-short">' + w.ready + ' queued ▾</span>'
       + '</button>';
   }
   _reportWorkFrontier(s, w, 'stalled');
@@ -2952,13 +4933,100 @@ function _stalledChip(s) {
     + w.ready + ' ready</span>';
 }
 
+async function _openStatusDetail(name) {
+  document.getElementById('status-detail-dialog')?.close();
+  document.getElementById('status-detail-dialog')?.remove();
+  const dialog = document.createElement('dialog');
+  dialog.id = 'status-detail-dialog';
+  dialog.className = 'work-queue-dialog';
+  dialog.innerHTML = '<div class="work-queue-header"><h2>' + esc(name) + ' · Status detail</h2>'
+    + '<button type="button" class="btn" data-close aria-label="Close">Close</button></div>'
+    + '<div class="work-queue-body" aria-live="polite">Loading…</div>';
+  document.body.appendChild(dialog);
+  dialog.querySelector('[data-close]').onclick = () => dialog.close();
+  dialog.addEventListener('keydown', e => e.stopPropagation());
+  const esc_ = e => { if (e.key === 'Escape' && dialog.open) { e.preventDefault(); e.stopPropagation(); dialog.close(); } };
+  window.addEventListener('keydown', esc_, true);
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', () => { window.removeEventListener('keydown', esc_, true); dialog.remove(); }, { once: true });
+  dialog.showModal();
+  const body = dialog.querySelector('.work-queue-body');
+  try {
+    const [peekRes, boardRes] = await Promise.all([
+      fetch('/api/sessions/' + encodeURIComponent(name) + '/peek?lines=15').then(r => r.json()).catch(() => null),
+      fetch('/api/board?session=' + encodeURIComponent(name) + '&status=doing&slim=0').then(r => r.json()).catch(() => []),
+    ]);
+    if (!dialog.open) return;
+    let html = '';
+    const cards = Array.isArray(boardRes) ? boardRes : [];
+    const blocked = cards.filter(c => c.blocked_on || (c.depends_on && c.depends_on.length));
+    if (blocked.length) {
+      html += '<h3>Blocked cards</h3>';
+      for (const c of blocked) {
+        html += '<div style="margin-bottom:8px;padding:8px;border-radius:6px;background:var(--surface)">'
+          + '<strong>' + esc(c.id) + '</strong> ' + esc(c.title || '') + '<br>';
+        if (c.blocked_on) html += '<span style="color:var(--red)">Blocked on: ' + esc(c.blocked_on) + '</span><br>';
+        if (c.depends_on && c.depends_on.length) html += '<span style="color:var(--orange,var(--yellow))">Waiting on: ' + c.depends_on.map(d => esc(d)).join(', ') + '</span><br>';
+        html += '</div>';
+      }
+    }
+    if (peekRes) {
+      const lines = (peekRes.output || '').split('\n').filter(l => l.trim());
+      const last = lines.slice(-12);
+      if (last.length) {
+        html += '<h3>Terminal</h3><pre style="font-size:0.8rem;max-height:200px;overflow:auto;padding:8px;border-radius:6px;background:var(--surface);white-space:pre-wrap;word-break:break-all;margin:0">'
+          + esc(last.join('\n')) + '</pre>';
+      }
+    }
+    if (!html) html = '<p>No specific blocker information available. Check the worker terminal directly.</p>';
+    body.innerHTML = html;
+  } catch (e) {
+    if (dialog.open) body.innerHTML = '<p role="alert">Could not load status details.</p>';
+  }
+}
+
+const _workerLifecyclePending = new Map();
+function _workerExecutionBadge(s, runtimeBoard) {
+  const pending = _workerLifecyclePending.get(s.name);
+  if (pending) return '<span class="status-badge idle">' + pending + '…</span>';
+  if (s.lifecycle === 'paused') return s.running
+    ? '<span class="status-badge blocked" title="Pause has not finished stopping this worker. Retry Pause.">pause incomplete</span>'
+    : '<span class="status-badge paused">paused</span>';
+  let badge = '';
+  if (s.status === 'starting') badge = '<span class="status-badge idle">starting</span>';
+  else if (!s.running) badge = '<span class="status-badge idle">stopped</span>';
+  else if (s.status === 'error') badge = '<button type="button" class="status-badge blocked" title="' + esc(s.error_detail || s.state_detail || 'Worker failed; inspect the terminal for the provider error') + '" onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">error ▾</button>';
+  else if (s.status === 'active')  badge = runtimeBoard.syncing
+    ? _runtimeBoardSyncBadge()
+    : '<span class="status-badge active">working</span>' + _agentsChip(s)
+      + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
+  else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
+  else if (s.status === 'blocked') badge = '<button type="button" class="status-badge blocked" title="Agent is waiting on a permission decision. Click for details." onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">blocked ▾</button>';
+  else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
+  else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
+  else if (s.status === 'api_error') badge = `<button type="button" class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;." onclick="event.stopPropagation();_openStatusDetail('${escJs(s.name)}')">API ${esc(s.api_error_code || '5xx')} ▾</button>`;
+  else if (s.status === 'idle')    badge = '<span class="status-badge idle"' + _idleMovedTitle(s) + '>idle' + _idleMovedSuffix(s) + '</span>';
+
+  return badge;
+}
+
 function updatePeekStatus() {
   const el = document.getElementById('peek-session-status');
   if (!el || !peekSession) { if (el) el.innerHTML = ''; return; }
-  const s = sessions.find(s => s.name === peekSession);
+  const identity = _peekIdentity();
+  const overlay = document.getElementById('peek-overlay');
+  if (!overlay || overlay.dataset.session !== identity.name
+      || overlay.dataset.generation !== String(identity.generation)) {
+    _peekIdentityDiscard('peek-status', identity, overlay && overlay.dataset.session || '');
+    el.innerHTML = '';
+    return;
+  }
+  const s = sessions.find(s => s.name === identity.name);
   if (!s) { el.innerHTML = ''; return; }
+  _bindPeekTaskIdentity(s, identity);
   _renderPeekWorkerActions(s);
   let badge = '';
+  const runtimeBoard = _runtimeBoardPresentation(s);
   // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
   // need the task name, status and model"). `_liveWorkLine` used to append the
   // worker's current progress line — "Perusing… (4m 11s · ↓ 5.4k tokens)" — up
@@ -2971,13 +5039,9 @@ function updatePeekStatus() {
   // the same output live, so this was a lossy 60-char summary of something
   // already on screen. amux is mobile-first — when the phone and a nice-to-have
   // trade off, the phone wins.
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
-  else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
-  else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
-  else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
-  else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>' + _stalledChip(s);
-  else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
-  if (s.rate_limited_until) {
+  badge = _workerExecutionBadge(s, runtimeBoard);
+  if (s.running && s.status === 'idle') badge += _stalledChip(s);
+  if (s.running && s.rate_limited_until) {
     const _lbl = s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until';
     badge += `<span class="status-badge rate-limited" style="margin-left:6px;">${_lbl} ${_fmtResetTime(s.rate_limited_until)}</span>`;
   }
@@ -2985,9 +5049,9 @@ function updatePeekStatus() {
   // Update input placeholder based on session state
   const cmdInp = document.getElementById('peek-cmd-input');
   if (cmdInp) {
-    cmdInp.placeholder = s.status === 'active'
-      ? 'Type a message (worker is working)...'
-      : 'Type a message or drop a file...';
+    // Working state is already shown above; repeating it here clips the
+    // empty prompt inside the deliberately single-row phone composer.
+    cmdInp.placeholder = 'Message…';
   }
   // Model badge (+ reasoning effort, Claude only)
   const mb = document.getElementById('peek-model-badge');
@@ -3021,6 +5085,7 @@ function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'gemini') return 'Gemini';
   if (provider === 'ollama') return 'Ollama';
+  if (provider === 'muse') return 'Muse Code';
   if (provider === 'iterm2') return 'iTerm2';
   if (provider === 'grok') return 'Grok';
   return 'Claude';
@@ -3028,7 +5093,12 @@ function providerLabel(provider) {
 
 function sessionProvider(s) {
   const p = ((s && s.provider) || 'claude').toLowerCase();
-  return (p === 'codex' || p === 'gemini' || p === 'ollama' || p === 'iterm2' || p === 'grok') ? p : 'claude';
+  // A provider missing from this list does not render as itself — it renders as
+  // CLAUDE, silently, because the fallback is a value rather than a failure. A
+  // muse lane would have shown a Claude badge, a Claude model and Claude's yolo
+  // flag while running `muse`. Anything added to SESSION_PROVIDERS server-side
+  // belongs here too.
+  return (p === 'codex' || p === 'gemini' || p === 'ollama' || p === 'muse' || p === 'grok' || p === 'iterm2') ? p : 'claude';
 }
 
 function providerDefaultModel(provider) {
@@ -3036,6 +5106,7 @@ function providerDefaultModel(provider) {
   if (provider === 'gemini') return 'auto';
   if (provider === 'ollama') return 'qwen3.8:27b';
   if (provider === 'grok') return 'grok-4.6';
+  if (provider === 'muse') return 'muse-spark-1.3-contributor';
   return window._AMUX_DEFAULT_MODEL || 'sonnet';
 }
 
@@ -3046,7 +5117,10 @@ function sessionConfiguredModel(s) {
 
 function providerYoloFlag(provider) {
   if (provider === 'codex' || provider === 'ollama') return '--dangerously-bypass-approvals-and-sandbox';
-  if (provider === 'gemini') return '--yolo';
+  // muse spells it like gemini, NOT like codex: `--yolo` (it also accepts
+  // --disable-approval/--disable-sandbox separately). Sending codex's
+  // --dangerously-bypass-approvals-and-sandbox to muse is an unknown flag.
+  if (provider === 'gemini' || provider === 'muse') return '--yolo';
   return '--dangerously-skip-permissions';
 }
 
@@ -3068,9 +5142,8 @@ function stripProviderYoloFlags(flags) {
 function _restoreCardFocus(focusedId, savedInputs) {
   // Rehydrate persisted composer drafts on every render path. Done HERE rather
   // than at each of render()'s exits because it has six of them, and the one
-  // that gets missed is the one that eats your text. _draftRestore is a no-op
-  // for a composer that already has content or is focused, so a re-render
-  // mid-type never rewinds you.
+  // that gets missed is the one that eats your text. Edits commit synchronously,
+  // so the draft is authoritative even when the DOM snapshot is older.
   try {
     document.querySelectorAll('#cards textarea.send-input').forEach(inp => {
       if ((inp.id || '').startsWith('input-')) _draftRestore(inp, inp.id.slice(6));
@@ -3122,22 +5195,137 @@ function _cardBoardStatusCounts(name) {
   });
   return counts;
 }
-// The ONE board card a worker explicitly claims through `task_board_id`.
-//
-// Do not derive this from "worker active + card doing". A worker may have more
-// than one historical/captured card in doing (TubeScience had four), while one
-// terminal turn can execute only one parent task. The old newest-doing fallback
-// made all four cards say "Working now" and could also replace the task named by
-// the status hook with whichever card happened to be touched last. An active
-// worker can also be answering an informational message that correctly produced
-// no card. Runtime activity is not a board error state; guessing a task is wrong.
+// The server's measured runtime/board object is the ONE source for a worker's
+// active card. `boardItems` may arrive before or after it, so it may decorate a
+// board row but can never decide the worker's badge, task, or card link.
+function _runtimeBoardCardId(s) {
+  const truth = s && s.runtime_board;
+  if (!truth || truth.measured !== true || truth.status !== 'linked') return '';
+  return String(truth.card_id || '').trim();
+}
+
 function _cardDoingItem(name) {
   const session = (sessions || []).find(s => s.name === name);
-  const claimed = String(session && session.task_board_id || '').trim();
+  const claimed = _runtimeBoardCardId(session);
   if (!claimed) return null;
   return (boardItems || []).find(c =>
     !c.deleted && !c.archived && c.session === name && c.status === 'doing' && c.id === claimed
   ) || null;
+}
+
+// Runtime activity remains visible even when its task is filtered out, the
+// board has not loaded, or the last claim no longer matches a Doing card.
+// An observed stale claim is a navigation aid, never promoted to a live claim.
+function _workerHasLiveActivity(s) {
+  if (!s?.running || s.archived || ['paused','archived','expired'].includes(s.lifecycle)) return false;
+  const truth = s.runtime_board || {};
+  return truth.measured === true ? truth.runtime_status === 'active' : s.status === 'active';
+}
+
+function _boardActivityEntries(workerName) {
+  return (sessions || []).filter(s => {
+    if (workerName && s.name !== workerName) return false;
+    return _workerHasLiveActivity(s);
+  }).map(s => {
+    const truth = s.runtime_board || {};
+    const cardId = _runtimeBoardCardId(s);
+    const observedId = truth.measured === true ? String(truth.observed_card_id || '') : '';
+    const id = cardId || observedId;
+    const card = (boardItems || []).find(c => c.id === id && !c.deleted);
+    return { name: s.name, cardId, observedId, linked: !!cardId,
+      cardless: truth.status === 'cardless-allowed',
+      title: card ? card.title : (cardId && s.task_source === 'board' ? s.task_name : ''),
+      status: card ? card.status : '', verdict: truth.verdict || truth.status || 'unmeasured' };
+  });
+}
+
+function _boardActivityForCard(item) {
+  const session = (sessions || []).find(s => s.name === item.session);
+  const id = _runtimeBoardCardId(session) || String(session?.runtime_board?.observed_card_id || '');
+  if (!id || id !== item.id) return null;
+  return _boardActivityEntries(item.session).find(a => (a.cardId || a.observedId) === item.id) || null;
+}
+
+function _renderBoardActivity(host, workerName, insideHost = true) {
+  if (!host || !host.parentNode) return;
+  const id = host.id + '-activity';
+  let strip = document.getElementById(id);
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.id = id;
+    strip.className = 'board-activity';
+    strip.setAttribute('aria-label', 'Current worker activity');
+    if (insideHost) host.insertBefore(strip, host.firstChild);
+    else host.parentNode.insertBefore(strip, host);
+  }
+  const entries = _boardActivityEntries(workerName);
+  strip.hidden = !entries.length;
+  strip.innerHTML = entries.map(a => {
+    const id = a.cardId || a.observedId;
+    const state = a.linked ? 'Working now' : a.cardless ? 'Working · conversation' : 'Working · task link missing or out of date';
+    const label = id ? (a.linked ? '' : 'Last linked: ') + id + (a.title ? ' · ' + a.title : '') : '';
+    return '<div class="board-activity-item' + (!a.linked && !a.cardless ? ' board-activity-unlinked' : '') + '" data-worker="' + esc(a.name) + '" data-card-id="' + esc(id) + '">'
+      + '<div class="board-activity-copy"><strong>' + esc(a.name) + '</strong> <span>' + state + '</span>'
+      + (id ? '<button class="board-activity-task" onclick="openBoardDetail(\'' + escJs(id) + '\')">' + esc(label) + '</button>' : '')
+      + (!a.linked && !a.cardless ? '<div class="board-activity-note">No current board task is confirmed. Open the terminal to see the running work.</div>' : '') + '</div>'
+      + '<button class="btn btn-sm" onclick="openPeek(\'' + escJs(a.name) + '\')">Open terminal</button></div>';
+  }).join('');
+}
+
+function _refreshBoardActivityOnSessions() {
+  const signature = JSON.stringify(_boardActivityEntries());
+  if (window._boardLiveSig === signature) return;
+  window._boardLiveSig = signature;
+  if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
+  if (activeView === 'board') renderBoard();
+  const pane = document.getElementById('peek-issues-panel');
+  if (pane && pane.classList.contains('active')) renderPeekIssues();
+}
+
+// A card's runtime badge, text and link make one statement. The server owns
+// that statement; when an old cache/response lacks the measured object, or the
+// object reports a contradiction, rendering a neutral synchronization state is
+// more honest than rebuilding WORKING from a separate board snapshot.
+function _runtimeBoardPresentation(s) {
+  if (!s || s.status !== 'active') return { syncing: false, cardless: false, cardId: '' };
+  const truth = s.runtime_board;
+  if (!truth || truth.measured !== true) return { syncing: true, cardless: false, cardId: '' };
+  const status = String(truth.status || truth.verdict || '');
+  if (status === 'cardless-allowed') return { syncing: false, cardless: true, cardId: '' };
+  const cardId = String(truth.card_id || '').trim();
+  if (status !== 'linked' || !cardId) {
+    return { syncing: true, cardless: false, cardId: '' };
+  }
+  return { syncing: false, cardless: false, cardId };
+}
+
+function _runtimeBoardSyncBadge() {
+  return '<span class="status-badge active" title="The worker is running; the board link is still being resolved after a restart.">working</span>';
+}
+
+function _runtimeBoardCardlessBadge() {
+  return '<span class="status-badge" style="margin-left:4px;" title="The server measured this as an explicit informational or control turn, not board work.">cardless turn</span>';
+}
+
+function _runtimeBoardSplitBadge(s) {
+  if (!s || s.status !== 'unattributed') return '';
+  const truth = s.runtime_board || {};
+  const verdict = String(truth.verdict || 'unattributed');
+  const observed = truth.observed_card_id ? ' Observed ' + esc(truth.observed_card_id) + '.' : '';
+  const isRunning = truth.runtime_status === 'active';
+  if (verdict === 'active-conflicting-claims') {
+    // Competing claims are harness bookkeeping, not a human decision. The
+    // board driver gives the full set back to the model to reconcile; keep the
+    // operator-facing state about execution instead of inventing a red status.
+    return '<span class="status-badge active" title="Working while AMUX automatically reconciles multiple live task claims.'
+      + observed + ' Diagnostic: ' + esc(verdict) + '.">working</span>';
+  }
+  if (isRunning) {
+    return '<span class="status-badge active" title="Running. Board link: ' + esc(verdict) + '.'
+      + observed + '">working</span>';
+  }
+  return '<span class="status-badge waiting" title="' + esc(verdict) + '.'
+    + observed + '">working</span>';
 }
 
 // Turn the board-drive trace into the smallest useful operator explanation.
@@ -3188,7 +5376,7 @@ function _nudgeWorkersOnBoardChange() {
   } catch (e) { /* a render hiccup must not break the ingest that called us */ }
 }
 function _grpMembers(g) {
-  const all = (sessions || []).filter(s => !s.archived);
+  const all = (sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused');
   return all.filter(s => (s.tags || []).includes(g));
 }
 function _grpSummary(g) {
@@ -3247,6 +5435,8 @@ function _workerActionDefinitions(s) {
     { key: 'task-label', icon: '&#x270F;', label: 'Task label' + (s.task_override ? '' : ' (none)'),
       run: "editField('" + name + "','task','" + escJs(s.task_override || '') + "')" },
     { separator: true },
+    { key: 'task-queue', icon: '&#x2637;', label: 'Task queue',
+      run: "closeAllMenus();_openWorkQueue('" + name + "')" },
     { key: 'peek-terminal', icon: '&#x1F4BB;', label: 'Peek terminal',
       run: "closeAllMenus();openPeek('" + name + "')" },
     { key: 'read-latest', icon: '&#x1F50A;', label: 'Read latest message',
@@ -3285,8 +5475,10 @@ function _workerActionDefinitions(s) {
       labelHtml: 'Spans groups' + _spansLabel(s),
       title: 'Let this worker message workers in other groups according to its resolved cross-group configuration.',
       run: "toggleSpansGroups('" + name + "')" },
-    { key: 'directory', icon: '&#x1F4C1;', label: 'Directory',
+    { key: 'directory', icon: '&#x1F4C1;', label: 'Change directory',
       run: "editField('" + name + "','dir','" + escJs(s.dir || '') + "')" },
+    s.dir ? { key: 'copy-directory-link', icon: '&#x1F517;', label: 'Copy directory link',
+      run: "closeAllMenus();_copyFileDeeplink('" + escJs(s.dir) + "')" } : null,
     s.running ? { key: 'restart', icon: '&#x21BB;', label: 'Restart',
       run: "closeAllMenus();doRestart('" + name + "')" } : null,
     s.running ? { key: 'stop', icon: '&#x23F9;', label: 'Stop',
@@ -3299,6 +5491,9 @@ function _workerActionDefinitions(s) {
       run: "newConversation('" + name + "'," + (s.running ? 'true' : 'false') + ")" },
     { key: 'share', icon: '&#x1F517;', label: 'Share link',
       run: "closeAllMenus();shareSession('" + name + "')" },
+    s.lifecycle === 'paused' && !s.running
+      ? { key: 'resume', icon: '&#x25B6;', label: 'Resume', run: "resumeWorker('" + name + "')" }
+      : { key: 'pause', icon: '&#x23F8;', label: 'Pause', run: "pauseWorker('" + name + "')" },
     { key: 'archive', icon: '&#x1F4E6;', label: 'Archive',
       run: "archiveSession('" + name + "')" },
     { separator: true },
@@ -3409,7 +5604,7 @@ function render() {
   renderActiveFilters();
   // Build tag filter bar
   const tagEl = document.getElementById('tag-filters');
-  const allTags = [...new Set(sessions.filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
+  const allTags = [...new Set(sessions.filter(s => !s.archived && s.lifecycle !== 'paused').flatMap(s => s.tags || []))].sort();
   if (activeTag && !allTags.includes(activeTag)) activeTag = null;
   // Pills FILTER the worker list. Nothing more.
   //
@@ -3438,9 +5633,11 @@ function render() {
   _renderGroupsTab();
   const stripEl = document.getElementById('grp-scope-strip');
   if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
-  const _nonArchivedCount = sessions.filter(s => !s.archived).length;
+  const _nonArchivedCount = sessions.filter(s => !s.archived && s.lifecycle !== 'paused').length;
   if (!_nonArchivedCount && !drafts.length) {
-    if (_initialLoad) {
+    if (_sessionLoadError) {
+      el.innerHTML = ''; // Actionable detail is in the Sync error badge modal.
+    } else if (_initialLoad) {
       // A SPINNER THAT NEVER RESOLVES IS A LIE (amux-cloud, AC-275, 2026-08-06).
       // _initialLoad clears on ANY successful /api/sessions fetch, empty list
       // included — so a spinner still showing means the fetch never COMPLETED,
@@ -3456,12 +5653,16 @@ function render() {
         ? '<div class="empty">Can\u2019t reach the server \u2014 ' + consecutiveFailures +
           ' failed attempt' + (consecutiveFailures === 1 ? '' : 's') + '.<br>' +
           '<span style="color:var(--dim);font-size:0.85rem;">This is a connection problem, not an ' +
-          'empty workspace. Workers may exist and be unreachable.</span></div>'
-        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…</div>';
+          'empty workspace. Workers may exist and be unreachable.</span><br>' +
+          '<a href="/api/_clear_sw" style="color:var(--accent);font-size:0.8rem;">Clear cache &amp; reload</a></div>'
+        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…<br>' +
+          '<a href="/api/_clear_sw" style="color:var(--dim);font-size:0.75rem;margin-top:8px;display:inline-block;">Stuck? Clear cache</a></div>';
     } else {
-      el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
+      el.innerHTML = '<div class="empty">' + (sessions.some(s => s.lifecycle === 'paused') ? 'No active workers. Resume a paused worker to continue.' : 'No workers yet.<br>Tap <strong>+</strong> to create one.') +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
+    _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -3485,7 +5686,7 @@ function render() {
   }).join('');
 
   // Filter by tag (exclude archived from main view)
-  let list = (activeTag ? sessions.filter(s => (s.tags || []).includes(activeTag)) : sessions).filter(s => !s.archived);
+  let list = (activeTag ? sessions.filter(s => (s.tags || []).includes(activeTag)) : sessions).filter(s => !s.archived && s.lifecycle !== 'paused');
   // Filter by search query
   const q = searchQuery.toLowerCase().trim();
   let filtered = q ? list.filter(s =>
@@ -3501,6 +5702,8 @@ function render() {
   if (filterStatuses.size) filtered = filtered.filter(s => filterStatuses.has(_sessStatusKey(s)));
   if ((q || activeTag || filterProviders.size || filterModels.size || filterStatuses.size) && !filtered.length) {
     el.innerHTML = '<div class="empty">No matching workers.</div>';
+    _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -3522,15 +5725,14 @@ function render() {
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
-    const liveBoardTask = _cardDoingItem(s.name);
-    // A board transition and the next sessions poll are not atomic. Render the
-    // SSE-synced doing card immediately, then naturally converge on the server
-    // fields on the next poll. This also repairs old/stale task summaries while
-    // the board has a stronger, current fact.
-    const displayTaskName = liveBoardTask ? (liveBoardTask.title || liveBoardTask.id) : (s.task_name || '');
-    const displayTaskSource = liveBoardTask ? 'board' : s.task_source;
-    const displayTaskBoardId = liveBoardTask ? liveBoardTask.id : s.task_board_id;
-    const taskStale = liveBoardTask ? 0 : _taskStaleAge(s);
+    const runtimeBoard = _runtimeBoardPresentation(s);
+    // The measured object and the task text were serialized together by the
+    // server. Do not let a faster/slower board poll replace either side with a
+    // different snapshot; it is presentation-only evidence for the board view.
+    const displayTaskName = s.task_name || runtimeBoard.cardId || '';
+    const displayTaskSource = runtimeBoard.cardId ? 'board' : s.task_source;
+    const displayTaskBoardId = runtimeBoard.cardId;
+    const taskStale = runtimeBoard.cardId ? 0 : _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && displayTaskSource === 'board';   // stale board title shown as last resort
     // AF-148: a lane with no active card falls back to its static DESCRIPTION,
@@ -3548,9 +5750,9 @@ function render() {
     // Same discriminator the stale case already uses, applied to the case it
     // skipped. Not a mood, not a guess: the field was in the payload the whole
     // time and one consumer read it for one branch.
-    const taskIsDesc = displayTaskSource === 'desc' && !!displayTaskName;
+    const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
     return `
-    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
+    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" data-pinned="${s.pinned ? '1' : '0'}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
@@ -3561,18 +5763,10 @@ function render() {
         </div>
         </div>
         ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
-${/* A lane at a limit banner is not WORKING, and a working lane is not
-              limited — showing both asserts a contradiction (Ethan's screenshot:
-              three lanes wearing WORKING + RATE-LIMITED at once, because a turn
-              that hits the banner never fires Stop and the active latch keeps
-              claiming work). The payload now only reports FUTURE limits, so when
-              rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
-          ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
-          ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
-          ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
-          ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
-          ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code || '5xx')}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
+          ${!s.running || !s.rate_limited_until ? _workerExecutionBadge(s, runtimeBoard) : ''}
+          ${s.running && s.status === 'waiting' ? _stalledFor(s) : ''}
+          ${s.running && s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
+          ${s.running && s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
           ${_steerHumanCount(s) ? `<span class="status-badge steering" title="${_steerHumanCount(s)} steering message${_steerHumanCount(s)>1?'s':''} queued">${_steerHumanCount(s)} queued</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
           ${(() => {
@@ -3615,12 +5809,12 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
         </div>` : ''}
       </div>
-      ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.dir)}">${esc(s.dir)}</span></div>` : ''}
+      ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.worktree_active ? '~/.amux/worktrees/' + s.name : s.dir)}">${esc(s.worktree_active ? '~/.amux/worktrees/' + s.name : s.dir)}</span></div>` : ''}
       ${s.creator ? `<div class="card-dir" style="font-size:0.72rem;">${esc(s.creator)}</div>` : ''}
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
 
-      ${!isExp && displayTaskName ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(displayTaskName)}${_taskIdChip({task_board_id: displayTaskBoardId})}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
+      ${!isExp && displayTaskName ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${displayTaskBoardId ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : esc(displayTaskName)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
       ${logSearchMode && _logMatches[s.name] ? (() => {
         const hits = _logMatches[s.name];
@@ -3629,10 +5823,12 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           `<div class="card-log-hit" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}',hitIdx:${hi}})"><span class="log-hit-loc">${esc(s.name)}:${h.line}</span> <span class="log-hit-text">${esc(h.text.slice(0, 80))}</span></div>`
         ).join('') + (hits.length > 2 ? `<div class="card-log-hit" style="color:var(--dim);font-style:italic;" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}'})">+${hits.length - 2} more matches</div>` : '');
       })() : ''}
-      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length) ? `<div class="badges">
+      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length || s.worktree_active || s.ephemeral) ? `<div class="badges">
         ${s.backend === 'herdr' ? `<span class="badge herdr" title="Hosted on herdr">herdr</span>` : ''}
         ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
         ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
+        ${s.worktree_active ? '<span class="badge worktree" title="Running in an isolated git worktree">worktree</span>' : ''}
+        ${s.ephemeral ? `<span class="badge ephemeral" title="Ephemeral fan-out worker${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}">eph${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}</span>` : ''}
         ${effort ? `<span class="badge effort" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Reasoning effort — click to change">${esc(effort)}</span>` : ''}
         ${(s.tags||[]).map(g => `<span class="grp-chip" title="Filter by group ${esc(g)}" onclick="event.stopPropagation();toggleTagFilter('${escJs(g)}')">${esc(g)}</span>`).join('')}
         ${model ? `<span class="badge model card-model-inline" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Change model">${esc(model)}</span>` : ''}
@@ -3641,7 +5837,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
       </div>` : ''}
       <div class="panel" onclick="event.stopPropagation()">
-        ${isExp && displayTaskName ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>${_taskIdChip({task_board_id: displayTaskBoardId})}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
+        ${isExp && displayTaskName ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Open the active board card" style="font-weight:600;">${displayTaskBoardId ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : `<span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>`}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
         ${isExp && s.running ? `<div class="card-timing">
           ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
           ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
@@ -3661,7 +5857,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
             onkeydown="cardSlashAcKeydown('${s.name}',event)"
             onpaste="handleCardPaste('${s.name}',event)"
             onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
-          <div class="send-split${_sendMode === 'queue' ? ' mode-queue' : ''}"><button class="btn primary send-split-main" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">${_sendMode === 'queue' ? 'Queue' : 'Send'}</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
+          <div class="send-split${_sendMode === 'queue' ? ' mode-queue' : ''}"><button class="btn primary send-split-main" ${_composerPendingSends.has(s.name) ? 'disabled' : ''} onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">${_sendMode === 'queue' ? 'Queue' : 'Send'}</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
         </div>` : ''}
       </div>
     </div>`;
@@ -3673,6 +5869,8 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     el.innerHTML = draftCards + frozenList.map(_renderSessionCard).join('');
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
+    _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     requestAnimationFrame(initSortable);
     requestAnimationFrame(() => { document.querySelectorAll('.chips[id^="card-chips-"]').forEach(el => { const name = el.id.replace('card-chips-', ''); if (name) renderChips(el, name, false); }); });
@@ -3684,8 +5882,11 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     let sortedFiltered;
     sortedFiltered = [...filtered].sort(_sortFnFor(sortMode));
     el.innerHTML = draftCards + sortedFiltered.map(_renderSessionCard).join('');
+    _checkWorkerStatusOrder();
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
+    _renderPausedSection();
+    _renderExpiredSection();
     _renderArchivedSection();
     requestAnimationFrame(initSortable);
     requestAnimationFrame(() => {
@@ -3699,21 +5900,19 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
 
   // Group mode: group by session status
   if (layoutMode === 'group' && !activeTag && !q) {
-    const STATUS_GROUPS = [
-      { key: 'active',  label: 'Working',     defaultOpen: true  },
-      { key: 'waiting', label: 'Needs Input', defaultOpen: true  },
-      { key: 'api_error', label: 'API Error', defaultOpen: true  },
-      { key: 'idle',    label: 'Idle',        defaultOpen: true  },
-      { key: 'stopped', label: 'Stopped',     defaultOpen: false },
-    ];
-    const buckets = { active: [], waiting: [], api_error: [], idle: [], stopped: [] };
-    filtered.forEach(s => {
-      if (!s.running)              buckets.stopped.push(s);
-      else if (s.status === 'active')  buckets.active.push(s);
-      else if (s.status === 'waiting') buckets.waiting.push(s);
-      else if (s.status === 'api_error') buckets.api_error.push(s);
-      else                             buckets.idle.push(s);
-    });
+    // PINNED IS A GROUP, NOT A TIE-BREAK (Ethan, 2026-09-09: "pinned workers
+    // should be pinned to the top"). Pinning used to sort only WITHIN a status
+    // bucket, so a pinned idle worker still sat below every working one — the
+    // pin moved it a few rows inside a group the reader had to scroll to. The
+    // menu item says "Pin to top", so the pin has to outrank the grouping it
+    // sits in, which means lifting those workers out of their status bucket
+    // into a group of their own at the top.
+    const pinned = filtered.filter(s => s.pinned);
+    const STATUS_GROUPS = pinned.length
+      ? [{ key: '_pinned', label: 'Pinned', defaultOpen: true }, ..._WORKER_STATUS_GROUPS]
+      : _WORKER_STATUS_GROUPS;
+    const buckets = Object.fromEntries(STATUS_GROUPS.map(g => [g.key, []]));
+    filtered.forEach(s => buckets[s.pinned && pinned.length ? '_pinned' : _sessStatusKey(s)].push(s));
     // Sort within each bucket: alpha (pinned → name) or pinned → last activity
     for (const key of Object.keys(buckets)) {
       if (sortMode !== 'natural') {
@@ -3747,7 +5946,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
       });
       el.innerHTML = draftCards + groupHtml;
     } else {
-      el.innerHTML = draftCards + filtered.map(_renderSessionCard).join('');
+      el.innerHTML = draftCards + (nonEmpty.length ? buckets[nonEmpty[0].key] : []).map(_renderSessionCard).join('');
     }
   } else {
     // list mode (flat) or group mode with active filter: flat list
@@ -3755,6 +5954,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     el.innerHTML = draftCards + flatList.map(_renderSessionCard).join('');
     if (layoutMode === 'list') requestAnimationFrame(initSortable);
   }
+  _checkWorkerStatusOrder();
   _updateResetBtn();
 
   // Restore input values, cursor positions and focus after re-rendering
@@ -3764,6 +5964,8 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
   }
   _restoreCardFocus(focusedId, savedInputs);
 
+  _renderPausedSection();
+  _renderExpiredSection();
   _renderArchivedSection();
 
   // Hydrate customizable chip bars on all session cards
@@ -3858,7 +6060,85 @@ function _taskIdChip(s) {
     + 'title="Open board card ' + esc(id) + '" '
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
+
+// A rendered worker/card pair is one immutable selection. If either side has
+// moved by click time, the DOM is stale and must not open/edit whatever the
+// mutable globals happen to name now. This is the card-side twin of the peek
+// open-generation guard.
+function _openWorkerCard(worker, cardId) {
+  const name = String(worker || '');
+  const id = String(cardId || '');
+  const session = (sessions || []).find(s => s.name === name);
+  const current = _runtimeBoardCardId(session);
+  if (!name || !id || current !== id) {
+    _peekIdentityDiscard('worker-card-link', { name, generation: _peekOpenGeneration }, id);
+    showToast(id + ' is no longer ' + name + '\'s active task — refreshed instead');
+    render();
+    return;
+  }
+  _openIssue(id);
+}
+
+function _activeTaskLink(worker, cardId, title) {
+  return '<button type="button" class="worker-active-task-link" data-worker="' + esc(worker)
+    + '" data-card="' + esc(cardId) + '" onclick="event.stopPropagation();_openWorkerCard(\''
+    + escJs(worker) + '\',\'' + escJs(cardId) + '\')" '
+    + 'aria-label="Open active task ' + esc(cardId) + ' for ' + esc(worker) + '" '
+    + 'title="Open board card ' + esc(cardId) + '" style="background:none;border:0;padding:0;'
+    + 'font:inherit;font-weight:inherit;color:inherit;text-align:left;cursor:pointer;">'
+    + esc(title) + ' <span class="task-id-chip" style="font-size:0.7rem;color:var(--accent);'
+    + 'border:1px solid var(--accent);border-radius:6px;padding:0 6px;white-space:nowrap;">'
+    + esc(cardId) + '</span></button>';
+}
+
+function _bindPeekTaskIdentity(s, identity) {
+  const row = document.getElementById('peek-task-row');
+  const label = document.getElementById('peek-task-label');
+  if (!row || !label || !_peekIdentityCurrent(identity) || !s || s.name !== identity.name) return;
+  const runtime = _runtimeBoardPresentation(s);
+  const cardId = runtime.cardId || '';
+  const title = runtime.syncing
+    ? 'Synchronizing runtime/board truth…'
+    : (s.task_name || cardId || '');
+  row.style.display = title ? 'flex' : 'none';
+  label.textContent = title;
+  label.dataset.worker = s.name;
+  label.dataset.card = cardId;
+  label.title = cardId ? 'Open active board card ' + cardId : 'Edit task label';
+  label.onclick = (event) => {
+    event.stopPropagation();
+    if (!_peekIdentityCurrent(identity)) {
+      _peekIdentityDiscard('peek-task-link', identity, label.dataset.card || '');
+      return;
+    }
+    if (cardId) _openWorkerCard(s.name, cardId);
+    else editField(s.name, 'task', s.task_override || '');
+  };
+}
 async function _askCardStatus(id, sess) {
+  // The list item can be stale exactly when this button is most useful: an old
+  // client may still call the terminal Refresh button after a worker has
+  // closed the card. Read the detail record FIRST, then decide whether a
+  // provider request is allowed. Deciding from `boardItems` before the GET
+  // reopens the ATE-75 race and lets a stale client overwrite a final outcome.
+  const refreshed = await _bdHydrate(id);
+  if (!refreshed) {
+    showToast('Could not refresh card status from the board');
+    return;
+  }
+  const current = boardItems.find(i => i.id === id);
+  const terminal = /^(done|verified|discarded)$/i.test(String(
+    (current && current.status) || (id === boardDetailId && boardDetailStatus) || ''));
+  if (terminal) {
+    // A terminal card already has an authoritative board outcome. Refresh it
+    // from the durable detail record; asking a worker here would reintroduce
+    // provider-text parsing and could overwrite the final outcome with stale
+    // model prose.
+    showToast(refreshed
+      ? 'Refreshed final terminal summary from the board'
+      : 'Could not refresh final terminal summary');
+    return;
+  }
   // Ask the owning session to report status onto the board (AMUX-2174). The
   // session's model authors the answer; amux only routes + records.
   try {
@@ -3894,6 +6174,38 @@ function _taskStaleAge(s) {
   if (!s.task_board_age) return '';
   return Math.floor(s.task_board_age / 86400) + 'd';
 }
+// AMUX-4879. `idle` is an INSTANTANEOUS between-turn sample, so a lane that
+// closes a card every half hour reads idle on most samples, identically to one
+// that has not moved a card in thirty hours. That ambiguity produced the same
+// wrong conclusion twice, from two different readers: Ethan reported three
+// fan-out workers as stalled, and the lane triaging that report repeated the
+// error before board_change_log showed 43 transitions in the previous 24h.
+//
+// So idle is never rendered bare. `last_board_change_ts` (float SECONDS, from
+// board_change_log) is the discriminator.
+//
+// 0 MEANS NEVER, NOT JUST NOW. timeAgo() returns '' for 0, which would put the
+// bare badge back, so the never case is spelled out instead of left blank.
+//
+// COMPACT ON PURPOSE: this badge sits in the worker list, which has to survive
+// 375px per .claude/rules/css-mobile.md. The badge carries "19m"; the full
+// sentence goes in the title where it costs no width.
+function _idleMovedAt(s) {
+  const at = Number(s && s.last_board_change_ts);
+  return Number.isFinite(at) && at > 0 ? at : 0;
+}
+function _idleMovedSuffix(s) {
+  const at = _idleMovedAt(s);
+  if (!at) return ' · never';
+  return ' · ' + esc(timeAgo(at).replace(/ ago$/, ''));
+}
+function _idleMovedTitle(s) {
+  const at = _idleMovedAt(s);
+  return at
+    ? ' title="Idle right now. Last moved a board card ' + esc(timeAgo(at)) + '."'
+    : ' title="Idle right now, and this lane has never moved a board card."';
+}
+
 function timeAgo(epoch) {
   if (!epoch) return '';
   const diff = Math.floor(Date.now()/1000) - epoch;
@@ -4242,7 +6554,13 @@ function toggleMenu(name) {
 function _menuScrollClose(e) {
   // Scrolls INSIDE the open menu (it has overflow-y:auto) must not close it.
   const el = openMenu && document.getElementById('menu-' + openMenu);
-  if (el && e.target instanceof Node && el.contains(e.target)) return;
+  if (el && e.target instanceof Node) {
+    if (el.contains(e.target)) return;
+    // Only scrolling an ancestor of the trigger moves its anchor. A delayed
+    // scroll in a closed terminal or another panel must not dismiss this menu.
+    const anchor = el._menuOrigParent;
+    if (anchor && !e.target.contains(anchor)) return;
+  }
   closeAllMenus();
 }
 function closeAllMenus() {
@@ -4299,8 +6617,12 @@ let hiddenTabs = (function() {
     const s = localStorage.getItem('amux_hidden_tabs');
     if (s !== null) return new Set(JSON.parse(s));
   } catch(e) {}
-  // Default visible tabs: sessions, files, scheduler, board, workspace, notes, skills, browser
-  return new Set(['logs','metrics','torrents','terminal']);
+  // Default visible tabs: sessions, files, scheduler, board, workspace, notes, skills, browser, logs
+  // Logs was hidden by default and kept disappearing on localStorage eviction
+  // (Ethan 2026-09-14: "logs are still off in the screen"). Main tab visibility
+  // falls back to this set when localStorage is empty and server-side prefs
+  // haven't loaded yet, so anything here is invisible until the user opts in.
+  return new Set(['metrics','torrents','terminal']);
 })();
 
 let tabOrder = (function() {
@@ -4513,10 +6835,51 @@ let peekTabOrder = (function() {
   } catch(e) {}
   return PEEK_TABS.map(t => t.id);
 })();
+let _peekTabPrefsDirty = false;
+let _peekTabPrefsSaveTimer = null;
+const _PEEK_TAB_PREF_KEY = 'peek_tab_layout';
+function _peekTabLayoutValue() {
+  return JSON.stringify({ hidden: [...peekHiddenTabs], tab_order: peekTabOrder });
+}
+function _persistPeekTabPrefs() {
+  clearTimeout(_peekTabPrefsSaveTimer);
+  _peekTabPrefsSaveTimer = setTimeout(() => {
+    fetch(API + '/api/prefs', { method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:_PEEK_TAB_PREF_KEY, value:_peekTabLayoutValue()}) }).catch(() => {});
+  }, 80);
+}
+async function _loadPeekTabPrefs() {
+  try {
+    const r = await fetch(API + '/api/prefs?key=' + encodeURIComponent(_PEEK_TAB_PREF_KEY));
+    if (!r.ok) return;
+    const value = (await r.json()).value;
+    // A user action made while this request was in flight wins. Never roll it
+    // back with a late startup response.
+    if (_peekTabPrefsDirty) return;
+    if (!value) { _persistPeekTabPrefs(); return; }
+    const saved = JSON.parse(value);
+    const all = PEEK_TABS.map(t => t.id);
+    if (!saved || !Array.isArray(saved.hidden) || !Array.isArray(saved.tab_order)) return;
+    peekHiddenTabs = new Set(saved.hidden.filter(id => all.includes(id)));
+    peekTabOrder = [...new Set([
+      ...saved.tab_order.filter(id => all.includes(id)),
+      ...all.filter(id => !saved.tab_order.includes(id)),
+    ])];
+    try {
+      localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
+      localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+    } catch(e) {}
+    _applyPeekTabVisibility();
+  } catch(e) {}
+}
 function _savePeekTabPrefs() {
   peekTabOrder = [...new Set(peekTabOrder)];
-  localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
-  localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+  _peekTabPrefsDirty = true;
+  try {
+    localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
+    localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+  } catch(e) {}
+  _persistPeekTabPrefs();
 }
 function _applyPeekTabVisibility() {
   const bar = document.querySelector('.peek-tabs');
@@ -4532,6 +6895,7 @@ function _applyPeekTabVisibility() {
     if (el) el.style.display = peekHiddenTabs.has(t.id) ? 'none' : '';
   });
 }
+_loadPeekTabPrefs();
 // Tab-customizer geometry beacon (AF-45). Ethan reported three times that the
 // tab list does not appear when he taps the box; it renders correctly on
 // desktop Chromium, mobile Chromium at 375px, and WebKit/iPhone-15 under
@@ -4588,15 +6952,15 @@ let _peekTabCustomizerOpen = false, _peekTabMenuSortable = null;
 function _peekCustOutside(e) {
   const menu = document.getElementById('peek-tab-customizer-menu');
   const btn = document.getElementById('peek-tab-customize');
-  if (menu && !menu.contains(e.target) && e.target !== btn) { _peekTabCustomizerOpen = false; menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
+  if (menu && !menu.contains(e.target) && !btn?.contains(e.target)) { _peekTabCustomizerOpen = false; menu.style.display = 'none'; btn?.setAttribute('aria-expanded', 'false'); document.removeEventListener('click', _peekCustOutside, true); }
 }
 function togglePeekTabCustomizer() {
   _peekTabCustomizerOpen = !_peekTabCustomizerOpen;
+  document.getElementById('peek-tab-customize')?.setAttribute('aria-expanded', String(_peekTabCustomizerOpen));
   const menu = document.getElementById('peek-tab-customizer-menu');
   if (!menu) return;
   if (_peekTabCustomizerOpen) {
     _renderPeekTabCustomizer();
-    const btn = document.getElementById('peek-tab-customize');
     // DISPLAY FIRST, THEN MEASURE, THEN PLACE. The old order positioned the menu
     // while it was still display:none, so it could not measure itself and clamped
     // against a HARDCODED 230px assumed width. The menu is not 230px — it measured
@@ -4605,7 +6969,53 @@ function togglePeekTabCustomizer() {
     // A guessed width is the bug; offsetWidth is the fix.
     menu.style.visibility = 'hidden';
     menu.style.display = '';
+    _placePeekTabCustomizer();
+    menu.style.visibility = '';
+    _watchPeekTabAnchor(true);
+    _tabCustBeacon(menu, 'peek');
+    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
+  } else {
+    menu.style.display = 'none';
+    _watchPeekTabAnchor(false);
+    document.removeEventListener('click', _peekCustOutside, true);
+  }
+}
+
+// PLACEMENT IS NOT A ONE-SHOT (Ethan, 2026-09-09: "this is way off" — the menu
+// hung ~145px below its button, over the terminal). Measured: placement is
+// correct at open, and ~3s later the peek header finishes loading its task
+// line and filters, which pushes the tab strip DOWN. The menu is
+// position:fixed against coordinates taken before that, so it stays where the
+// button used to be. A ResizeObserver does not help: the button changes
+// POSITION, not size, and that fires nothing. So while the menu is open we
+// re-read the anchor each frame and move only when it actually shifted. The
+// cost is one getBoundingClientRect per frame, bounded by the menu being open.
+let _peekTabAnchorRAF = null;
+let _peekTabAnchorLast = '';
+function _watchPeekTabAnchor(on) {
+  if (!on) {
+    if (_peekTabAnchorRAF) cancelAnimationFrame(_peekTabAnchorRAF);
+    _peekTabAnchorRAF = null; _peekTabAnchorLast = '';
+    return;
+  }
+  const tick = () => {
+    if (!_peekTabCustomizerOpen) { _peekTabAnchorRAF = null; return; }
+    const btn = document.getElementById('peek-tab-customize');
     if (btn) {
+      const r = btn.getBoundingClientRect();
+      const key = Math.round(r.left) + ':' + Math.round(r.bottom);
+      if (key !== _peekTabAnchorLast) { _peekTabAnchorLast = key; _placePeekTabCustomizer(); }
+    }
+    _peekTabAnchorRAF = requestAnimationFrame(tick);
+  };
+  _peekTabAnchorRAF = requestAnimationFrame(tick);
+}
+
+function _placePeekTabCustomizer() {
+  const menu = document.getElementById('peek-tab-customizer-menu');
+  const btn = document.getElementById('peek-tab-customize');
+  if (menu && btn) {
+    {
       const r = btn.getBoundingClientRect();
       const vw = document.documentElement.clientWidth || window.innerWidth;
       const vh = document.documentElement.clientHeight || window.innerHeight;
@@ -4633,10 +7043,7 @@ function togglePeekTabCustomizer() {
       menu.style.maxHeight = Math.max(120, vh - top - PAD) + 'px';
       menu.style.overflowY = 'auto';
     }
-    menu.style.visibility = '';
-    _tabCustBeacon(menu, 'peek');
-    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
-  } else { menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
+  }
 }
 function _renderPeekTabCustomizer() {
   const menu = document.getElementById('peek-tab-customizer-menu');
@@ -4853,6 +7260,134 @@ function _applyEmbedView() {
   }
 })();
 
+function togglePaused() {
+  pausedExpanded = !pausedExpanded;
+  _renderPausedSection();
+}
+
+function _renderPausedSection() {
+  const el = document.getElementById('paused-section');
+  if (!el) return;
+  const allPaused = sessions.filter(s => s.lifecycle === 'paused' && !s.archived);
+  if (!allPaused.length) { el.innerHTML = ''; return; }
+  const q = searchQuery.toLowerCase().trim();
+  const paused = q ? allPaused.filter(s =>
+    s.name.toLowerCase().includes(q) ||
+    (s.dir || '').toLowerCase().includes(q) ||
+    (s.desc || '').toLowerCase().includes(q) ||
+    (s.tags || []).some(t => t.toLowerCase().includes(q))
+  ) : allPaused;
+  const showExpanded = pausedExpanded;
+  const label = q && paused.length !== allPaused.length
+    ? `${paused.length} of ${allPaused.length} paused`
+    : `${allPaused.length} paused`;
+  const chevron = `<span class="paused-chevron${showExpanded ? ' open' : ''}">&#x25B6;</span>`;
+  let html = `<div class="paused-footer" onclick="togglePaused()">${chevron} ${label}</div>`;
+  if (showExpanded) {
+    html += '<div class="paused-body">';
+    (q ? paused : allPaused).forEach(s => {
+      const ago = s.last_activity ? timeAgo(s.last_activity) : '';
+      const rawDir = s.worktree_active ? '~/.amux/worktrees/' + s.name : (s.dir || '');
+      const dir = rawDir.replace(/^\/Users\/[^/]+/, '~');
+      const model = s.active_model || sessionConfiguredModel(s) || '';
+      const body = esc(s.task_name || s.preview || s.desc || '');
+      const meta = [];
+      if (dir) meta.push(`<code title="${esc(rawDir)}">${esc(dir)}</code>`);
+      if (ago) meta.push(`active ${ago}`);
+      (s.tags || []).forEach(t => meta.push(`<span class="paused-card-tag">#${esc(t)}</span>`));
+      html += `<div class="paused-card" data-session="${esc(s.name)}">
+        <div class="paused-card-top">
+          <span class="paused-card-name" onclick="openPeek('${esc(s.name)}')">${esc(s.name)}</span>
+          ${model ? `<span class="paused-card-chip model">${esc(model)}</span>` : ''}
+          <span class="paused-card-spacer"></span>
+          <div class="paused-card-actions">
+            <button class="paused-resume-btn" ${_workerLifecyclePending.has(s.name) ? 'disabled' : ''} onclick="${s.running ? 'pauseWorker' : 'resumeWorker'}('${esc(s.name)}')">${_workerLifecyclePending.get(s.name) || (s.running ? 'Retry Pause' : 'Resume')}</button>
+            <button class="paused-archive-btn" onclick="archiveSession('${esc(s.name)}')">Archive</button>
+          </div>
+        </div>
+        ${meta.length ? `<div class="paused-card-meta">${meta.join('<span style="opacity:0.4;">&middot;</span>')}</div>` : ''}
+        ${body ? `<div class="paused-card-preview">${body}</div>` : ''}
+      </div>`;
+    });
+    html += '</div>';
+  }
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+function toggleExpired() {
+  expiredExpanded = !expiredExpanded;
+  _renderExpiredSection();
+}
+
+function _renderExpiredSection() {
+  const el = document.getElementById('expired-section');
+  if (!el) return;
+  const sessNames = new Set(sessions.map(s => s.name));
+  const ephCards = boardItems.filter(c =>
+    (c.session || '').includes('-eph-') && !sessNames.has(c.session)
+  );
+  if (!ephCards.length) { el.innerHTML = ''; return; }
+  const byWorker = {};
+  ephCards.forEach(c => {
+    const w = c.session;
+    if (!byWorker[w]) byWorker[w] = { name: w, cards: [], parent: '' };
+    byWorker[w].cards.push(c);
+    if (!byWorker[w].parent) {
+      const m = w.match(/^(.+?)-eph-/);
+      if (m) byWorker[w].parent = m[1];
+    }
+  });
+  const workers = Object.values(byWorker);
+  workers.sort((a, b) => {
+    const la = Math.max(...a.cards.map(c => c.updated || 0));
+    const lb = Math.max(...b.cards.map(c => c.updated || 0));
+    return lb - la;
+  });
+  const q = searchQuery.toLowerCase().trim();
+  const filtered = q ? workers.filter(w =>
+    w.name.toLowerCase().includes(q) ||
+    w.parent.toLowerCase().includes(q) ||
+    w.cards.some(c => (c.title || '').toLowerCase().includes(q))
+  ) : workers;
+  const label = q && filtered.length !== workers.length
+    ? `${filtered.length} of ${workers.length} expired`
+    : `${workers.length} expired`;
+  const chevron = `<span class="expired-chevron${expiredExpanded ? ' open' : ''}">&#x25B6;</span>`;
+  let html = `<div class="expired-footer" onclick="toggleExpired()">${chevron} ${label}</div>`;
+  if (expiredExpanded) {
+    const TERMINAL = _CLOSED_STATUSES;
+    const STATUS_DOT = { doing: 'var(--accent)', todo: 'var(--dim)', backlog: 'var(--dim)', done: '#4ade80', verified: '#4ade80', discarded: '#888', cancelled: '#888' };
+    html += '<div class="expired-body">';
+    filtered.forEach(w => {
+      const doneCt = w.cards.filter(c => TERMINAL.has(c.status)).length;
+      const total = w.cards.length;
+      const epicCard = boardItems.find(c => w.cards.some(ch => ch.epic === c.id));
+      const epicTitle = epicCard ? epicCard.title : w.name;
+      html += `<div class="paused-card" data-session="${esc(w.name)}">
+        <div class="paused-card-top">
+          <span class="paused-card-name">${esc(epicTitle)}</span>
+          <span class="paused-card-chip model" style="opacity:0.6">${doneCt}/${total} done</span>
+          <span class="paused-card-spacer"></span>
+        </div>
+        <div class="paused-card-meta"><code>${esc(w.name)}</code>
+          ${w.parent ? `<span style="opacity:0.4;">&middot;</span> parent: <code>${esc(w.parent)}</code>` : ''}</div>
+        <div style="margin-top:4px;">`;
+      w.cards.forEach(c => {
+        const st = c.status || 'todo';
+        const dot = STATUS_DOT[st] || 'var(--dim)';
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer;font-size:.8rem;" onclick="switchView('board');setTimeout(function(){openBoardDetail('${escJs(c.id)}')},300)">
+          <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0;"></span>
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(c.title)}</span>
+          <span style="color:var(--dim);font-size:.7rem;">${esc(st)}</span>
+        </div>`;
+      });
+      html += '</div></div>';
+    });
+    html += '</div>';
+  }
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
 function toggleArchived() {
   archivedExpanded = !archivedExpanded;
   _renderArchivedSection();
@@ -4889,7 +7424,8 @@ function _renderArchivedSection() {
     (q ? archived : allArchived).forEach(s => {
       const ago = s.last_activity ? timeAgo(s.last_activity) : '';
       const created = s.session_created ? new Date(s.session_created * 1000).toLocaleDateString([], {month:'short', day:'numeric', year:'2-digit'}) : '';
-      const dir = s.dir ? s.dir.replace(/^\/Users\/[^/]+/, '~') : '';
+      const rawDir2 = s.worktree_active ? '~/.amux/worktrees/' + s.name : (s.dir || '');
+      const dir = rawDir2.replace(/^\/Users\/[^/]+/, '~');
       const provider = s.provider && s.provider !== 'claude' ? s.provider : '';
       const model = s.active_model || '';
       const tokens = !s.tokens ? '' :
@@ -4897,7 +7433,7 @@ function _renderArchivedSection() {
         s.tokens >= 1000 ? (s.tokens/1000).toFixed(s.tokens >= 10000 ? 0 : 1) + 'k' : String(s.tokens);
       const body = esc(s.task_name || s.preview || s.desc || '');
       const meta = [];
-      if (dir) meta.push(`<code title="${esc(s.dir)}">${esc(dir)}</code>`);
+      if (dir) meta.push(`<code title="${esc(rawDir2)}">${esc(dir)}</code>`);
       if (s.branch) meta.push(`&#x2387; ${esc(s.branch)}`);
       if (s.worktree) meta.push(`worktree`);
       if (ago) meta.push(`active ${ago}`);
@@ -4934,7 +7470,7 @@ function toggleActiveDropdown() {
     activeDropdownOpen = false;
     return;
   }
-  const running = sessions.filter(s => s.running);
+  const running = sessions.filter(s => s.running && s.lifecycle !== 'paused');
   if (!running.length) {
     dd.innerHTML = '<div class="active-dropdown-empty">No active workers</div>';
   } else {
@@ -4966,7 +7502,7 @@ function closeActiveDropdown(e) {
   activeDropdownOpen = false;
 }
 function updateActiveCount() {
-  const count = sessions.filter(s => s.running).length;
+  const count = sessions.filter(s => s.running && s.lifecycle !== 'paused').length;
   const el = document.getElementById('active-count');
   const btn = document.getElementById('active-btn');
   if (el) el.textContent = count;
@@ -4992,6 +7528,9 @@ function updateRateLimitPill() {
   txt.textContent = blocked.length
     ? n + ' limited · reset ' + _fmtClockTime(Math.min(...blocked.map(s => s.rate_limited_until)))
     : n + ' limited';
+  txt.dataset.count = String(n);
+  document.getElementById('rate-limit-pill-count').textContent = n;
+  pill.setAttribute('aria-label', n + ' workers limited — open bulk actions');
   pill.title = blocked.concat(credit).map(s => s.name).join(', ') + ' (tap to jump)';
   pill.classList.add('show');
 }
@@ -5002,6 +7541,67 @@ function _scrollToFirstRateLimited() {
   const card = document.querySelector(sel);
   if (card && card.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
+
+// AF-731: document overflow alone misses a button clipped by its flex parent.
+// Measure the actual visible control bounds, including clipping ancestors.
+const _headerControlIds = ['brand-header','conn-status','notif-btn','rate-limit-pill','active-btn','add-btn','settings-btn','interaction-feedback'];
+function _headerLayoutCheck() {
+  const clipped = _headerControlIds.filter(id => {
+    const el = id==='interaction-feedback' ? document.querySelector('#interaction-feedback > summary') : document.getElementById(id);
+    if (!el || !el.getClientRects().length) return false;
+    const r = el.getBoundingClientRect();
+    if (r.left < -1 || r.right > innerWidth + 1) return true;
+    if (id === 'rate-limit-pill') {
+      const label = document.getElementById('rate-limit-pill-count')?.getBoundingClientRect();
+      if (label?.width && (label.left < r.left - 1 || label.right > r.right + 1)) return true;
+    }
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      if (!['hidden','clip','auto','scroll'].includes(getComputedStyle(p).overflowX)) continue;
+      const bounds = p.getBoundingClientRect();
+      if (r.left < bounds.left - 1 || r.right > bounds.right + 1) return true;
+    }
+    return false;
+  });
+  const badge = document.getElementById('notif-badge'), bell = document.getElementById('notif-btn');
+  if (badge?.getClientRects().length && bell) {
+    const b = badge.getBoundingClientRect(), r = bell.getBoundingClientRect();
+    if (b.left < r.left - 1 || b.right > r.right + 1 || b.top < r.top - 1 || b.bottom > r.bottom + 1) clipped.push('notif-badge');
+  }
+  // A wrapped row used to pass the clipping probe while consuming twice the
+  // phone's header height. Report that regression through the same log path.
+  if (innerWidth <= 600) {
+    const tops = _headerControlIds.filter(id => id !== 'interaction-feedback')
+      .map(id => document.getElementById(id)).filter(el => el?.getClientRects().length)
+      .map(el => el.getBoundingClientRect().top);
+    if (tops.length > 1 && Math.max(...tops) - Math.min(...tops) > 1) clipped.push('header-row-wrapped');
+  }
+  return clipped;
+}
+(function observeMobileHeader() {
+  const header = document.querySelector('.header-row');
+  if (!header || typeof ResizeObserver === 'undefined') return;
+  let previous = '', pending = false;
+  const observer = new ResizeObserver(() => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      document.documentElement.style.setProperty('--mobile-header-bottom', (header.getBoundingClientRect().bottom + 6) + 'px');
+      const clipped = _headerLayoutCheck();
+      const signature = clipped.join(',');
+      if (signature && signature !== previous) {
+        console.warn('[amux] header controls clipped', clipped);
+        fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({kind:'mobile-header-clipped',measured:true,n_considered:_headerControlIds.filter(id=>document.getElementById(id)?.getClientRects().length).length,clipped,viewport:innerWidth,surface:innerWidth<=600?'mobile':'desktop',ver:APP_VER})}).catch(() => {});
+      }
+      previous = signature;
+    });
+  });
+  observer.observe(header);
+  const badge = document.getElementById('notif-badge');
+  if (badge) observer.observe(badge);
+  header.querySelectorAll(':scope > div, :scope > div > *').forEach(el => observer.observe(el));
+})();
 
 // ── Header + dropdown ──
 let addMenuOpen = false;
@@ -5346,7 +7946,8 @@ function editField(session, field, current, provider) {
       {v:'codex',l:'Codex'},
       {v:'gemini',l:'Gemini'},
       {v:'grok',l:'Grok'},
-      {v:'ollama',l:'Ollama (local)'}
+      {v:'ollama',l:'Ollama (local)'},
+      {v:'muse',l:'Muse Code'}
     ];
     sel.innerHTML = '';
     providers.forEach(p => { const o = document.createElement('option'); o.value = p.v; o.textContent = p.l; sel.appendChild(o); });
@@ -5354,65 +7955,13 @@ function editField(session, field, current, provider) {
     sel.style.display = 'block';
     sel.value = (current || 'claude').toLowerCase();
   } else if (field === 'model') {
-    const claudeModels = [
-      {v:'',l:'Default'},{v:'opus',l:'opus'},{v:'sonnet',l:'sonnet'},{v:'haiku',l:'haiku'},
-      {v:'claude-opus-5',l:'claude-opus-5'},{v:'claude-opus-5[1m]',l:'claude-opus-5 [1M]'},
-      {v:'claude-fable-5-1',l:'claude-fable-5-1'},{v:'claude-fable-5',l:'claude-fable-5'},
-      {v:'claude-opus-4-8',l:'claude-opus-4-8'},{v:'claude-opus-4-8[1m]',l:'claude-opus-4-8 [1M]'},
-      {v:'claude-opus-4-7',l:'claude-opus-4-7'},{v:'claude-opus-4-7[1m]',l:'claude-opus-4-7 [1M]'},
-      {v:'claude-opus-4-6',l:'claude-opus-4-6'},{v:'claude-opus-4-6[1m]',l:'claude-opus-4-6 [1M]'},
-      {v:'claude-sonnet-4-6',l:'claude-sonnet-4-6'},{v:'claude-sonnet-4-6[1m]',l:'claude-sonnet-4-6 [1M]'},
-      {v:'claude-haiku-4-5-20251001',l:'claude-haiku-4-5-20251001'}
-    ];
-    const codexModels = [
-      {v:'',l:'Default'},
-      {v:'gpt-5.6-sol',l:'GPT-5.6 Sol'},{v:'gpt-5.6-terra',l:'GPT-5.6 Terra'},
-      {v:'gpt-5.6-luna',l:'GPT-5.6 Luna'},{v:'gpt-5.5',l:'GPT-5.5'},
-      {v:'gpt-5.4',l:'GPT-5.4'},{v:'gpt-5.4-mini',l:'GPT-5.4 Mini'},
-      {v:'gpt-5.3-codex-spark',l:'GPT-5.3 Codex Spark'},
-      {v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
-      {v:'gpt-4o',l:'gpt-4o'},{v:'gpt-4.1',l:'gpt-4.1'},{v:'gpt-4.1-mini',l:'gpt-4.1-mini'}
-    ];
-    const geminiModels = [
-      {v:'',l:'Default'},{v:'auto',l:'auto'},{v:'gemini-2.5-pro',l:'gemini-2.5-pro'},
-      {v:'gemini-2.5-flash',l:'gemini-2.5-flash'},{v:'gemini-2.5-flash-lite',l:'gemini-2.5-flash-lite'},
-      {v:'gemini-3-pro-preview',l:'gemini-3-pro-preview'},{v:'gemini-3-flash-preview',l:'gemini-3-flash-preview'}
-    ];
-    if (provider === 'ollama') {
-      sel.innerHTML = '<option value="">Loading local models…</option>';
-      inpWrap.style.display = 'none';
-      sel.style.display = 'block';
-      fetch(API + '/api/ollama/models', { headers: _authHeaders() })
-        .then(r => r.json())
-        .then(d => {
-          sel.innerHTML = '';
-          const mlist = d.models || [];
-          if (!mlist.length) {
-            const o = document.createElement('option'); o.value = ''; o.textContent = 'No local models found'; sel.appendChild(o);
-          }
-          mlist.forEach(name => {
-            const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o);
-          });
-          sel.value = current || (mlist[0] || '');
-        })
-        .catch(() => { sel.innerHTML = '<option value="">Could not reach Ollama</option>'; });
-    } else {
-    const grokModels = [
-      {v:'',l:'Default'},{v:'grok-4.6',l:'grok-4.6'},{v:'grok-4.5',l:'grok-4.5'}
-    ];
-    const models = provider === 'codex' ? codexModels : (provider === 'gemini' ? geminiModels : (provider === 'grok' ? grokModels : claudeModels));
-    sel.innerHTML = '';
-    models.forEach(m => { const o = document.createElement('option'); o.value = m.v; o.textContent = m.l; sel.appendChild(o); });
     inpWrap.style.display = 'none';
     sel.style.display = 'block';
-    sel.value = current || '';
-    if (current && !Array.from(sel.options).some(o => o.value === current)) {
-      const opt = document.createElement('option');
-      opt.value = current; opt.textContent = current;
-      sel.appendChild(opt);
-      sel.value = current;
-    }
-    }
+    inp.value = '';
+    const catalogProvider = provider === 'claude-code' || !provider ? 'claude' : provider;
+    _fillWorkerModelSelect(sel, catalogProvider, current || '', 'Default', true).then(() => {
+      if (sel.value === '__custom__') _editSelectChanged();
+    });
     // Reasoning effort — Claude only. Pre-fill from the session's current --effort flag.
     const effortWrap = document.getElementById('edit-effort-wrap');
     if (effortWrap) {
@@ -5500,14 +8049,27 @@ function closeEdit() {
 // edit-select auto-submits for quick single-select fields (provider), but the
 // model field pairs with the reasoning-effort dial, so it waits for Save.
 function _editSelectChanged() {
-  if (editState && editState.field === 'model') return;
+  if (editState && editState.field === 'model') {
+    const custom = document.getElementById('edit-select').value === '__custom__';
+    const wrap = document.getElementById('edit-input-wrap');
+    const input = document.getElementById('edit-input');
+    if (wrap) wrap.style.display = custom ? '' : 'none';
+    if (input && custom) {
+      input.placeholder = 'Exact model ID';
+      setTimeout(() => input.focus({ preventScroll: true }), 0);
+    }
+    return;
+  }
   submitEdit();
 }
 async function submitEdit() {
   if (!editState) return;
-  const val = (editState.field === 'model' || editState.field === 'provider' || editState.field === 'effort' || editState.field === 'mcp')
+  let val = (editState.field === 'model' || editState.field === 'provider' || editState.field === 'effort' || editState.field === 'mcp')
     ? document.getElementById('edit-select').value.trim()
     : document.getElementById('edit-input').value.trim();
+  if (editState.field === 'model' && val === '__custom__') {
+    val = document.getElementById('edit-input').value.trim();
+  }
   if (!val && !['desc','tags','model','task','effort','branch','mcp','send_allow'].includes(editState.field)) return;
   const { session, field } = editState;
   // Capture the reasoning-effort dial before closeEdit() tears the dialog down.
@@ -5771,10 +8333,11 @@ async function togglePin(session) {
 // a ticked box it cannot untick here, and saying "(inherited)" is the difference
 // between a confusing control and an honest one.
 function _spansLabel(s) {
-  if (!s.spans_groups) return '';
+  const source = s.spans_groups_source || (s.spans_groups_own ? 'worker' : 'inherited');
+  if (!s.spans_groups) return ': refused (' + esc(source) + ' deny)';
   const v = s.spans_groups_value || '';
   const scope = v === '*' ? 'all' : v;
-  return s.spans_groups_own ? ': ' + esc(scope) : ': ' + esc(scope) + ' (inherited)';
+  return ': ' + esc(scope) + ' (' + esc(source) + ')';
 }
 
 // AUTO-DRAIN BACKLOG (AMUX-4055). Ethan: "the configuration needs to be a
@@ -5809,13 +8372,9 @@ async function toggleSpansGroups(session) {
   closeAllMenus();
   const s = sessions.find(x => x.name === session);
   const was = s ? !!s.spans_groups : false;
-  // Turning OFF only clears this worker's own value. If a group or global layer
-  // granted it, the server says so in its reply rather than reporting success
-  // for a change the next send would disprove.
-  if (was && s && !s.spans_groups_own) {
-    showToast('Granted by a group or global layer — turn it off in Configurations');
-    return;
-  }
+  // OFF writes the explicit empty worker deny. That is deliberately different
+  // from omission: it is the visible lower-level override that can narrow an
+  // inherited global/group grant. ON writes the worker's explicit `*` grant.
   const next = !was;
   if (s) { s.spans_groups = next; lastSessionsJSON = ''; render(); }
   const r = await apiCall(API + '/api/sessions/' + session + '/config', {
@@ -5823,7 +8382,19 @@ async function toggleSpansGroups(session) {
     body: JSON.stringify({ spans_groups: next })
   });
   if (!r && s) { s.spans_groups = was; lastSessionsJSON = ''; render(); }
-  else if (r) { showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off')); }
+  else if (r) {
+    if (s) {
+      s.spans_groups = !!r.spans_groups;
+      s.spans_groups_value = r.effective || '';
+      s.spans_groups_source = r.source || 'worker';
+      s.spans_groups_reason = r.reason || '';
+      s.spans_groups_explicit_deny = !!r.explicit_deny;
+      s.spans_groups_own = true;
+      lastSessionsJSON = '';
+      render();
+    }
+    showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off'));
+  }
   await fetchSessions();
 }
 
@@ -5844,10 +8415,6 @@ async function toggleIsolated(session) {
 
 async function clearScrollback(session) {
   closeAllMenus();
-  await apiCall(API + '/api/sessions/' + session + '/keys', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ keys: '' })
-  });
   await apiCall(API + '/api/sessions/' + session + '/clear', { method: 'POST' });
 }
 
@@ -5951,6 +8518,39 @@ async function deleteSession(session) {
   await fetchSessions();
 }
 
+async function pauseWorker(session) { return _changeWorkerPaused(session, true); }
+async function resumeWorker(session) { return _changeWorkerPaused(session, false); }
+
+async function _changeWorkerPaused(session, paused) {
+  if (_workerLifecyclePending.has(session)) return;
+  closeAllMenus();
+  const label = paused ? 'Pausing' : 'Resuming';
+  _workerLifecyclePending.set(session, label.toLowerCase());
+  const done = _cardBusy(session, label);
+  updatePeekStatus();
+  _renderPausedSection();
+  try {
+    const r = await apiCall(API + '/api/workers/' + encodeURIComponent(session) + (paused ? '/pause' : '/resume'), { method: 'POST' });
+    if (r) {
+      const body = await r.json();
+      // Acknowledged lifecycle is projected immediately; a slow sessions poll
+      // must not leave a stale Resume action or a Working badge behind.
+      const worker = sessions.find(s => s.name === session);
+      if (worker && body.lifecycle) {
+        worker.lifecycle = body.lifecycle;
+        if (typeof body.running === 'boolean') worker.running = body.running;
+        if (body.session === 'starting' || (!paused && body.session === 'started')) worker.status = 'starting';
+      }
+      showToast(session + (paused ? ' paused — work stopped' : ' resuming'));
+    }
+    await fetchSessions();
+  } finally {
+    _workerLifecyclePending.delete(session);
+    done();
+    render();
+  }
+}
+
 async function archiveSession(session) {
   closeAllMenus();
   const done = _cardBusy(session, 'Archiving');
@@ -5987,10 +8587,21 @@ async function doStart(name) {
   }
 }
 
+const _stoppingSessions = new Set();
 async function doStop(name) {
-  await apiCall(API + '/api/sessions/' + name + '/stop', { method: 'POST' });
-  await new Promise(r => setTimeout(r, 500));
-  await fetchSessions();
+  if (_stoppingSessions.has(name)) return;
+  _stoppingSessions.add(name);
+  try {
+    await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/stop', { method: 'POST' });
+    // A 202 acknowledges intent, not a stopped process. Keep refreshing until
+    // the server observes termination; retries remain in the durable outbox.
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      await fetchSessions();
+      if (sessions.find(s => s.name === name)?.running === false) return;
+    }
+    showToast('Stop has not been confirmed yet — check the worker or pending requests');
+  } finally { _stoppingSessions.delete(name); }
 }
 
 async function copyMoshCmd(name) {
@@ -6147,35 +8758,36 @@ function _stampSendTime(text, now, author) {
   return `[${ts}${author ? ` ${author}` : ''}] ${text}`;
 }
 
-async function doSend(name, text) {
-  showSendingIndicator();
-  // OPTIMISTIC STATUS (Ethan, 2026-08-16: "very snappy"). Flip to working the
-  // instant a command is sent, before the UserPromptSubmit hook + SSE round-trip
-  // confirms it. The server now pushes a Session SSE event on the hook report, so
-  // this optimism is corrected/confirmed within a beat; if the send is refused
-  // (409 not running) the next fetch resets it.
-  try {
-    const s = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(x => x.name === name) : null;
-    if (s && s.status !== 'active' && s.status !== 'rate_limited') {
-      s.status = 'active'; s.running = true;
-      if (typeof render === 'function') render();
-      if (typeof updatePeekStatus === 'function' && typeof peekSession !== 'undefined' && peekSession === name) updatePeekStatus();
-    }
-  } catch (e) {}
+async function doSend(name, text, identity = {}) {
+  if (/^\/[a-z]/.test(text.trim())) showSendingIndicator();
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
-  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail);
+  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail || _localMemberEmail);
   // One msg_id per logical send, reused verbatim by the offline-queue replay:
   // the server dedups on it, so a retry after a lost response (e.g. the
   // server restarted mid-request AFTER the keys landed) can't deliver twice.
-  const sendBody = JSON.stringify({text: payload, record_history: true, msg_id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random())});
-  // Use direct fetch (not apiCall) so we can handle 409 specifically
+  identity.msg_id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random();
+  const sendBody = JSON.stringify({text: payload, record_history: true, msg_id: identity.msg_id,
+                                   client_meta: _sendContext()});
+  // Ordinary messages return after durable local acceptance. The outbox owns
+  // network delivery and retry; only interactive slash commands await the API.
+  const sendUrl = API + '/api/sessions/' + encodeURIComponent(name) + '/send';
+  const sendOpts = { method: 'POST', headers: Object.assign({'Content-Type':'application/json'}, _authHeaders()), body: sendBody };
   try {
-    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: sendBody
-    });
+    // WAIT FOR THE REAL ANSWER. This was a 10s abort, and on this host /send
+    // routinely takes longer (the CLI's own beacons log curl exit 28 on the
+    // same route). The abort fell through to the outbox with the same msg_id;
+    // the replay then met the server's dedup gate, which answers 503 "pending"
+    // for two minutes and 409 "uncertain" after that, and the 409 marked the
+    // op BLOCKED. That is the whole chain behind "1 message waiting — view
+    // details" sitting over a message the worker had already received (Ethan,
+    // 2026-09-11 22:46, mixpeek-orchestrator and amux-research). 90s is a
+    // ceiling for a server that is genuinely hung, not a budget for a slow
+    // one; an abort still queues below, exactly like a network error.
+    const r = await fetch(sendUrl, Object.assign({}, sendOpts, { signal: AbortSignal.timeout(90000) }));
+    if (_isLocallyQueued(r)) return 'queued';
+    if (!isSlashCmd && r.status === 507) return 'local-failed';
     if (r.ok) return 'sent';
     if (r.status === 409) {
       const d = await r.json().catch(() => ({}));
@@ -6184,40 +8796,53 @@ async function doSend(name, text) {
         const start = await showConfirm(
           `Worker "${name}" is not running.\n\nStart it and resend?`, 'Start & Send', false);
         if (start) {
-          await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/start', { method: 'POST' });
+          const started = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/start', { method: 'POST' });
+          if (!started.ok || _isLocallyQueued(started)) return 'failed';
           showToast('Starting ' + name + '...');
-          // Wait for session to be ready, then retry send
-          setTimeout(() => doSend(name, text), 3000);
-          return 'starting';
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          return doSend(name, text, identity);
         }
         return 'declined';        // user said no — nothing sent, nothing queued
-      } else {
-        showToast('Send failed: ' + msg);
-        return 'failed';
       }
+      showToast('Send failed: ' + msg);
+      return 'failed';
     }
-    showToast('Send error: ' + r.status);
-    return 'failed';
-  } catch(e) {
-    // Offline — queue it (same body, same msg_id → server-side dedup if the
-    // original request actually landed before the connection died)
-    _queueOp(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: sendBody
-    });
-    return 'queued';
-  }
+    if (r.status >= 400 && r.status < 500) {
+      const d = await r.json().catch(() => ({}));
+      showToast('Send failed: ' + (d.error || d.message || 'HTTP ' + r.status));
+      return 'failed';
+    }
+  } catch (e) {}
+  // Network error or 5xx: queue for retry. Same body and msg_id, so the server
+  // dedups if the original request actually landed before the link died.
+  const _outboxId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random();
+  const queued = await _queueOp(sendUrl, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: sendBody, _outboxId
+  });
+  if (!queued) return 'local-failed';
+  try { _scheduleSyncRetry(); } catch (e) {}
+  return 'queued';
 }
 
 async function doKeys(name, keys) {
   showSendingIndicator();
-  await apiCall(API + '/api/sessions/' + name + '/keys', {
+  const r = await apiCall(API + '/api/sessions/' + name + '/keys', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({keys})
   });
+  if (!r) return { accepted: false, effect: 'not_sent', message: 'key request was not confirmed' };
+  const d = await r.json().catch(() => ({}));
+  return {
+    accepted: d.accepted !== undefined ? !!d.accepted : d.ok === true,
+    effect: d.effect || (d.ok ? 'unverified' : 'not_sent'),
+    message: d.message || ''
+  };
 }
 
+const _fieldSizingSupported = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('field-sizing', 'content');
 function autoGrow(el) {
+  if (_fieldSizingSupported) return;
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, parseFloat(getComputedStyle(el).maxHeight) || 999) + 'px';
 }
@@ -6245,97 +8870,104 @@ async function gitPush(name, e) {
 // localStorage (not IDB): a draft is a few hundred bytes, and the synchronous
 // write is what makes the pagehide flush below reliable.
 const _DRAFT_PREFIX = 'amux_draft_';
-const _DRAFT_MAX_AGE = 14 * 86400 * 1000;
-let _draftTimers = {};
-function _draftKey(session) { return _DRAFT_PREFIX + (session || '__peek__'); }
-function _draftSave(session, text) {
+// Storage is the shared authority across tabs and embedded grid panes. Only a
+// failed write stays in memory; lifecycle events retry that write, never harvest
+// stale DOM copies. Drafts remain until the user clears or submits them.
+const _draftUnsaved = new Map();
+function _draftKey(session) { return _DRAFT_PREFIX + session; }
+function _draftRecord(session) {
+  if (!session) return {t:'', rev:null};
+  if (_draftUnsaved.has(session)) return _draftUnsaved.get(session);
   try {
-    const k = _draftKey(session);
-    if (!text || !text.trim()) localStorage.removeItem(k);
-    else localStorage.setItem(k, JSON.stringify({ t: text, ts: Date.now() }));
-  } catch (e) {}   // quota/private-mode: a lost draft must never break sending
+    const d = JSON.parse(localStorage.getItem(_draftKey(session)) || 'null');
+    if (d && typeof d.t === 'string') return {...d, rev:d.rev || String(d.ts || 0)};
+  } catch (_) {}
+  return {t:'', rev:null};
 }
-// The value the composer for `session` holds RIGHT NOW, or null if none is
-// mounted. The peek box wins when it is the one showing this session (it is the
-// active editor); otherwise the list card.
+function _draftPersist(session, record) {
+  try {
+    if (record.t) _writeUserStorage(_draftKey(session), JSON.stringify(record));
+    else localStorage.removeItem(_draftKey(session));
+    _draftUnsaved.delete(session);
+  } catch (error) {
+    const first = !_draftUnsaved.has(session);
+    _draftUnsaved.set(session, record);
+    if (first) {
+      showToast('Draft kept in this page; device storage failed. Keep this page open.');
+      _outboxDiagnostic('composer_draft_storage_failed', {session, reason:error.name});
+    }
+  }
+}
+function _draftSave(session, text) {
+  if (!session) return null;
+  text = String(text || '');
+  const previous = _draftRecord(session);
+  const record = previous.t === text ? previous : {t:text, ts:Date.now(), rev:crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()};
+  _draftPersist(session, record);
+  _draftSyncInputs(session, text);
+  return record.rev;
+}
 function _liveComposerValue(session) {
   if (typeof peekSession !== 'undefined' && peekSession === session) {
-    const pk = document.getElementById('peek-cmd-input');
+    const fs = document.getElementById('peek-input-fs');
+    const pk = document.getElementById(fs && fs.classList.contains('open') ? 'peek-input-fs-ta' : 'peek-cmd-input');
     if (pk) return pk.value;
   }
   const card = document.getElementById('input-' + session);
   return card ? card.value : null;
 }
-function _draftSaveDebounced(session, text) {
-  clearTimeout(_draftTimers[session || '_']);
-  _draftTimers[session || '_'] = setTimeout(() => {
-    // Read the LIVE composer at fire time, not the value captured 250ms ago at
-    // the keystroke. If a send cleared the box in that window, we save the
-    // CLEARED state (dropping the draft) instead of resurrecting the pre-send
-    // text — that stale-capture race is how an already-sent message came back and
-    // sat in the composer (a prefix of it, from the mid-typing snapshot). Falls
-    // back to the captured text only if the input is gone.
-    const live = _liveComposerValue(session);
-    const val = live != null ? live : text;
-    _draftSave(session, val);
-    _draftSyncInputs(session, val);   // keep the other view in step as you type
-  }, 250);
-}
-function _draftGet(session) {
-  try {
-    const raw = localStorage.getItem(_draftKey(session));
-    if (!raw) return '';
-    const d = JSON.parse(raw);
-    // Age out rather than restoring something you typed two weeks ago into a
-    // conversation that has long since moved on.
-    if (!d || !d.t || (Date.now() - (d.ts || 0)) > _DRAFT_MAX_AGE) {
-      localStorage.removeItem(_draftKey(session)); return '';
-    }
-    return d.t;
-  } catch (e) { return ''; }
-}
-function _draftClear(session) {
-  clearTimeout(_draftTimers[session || '_']);
-  try { localStorage.removeItem(_draftKey(session)); } catch (e) {}
-  // One store, so one removal. This used to have to chase two more copies
-  // (an in-memory map and the peekState snapshot's own `draft` field), and
-  // missing either put an already-sent message back in the box.
-  _draftSyncInputs(session, '');
-}
+// Keep the handler name for existing markup, but commit the actual edit now.
+// A debounce let opening/sending outrun the card's partially typed mirror.
+function _draftSaveDebounced(session, text) { return _draftSave(session, text); }
+function _draftGet(session) { return _draftRecord(session).t; }
+function _draftClear(session) { _draftSave(session, ''); }
 
-// Push a session's draft into EVERY composer showing that session right now:
-// the card in the session list and the peek box are two views of one value, so
-// typing in one and opening the other must not lose or duplicate anything.
+// A receipt owns one revision, not whichever text happens to be in the worker
+// after an await. New edits (even retyping identical text) must survive it.
+function _composerAcceptLocal(session, original, revision) {
+  const current = _draftRecord(session);
+  const live = _liveComposerValue(session);
+  const owns = revision === undefined ? current.t === original : current.rev === revision;
+  if (owns && live != null && live !== original && live !== '') _draftSave(session, live);
+  else if (owns) _draftClear(session);
+  else _draftSyncInputs(session, current.t);
+  _outboxDiagnostic('composer_locally_accepted', {session, draft_cleared:_draftGet(session) === '', newer_draft_preserved:!owns});
+}
 function _draftSyncInputs(session, text) {
-  try {
-    const card = document.getElementById('input-' + session);
-    if (card && card.value !== text && document.activeElement !== card) {
-      card.value = text; try { autoGrow(card); } catch (e) {}
-    }
-    if (typeof peekSession !== 'undefined' && peekSession === session) {
-      const pk = document.getElementById('peek-cmd-input');
-      if (pk && pk.value !== text && document.activeElement !== pk) {
-        pk.value = text; try { autoGrow(pk); } catch (e) {}
-      }
-    }
-  } catch (e) {}
+  const inputs = [document.getElementById('input-' + session)];
+  if (typeof peekSession !== 'undefined' && peekSession === session) {
+    inputs.push(document.getElementById('peek-cmd-input'));
+    inputs.push(document.getElementById('peek-input-fs-ta'));
+  }
+  for (const input of inputs) {
+    if (!input || input.value === text) continue;
+    input.value = text;
+    try { autoGrow(input); } catch (_) {}
+  }
 }
-// Restore into a composer that has just been (re)rendered. Never clobbers text
-// the user is actively typing — a re-render mid-type must not rewind them.
 function _draftRestore(inp, session) {
-  if (!inp || inp.value || document.activeElement === inp) return;
-  const d = _draftGet(session);
-  if (d) { inp.value = d; try { autoGrow(inp); } catch (e) {} }
+  if (!inp) return;
+  const text = _draftGet(session);
+  if (inp.value !== text) { inp.value = text; try { autoGrow(inp); } catch (_) {} }
 }
-// The 250ms debounce can lose the final keystrokes to a reload or a tab kill.
-// pagehide fires on both, including iOS bfcache suspends, so flush synchronously.
+// Fullscreen is another editor of the same draft, including before collapse.
+// Input events from programmatic history/chip selection use this path too.
+function _draftInputChanged(input) {
+  if (!input) return;
+  const id = input.id || '';
+  if (id === 'peek-cmd-input' || id === 'peek-input-fs-ta') _draftSave(peekSession, input.value);
+  else if (id.startsWith('input-')) _draftSave(id.slice(6), input.value);
+}
+document.addEventListener('input', event => _draftInputChanged(event.target));
+window.addEventListener('storage', event => {
+  if (event.storageArea !== localStorage || !event.key || !event.key.startsWith(_DRAFT_PREFIX)) return;
+  const session = event.key.slice(_DRAFT_PREFIX.length);
+  // Read the current value, not an older queued event payload.
+  if (!_draftUnsaved.has(session)) _draftSyncInputs(session, _draftGet(session));
+});
 ['pagehide', 'visibilitychange'].forEach(ev => window.addEventListener(ev, () => {
   if (ev === 'visibilitychange' && document.visibilityState !== 'hidden') return;
-  document.querySelectorAll('textarea.send-input').forEach(inp => {
-    const id = inp.id || '';
-    if (id === 'peek-cmd-input') _draftSave(typeof peekSession !== 'undefined' ? peekSession : '', inp.value);
-    else if (id.startsWith('input-')) _draftSave(id.slice(6), inp.value);
-  });
+  for (const [session, record] of _draftUnsaved) _draftPersist(session, record);
 }));
 
 async function sendFromInput(name) {
@@ -6364,82 +8996,57 @@ async function sendFromInput(name) {
     // The message is pre-filled so the user can review/edit before sending.
     inp.value = '';
     inp.style.height = 'auto';
+    _draftClear(name);
     _clearCardFiles(name);
     channelOpen(name, routed.target, routed.message);
     return;
   }
-  // Honour the SAME send/queue mode the peek composer uses — the card now has
-  // the same split control, and a button labelled Queue that sends anyway would
-  // be the AMUX-2140 shape: a control you can read correctly and still be lied
-  // to by. Direct-send when the worker is at a selector, matching sendPeekCmd:
-  // a waiting session needs the keystroke to land now, not at a turn boundary.
-  const _atSel = (sessions.find(s => s.name === name) || {}).status === 'waiting';
-  if (_sendMode === 'queue' && !_atSel) {
-    cmdHistoryAdd(text || msg, { type: 'steering' });
-    inp.value = '';
-    _draftClear(name);
-    inp.style.height = 'auto';
-    const _nf = _files.length;
-    _clearCardFiles(name);
-    const splitMain = inp.closest('.panel, .card')?.querySelector('.send-split-main');
-    if (splitMain) { splitMain.dataset.prevText = splitMain.textContent; splitMain.textContent = 'Queuing…'; splitMain.disabled = true; splitMain.style.opacity = '0.6'; }
-    await steerSession(name, _expandAtMentions(msg));
-    if (splitMain) { splitMain.textContent = splitMain.dataset.prevText || 'Queue'; splitMain.disabled = false; splitMain.style.opacity = ''; }
-    inp.style.borderColor = '#a371f7';
-    setTimeout(() => { inp.style.borderColor = ''; }, 600);
-    const sess = sessions.find(s => s.name === name);
-    const cnt = _steerHumanCount(sess);
-    if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : '') + (_nf ? ' · ' + _nf + ' file' + (_nf === 1 ? '' : 's') : ''));
-    return;
+  const original = inp.value;
+  const queued = _sendMode === 'queue' && (sessions.find(s => s.name === name) || {}).status !== 'waiting';
+  if (_composerPendingSends.has(name)) return;
+  const draftRevision = _draftSave(name, original);
+  _composerPendingSends.add(name);
+  _syncComposerPending();
+  try {
+    const identity = {};
+    const result = queued ? (await steerSession(name, _expandAtMentions(msg), identity) ? 'queued' : 'failed')
+      : await doSend(name, _expandAtMentions(msg), identity);
+    if (!['sent', 'queued'].includes(result)) {
+      _composerUnconfirmed(name, result, _files.length);
+      showToast(result === 'local-failed' ? _writeError + ' — draft and attachments kept'
+        : 'Message not confirmed — draft and attachments kept');
+      return;
+    }
+    cmdHistoryAdd(text || msg, { session: name, type: queued ? 'steering' : 'direct', msg_id:identity.msg_id });
+    _composerAcceptLocal(name, original, draftRevision);
+    // Remove the SENT attachments durably, not just from the on-screen array.
+    // _cancelUpload deletes the IndexedDB upload row; a plain array filter left
+    // it behind, so _attachmentRestore re-hydrated every sent file on the next
+    // reload/reconnect and the card chips piled up with green ticks despite
+    // having been delivered (Ethan, 2026-09-12: "these files keep accumulating
+    // here despite im pretty sure they're being sent"). This is the same clear
+    // sendPeekCmd already does; the card path had drifted from it.
+    const sent = new Set();
+    for (const f of _files) {
+      if (!_cancelUpload(f)) continue;
+      sent.add(f);
+      if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+    }
+
+    _cardFiles[name] = (_cardFiles[name] || []).filter(f => !sent.has(f));
+    renderCardFiles(name);
+    if (result === 'sent') showToast('Sent to ' + name);
+  } catch (e) {
+    _composerUnconfirmed(name, 'exception', _files.length);
+    showToast('Message not confirmed — draft and attachments kept');
+  } finally {
+    _composerPendingSends.delete(name);
+    _syncComposerPending();
   }
-  cmdHistoryAdd(text || msg);
-  inp.value = '';
-  _draftClear(name);          // it left the composer — a restored copy would be a ghost
-  inp.style.height = 'auto';
-  _clearCardFiles(name);
-  // OUTCOME FROM doSend, NOT FROM A FLAG SAMPLED BEFORE THE ATTEMPT (amux-cloud,
-  // reviewing this card). `online` and "what the send actually did" are two different
-  // facts and they diverge in reachable ways: an online fetch that THROWS gets queued
-  // while the toast said "Sent" — false success in exactly the case this card exists to
-  // report; a 500 produced two contradictory toasts with the wrong one last; and a
-  // declined start prompt sent nothing while claiming it had (62 of 105 lanes are not
-  // running, so that path is live).
-  //
-  // Same defect as AMUX-2363 six commits earlier, inverted onto the client: there the
-  // endpoint reported that it was REACHED rather than what it DID. doSend knows the
-  // outcome; it was throwing it away and the caller was guessing.
-  const _outcome = await doSend(name, _expandAtMentions(msg));
-  // Same queue/send semantics as the peek composer. doSend() has always queued
-  // correctly when offline; the worker list just never SAID which happened — a
-  // 400ms green border reads identically for "delivered" and "sitting in a local
-  // queue until the server comes back". Those are different facts and the second
-  // one is the one you need.
-  const _colour = { sent: 'var(--green)', queued: '#d29922', starting: '#d29922',
-                    failed: 'var(--red, #f85149)', declined: '' };
-  inp.style.borderColor = _colour[_outcome] !== undefined ? _colour[_outcome] : 'var(--green)';
-  setTimeout(() => { inp.style.borderColor = ''; }, 600);
-  if (typeof showToast === 'function') {
-    // Silent when doSend already spoke — that double-toast was case 2 in the review,
-    // where the WRONG message was the one left on screen.
-    const _msg = { sent: 'Sent to ' + name,
-                   queued: 'Offline \u2014 queued for ' + name,
-                   starting: 'Starting ' + name + ' \u2014 will resend',
-                   declined: 'Not sent \u2014 ' + name + ' is not running' }[_outcome];
-    if (_msg) showToast(_msg);
-  }
-  _cardQueuedBadge(name);
 }
 
-// Mirror the peek's "queued" pill onto the card, so a worker with locally-queued
-// messages looks the same in both places rather than only in the peek.
-function _cardQueuedBadge(name) {
-  try {
-    const n = (offlineQueue || []).filter(op =>
-      (op.url || '').indexOf('/api/sessions/' + encodeURIComponent(name) + '/send') !== -1).length;
-    const btn = document.querySelector('#input-' + CSS.escape(name) + ' ~ button, .card[data-session="' + CSS.escape(name) + '"] .send-row button');
-    if (btn) btn.textContent = n ? ('\u23F3 ' + n) : 'Send';
-  } catch (e) {}
-}
+// Composer labels describe the selected action, never background transport.
+function _cardQueuedBadge() { _syncComposerPending(); }
 
 let _peekTab = 'terminal';
 let _peekGitData = null;
@@ -6584,7 +9191,7 @@ function _renderGroupsTab() {
   if (activeView !== 'groups') return;
   const el = document.getElementById('groups-container');
   if (!el) return;
-  const all = (sessions || []).filter(s => !s.archived);
+  const all = (sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused');
   const groups = [...new Set(all.flatMap(s => s.tags || []))].sort();
   const grouped = new Set(all.filter(s => (s.tags || []).length).map(s => s.name));
   const activeN = all.filter(s => s.status === 'active').length;
@@ -6721,8 +9328,13 @@ function _grpGoto(g, where) {
 // same call the server made in _scope_write, which accepts exactly these shapes.
 let _scopeEditCtx = null, _scopeEditDirty = false;
 
-function _scopeEditClose() {
-  if (_scopeEditDirty && !confirm('Discard unsaved configuration changes?')) return;
+async function _scopeEditClose() {
+  if (_scopeEditDirty) {
+    const discard = await showConfirm('Discard unsaved configuration changes?', 'Discard', true);
+    fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:'scope-discard-choice',measured:true,n_considered:1,discarded:discard,ver:APP_VER})}).catch(() => {});
+    if (!discard) return;
+  }
   document.getElementById('scope-edit-backdrop').classList.remove('open');
   _scopeEditCtx = null; _scopeEditDirty = false;
 }
@@ -6915,7 +9527,7 @@ function _workerPrimaryConfigurationsHTML(name) {
     _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', '))),
   ];
   const runtime = [
-    _workerConfigurationRow('directory', 'Working directory', s.dir || '', 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || '')),
+    _workerConfigurationRow('directory', 'Working directory', s.worktree_active ? '~/.amux/worktrees/' + name + ' (worktree)' : (s.dir || ''), 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || '')),
     _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || '')),
     _workerConfigurationRow('provider', 'Model provider', providerLabel(provider), 'Provider swaps preserve durable board state and restart only when required.', edit('provider', provider)),
     _workerConfigurationRow('model', 'Model version', model || 'Provider default', 'A supported live switch keeps the conversation; restart fallback rehydrates from board state.', edit('model', model || '', provider)),
@@ -6925,7 +9537,7 @@ function _workerPrimaryConfigurationsHTML(name) {
   const permissions = [
     _workerConfigurationRow('yolo', 'Model tool approval bypass (YOLO)', s.yolo ? 'Enabled' : 'Disabled', 'Uses the selected provider’s native tool-permission flag.', sw(!!s.yolo, 'toggleYolo', 'Toggle model tool approval bypass')),
     _workerConfigurationRow('isolated', 'Isolated raw agent', s.isolated ? 'Enabled' : 'Disabled', 'No amux harness, hooks, MCP config, or peer discovery; restart to apply.', sw(!!s.isolated, 'toggleIsolated', 'Toggle isolated mode')),
-    _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_own ? 'Worker override.' : (s.spans_groups ? 'Inherited from a group/global layer.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : '')),
+    _workerConfigurationRow('cross_group', 'Cross-group messaging', s.spans_groups_value || 'Refused', s.spans_groups_reason || (s.spans_groups ? 'Standing allowance is active.' : 'No standing allowance.'), edit('send_allow', s.spans_groups_own ? (s.spans_groups_value || '') : '')),
     _workerConfigurationRow('external_email', 'Send external email without approval', s.external_email_allowed ? 'Allowed' : 'Approval required', s.external_email_allowed_own ? 'Worker override; applies immediately.' : 'Inherited/default; disabled by default.', _workerEmailPermissionControls(name, s)),
   ];
   const advanced = [
@@ -7427,6 +10039,21 @@ function setPeekTab(tab) {
   const logsP = document.getElementById('peek-logs-panel');
   if (tab === 'logs') { logsP.classList.add('active'); _peekLogsLoad(); }
   else { logsP.classList.remove('active'); }
+  document.getElementById('peek-tab-fanout')?.classList.toggle('active', tab === 'fanout');
+  const fanoutP = document.getElementById('peek-fanout-panel');
+  if (fanoutP) {
+    if (tab === 'fanout') { fanoutP.classList.add('active'); _peekFanoutLoad(); if (!_fanoutRefreshTimer) _fanoutRefreshTimer = setInterval(_peekFanoutLoad, 4000); }
+    else { fanoutP.classList.remove('active'); if (_fanoutRefreshTimer) { clearInterval(_fanoutRefreshTimer); _fanoutRefreshTimer = null; } }
+  }
+  requestAnimationFrame(() => {
+    const selected=document.getElementById('peek-tab-'+tab);
+    if (!selected || _peekTab!==tab || !selected.getClientRects().length) return;
+    const r=selected.getBoundingClientRect(), bounds=selected.parentElement.getBoundingClientRect();
+    if(r.left<bounds.left || r.right>bounds.right-44) {
+      selected.scrollIntoView({block:'nearest',inline:'center',behavior:'instant'});
+      amuxTrack('mobile_tab_revealed',{tab,measured:true,n_considered:1});
+    }
+  });
 }
 
 // ── Standing instructions (autonomy config) ──
@@ -7465,14 +10092,32 @@ let _steerHistLoadedFor = null;
 
 // Human-queued rows only — system pushes (m.system, server-classified) are
 // amux's own drive prompts and never count as "queued" on any surface.
+// Read optimistic steering from the durable outbox. A server row supersedes
+// its local representation by transport identity, never by matching text.
+function _steerQueueFor(sess) {
+  const server = sess?.steering || [];
+  if (!sess) return server;
+  const url = '/api/sessions/' + encodeURIComponent(sess.name) + '/steer';
+  const known = new Set(server.map(m => m.transport_id).filter(Boolean));
+  const local = offlineQueue.filter(q => q.url.split('?')[0].endsWith(url)).flatMap(q => {
+    try {
+      const body = JSON.parse(q.options.body);
+      if (body.msg_id && known.has(body.msg_id)) return [];
+      return [{id:q.id, transport_id:body.msg_id, text:body.text, queued_at:q.timestamp/1000,
+        pending:true, local:true, error:q.error || '', guard:''}];
+    } catch (_) { return []; }
+  });
+  return server.concat(local);
+}
+
 function _steerHumanCount(sess) {
-  return ((sess && sess.steering) || []).filter(m => !m.system).length;
+  return _steerQueueFor(sess).filter(m => !m.system).length;
 }
 
 function _steeringRender() {
   if (!peekSession) return;
   const sess = sessions.find(s => s.name === peekSession);
-  const queue = (sess && sess.steering) || [];
+  const queue = _steerQueueFor(sess);
   const countEl = document.getElementById('peek-steering-count');
   const list = document.getElementById('peek-steering-list');
   // SYSTEM pushes (board-drive, schedules — server-classified by the guard
@@ -7487,15 +10132,19 @@ function _steeringRender() {
   const row = m => {
     const ago = timeAgo(m.queued_at);
     const sysTag = m.system ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(148,163,184,0.15);color:var(--dim);margin-right:6px;">SYSTEM${m.guard ? ' · ' + esc(m.guard) : ''}</span>` : '';
-    return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:${m.system ? 'rgba(255,255,255,0.02)' : 'var(--card-bg)'};border:1px solid var(--border);border-radius:8px;${m.system ? 'opacity:0.85;' : ''}">
+    // Durable local intent has no server steering ID yet; server-only actions
+    // stay disabled until acknowledgement. Offline/error state remains explicit.
+    const pendTag = m.pending ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(210,153,34,0.16);color:#d29922;margin-right:6px;">${m.error ? 'Needs review' : online ? 'Awaiting server' : 'Saved offline'}</span>` : '';
+    const dis = m.pending ? 'disabled style="opacity:0.5;font-size:0.7rem;padding:2px 8px;"' : 'style="font-size:0.7rem;padding:2px 8px;"';
+    return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:${m.system ? 'rgba(255,255,255,0.02)' : 'var(--card-bg)'};border:1px solid ${m.pending ? 'rgba(210,153,34,0.45)' : 'var(--border)'};border-radius:8px;${m.system ? 'opacity:0.85;' : ''}">
       <div style="flex:1;min-width:0;">
-        ${sysTag ? `<div style="margin-bottom:4px;">${sysTag}</div>` : ''}
+        ${(sysTag || pendTag) ? `<div style="margin-bottom:4px;">${sysTag}${pendTag}</div>` : ''}
         <div style="font-size:0.85rem;color:${m.system ? 'var(--dim)' : 'var(--fg)'};white-space:pre-wrap;word-break:break-word;">${esc(m.text)}</div>
         <div style="font-size:0.75rem;color:var(--dim);margin-top:4px;">Queued ${ago}</div>
       </div>
       <div style="display:flex;gap:4px;flex-shrink:0;">
-        <button class="btn primary" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringSendNow('${m.id}')">Send now</button>
-        <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringCancel('${m.id}')">✕</button>
+        <button class="btn primary" ${dis} onclick="_steeringSendNow('${m.id}')">Send now</button>
+        <button class="btn" ${dis} onclick="_steeringCancel('${m.id}')">✕</button>
       </div>
     </div>`;
   };
@@ -7562,14 +10211,16 @@ function _steeringUpdateBadge() {
 async function _steeringSendNow(msgId) {
   if (!peekSession) return;
   const sess = sessions.find(s => s.name === peekSession);
-  const msg = ((sess && sess.steering) || []).find(m => m.id === msgId);
+  const msg = _steerQueueFor(sess).find(m => m.id === msgId);
   if (!msg) return;
   const btn = document.querySelector(`[onclick*="_steeringSendNow('${msgId}')"]`);
   if (btn) { btn.textContent = 'Sending…'; btn.disabled = true; btn.style.opacity = '0.6'; }
+  showToast('Sending now to ' + peekSession + '…');
   try {
-    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/send', {
+    const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/send', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text: msg.text, deliver_now: true})
+      body: JSON.stringify({text: msg.text, deliver_now: true}),
+      signal: AbortSignal.timeout(90000)
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || !d.ok || String(d.message || '').startsWith('queued')) {
@@ -7577,7 +10228,7 @@ async function _steeringSendNow(msgId) {
       showToast(d.message ? ('Not sent: ' + d.message) : 'Not sent — kept in queue');
       return;
     }
-    await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', {
+    await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', {
       method: 'DELETE', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({id: msgId, sent: true})
     });
@@ -7586,7 +10237,7 @@ async function _steeringSendNow(msgId) {
     _steeringLoadHistory();
     _steeringUpdateBadge();
     render();
-    showToast('Sent to ' + peekSession);
+    showToast('Sent now to ' + peekSession);
     fetchSessions();
   } catch(e) { if (btn) { btn.textContent = 'Send now'; btn.disabled = false; btn.style.opacity = ''; } showToast('Failed to send'); }
 }
@@ -7598,6 +10249,7 @@ async function _steeringCancel(msgId) {
   _steeringRender();
   _steeringUpdateBadge();
   render();
+  showToast('Removed from queue');
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', {
       method: 'DELETE', headers: {'Content-Type': 'application/json'},
@@ -8235,7 +10887,30 @@ function togglePeekIssuesAll() {
   renderPeekIssues();
 }
 
+// AMUX-4863: THE ACTIVITY STRIP IS RENDERED AFTER THE LIST, NOT BEFORE IT.
+//
+// `_renderBoardActivity` puts the strip INSIDE `#peek-issues-list`, because that
+// is the element carrying `overflow-y: auto` and the strip has to scroll away
+// with the board (085f5a16; before it the strip sat in the non-scrolling flex
+// parent and held fixed vertical space on a phone).
+//
+// Inside is exactly what `list.innerHTML = ...` destroys, and every exit path of
+// the render below assigns it: the empty-board line, the list view, and both
+// branches of the kanban view. Calling the strip first, as the body used to,
+// created it and then wiped it on every single render. Seven e2e specs across
+// all three browser projects failed on `#peek-issues-list-activity` not being
+// found, and the message reads like a stale selector rather than a render order.
+//
+// Wrapped rather than fixed at each `list.innerHTML` site. There are five exit
+// paths today and the next branch added would have to remember; here the strip
+// is re-rendered after the body returns, whatever route it took.
 function renderPeekIssues() {
+  _renderPeekIssuesBody();
+  // Re-read the host: the body may have replaced the panel's contents.
+  const list = document.getElementById('peek-issues-list');
+  if (list) _renderBoardActivity(list, _peekIssuesAllSessions ? '' : peekSession);
+}
+function _renderPeekIssuesBody() {
   // Don't rebuild mid-drag — a board SSE refresh would destroy the active Sortable.
   if (document.body.classList.contains('board-dragging')) return;
   // NOT LOADED IS NOT EMPTY (Ethan, 2026-08-06 — screenshot of the amux worker's
@@ -8261,6 +10936,9 @@ function renderPeekIssues() {
       .finally(() => { _peekIssuesFetching = false; renderPeekIssues(); });
   }
   const list = document.getElementById('peek-issues-list');
+  // The strip used to be rendered HERE and was destroyed by every
+  // `list.innerHTML` below. It is now rendered by the wrapper, after this
+  // body returns (AMUX-4863).
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
   // The per-session panel shows the lane's FULL record including archived, so
@@ -8904,7 +11582,11 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.813';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1006';   // bump together with the sw.js CACHE version
+// Warm the shared catalog so model-type filters are exact on first use. A
+// failure is non-fatal (custom ids and the open-string fallback still work)
+// and is already reported by _loadModelCatalog.
+_loadModelCatalog().then(() => { if (!_initialLoad) render(); }).catch(() => {});
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8914,23 +11596,76 @@ const APP_VER = '0.9.813';   // bump together with the sw.js CACHE version
 // a visible failure toast naming the error. Rate-limited so a render-loop
 // error cannot toast-storm. This is the floor, not the goal — actions should
 // still give their own success feedback (toast / row animation / re-render).
+// SAY WHERE, AND DO NOT DROP IT UNDER LOAD (2026-09-09). The net above reported
+// `ev.message` and nothing else, which leaves a real bug undiagnosable: "Cannot
+// read properties of null (reading 'classList')" is a true statement about 600+
+// call sites in this 1.9MB bundle and names none of them. A user's screenshot of
+// that toast was the only record an error had ever happened, and it was not
+// enough to find the line — `ev.filename`, `ev.lineno`, `ev.colno` and
+// `ev.error.stack` were all on the event and all discarded.
+//
+// Two changes, and the second matters more than it looks:
+//   1. Carry the location and the stack. The toast gains `@ app.js:LINE:COL`
+//      (which is what a person screenshots) and the beacon carries the full
+//      stack plus the route, so `kind=client-action-error` in server-rs.log is
+//      enough to fix from.
+//   2. Beacon BEFORE the rate limit, deduped by SIGNATURE instead of by time.
+//      The 4s window is correct for toasts — a render-loop error must not
+//      toast-storm — but it was also gating the beacon, so during a burst every
+//      error after the first was lost from the record too. Distinct errors now
+//      always beacon; an identical repeat never does. Rate-limiting the evidence
+//      the same way you rate-limit the notification is how a burst erases
+//      exactly the errors that matter most (ethos rule 4).
 (function () {
   let _lastErrToast = 0;
-  function _surface(kind, msg) {
+  let _suppressed = 0;          // distinct errors swallowed by the toast window
+  const _sent = new Set();      // beacon signatures already recorded this load
+
+  // Bare filename keeps the toast readable; the beacon keeps the full picture.
+  // A cross-origin script reports "Script error." with NO location, so '' here
+  // means "the browser refused to say", not "we did not look".
+  function _loc(ev) {
+    if (!ev || !ev.filename) return '';
+    const f = String(ev.filename).replace(/^.*\//, '').split('?')[0];
+    return f + ':' + (ev.lineno || 0) + ':' + (ev.colno || 0);
+  }
+
+  function _beacon(kind, text, where, stack) {
     try {
-      const now = Date.now();
-      if (now - _lastErrToast < 4000) return;
-      _lastErrToast = now;
+      const sig = kind + '|' + text + '|' + where;
+      if (_sent.has(sig)) return;
+      if (_sent.size > 200) _sent.clear();   // bounded; distinct sites are few
+      _sent.add(sig);
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        keepalive:true,
+        body:JSON.stringify({kind:'client-action-error',verdict:kind,message:text,
+          where: where || null, stack: String(stack || '').slice(0, 2000),
+          route: location.pathname + location.search + location.hash,
+          measured:true,n_considered:1,ver:APP_VER})}).catch(() => {});
+    } catch (e) {}
+  }
+
+  function _surface(kind, msg, where, stack) {
+    try {
       const text = String(msg || 'unknown error').slice(0, 140);
-      if (typeof showToast === 'function') showToast('\u26a0 ' + kind + ': ' + text);
-      console.error('amux ' + kind + ':', msg);
+      _beacon(kind, text, where, stack);
+      console.error('amux ' + kind + ':', msg, where || '', stack || '');
+      const now = Date.now();
+      if (now - _lastErrToast < 4000) { _suppressed++; return; }
+      _lastErrToast = now;
+      const more = _suppressed ? ' (+' + _suppressed + ' more)' : '';
+      _suppressed = 0;
+      if (typeof showToast === 'function') {
+        showToast('\u26a0 ' + kind + ': ' + text + (where ? ' @ ' + where : '') + more);
+      }
     } catch (e) {}
   }
   window.addEventListener('unhandledrejection', function (ev) {
-    _surface('action failed', ev.reason && (ev.reason.message || ev.reason));
+    const r = ev.reason;
+    _surface('action failed', r && (r.message || r), '', r && r.stack);
   });
   window.addEventListener('error', function (ev) {
-    _surface('script error', ev.message);
+    _surface('script error', ev.message, _loc(ev), ev.error && ev.error.stack);
   });
 })();
 let _peekScrollLockY = 0;
@@ -9091,7 +11826,7 @@ function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
   _peekHistoryHTML = cached.histHTML || (cached.history ? _peekHtml(cached.history) : '');
-  _lastLiveHTML = cached.liveHTML || (cached.output ? _peekHtml(cached.output) : '');
+  _lastLiveHTML = cached.output ? _peekLiveHtml(cached.output) : '';
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
@@ -9100,6 +11835,11 @@ function _paintCachedPeek(cached) {
   return true;
 }
 function openPeek(name, opts) {
+  _peekAgentsReset();
+  _bindPeekScrollAffordance();
+  requestAnimationFrame(_peekScrollAffordance);
+  _peekOpenGeneration++;
+  const openIdentity = _peekIdentity(name);
   try { _applyPeekTabVisibility(); } catch(e) {}
   _peekPollStop('switch');   // wind down any prior open-view poller (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
@@ -9114,8 +11854,18 @@ function openPeek(name, opts) {
     _peekFilesRestore(name);
   }
   peekSession = name;
+  _syncComposerPending();
+  const identityOverlay = document.getElementById('peek-overlay');
+  if (identityOverlay) {
+    identityOverlay.dataset.session = name;
+    identityOverlay.dataset.generation = String(openIdentity.generation);
+  }
   _lastPeekedSession = name;   // remembered for the Messages view's default filter
   _peekScrollLocked = false;
+  _peekFollowBottom = !(opts && opts.query);
+  _peekWatchBottom();
+  _peekBufferedOutput = false;
+  _hideScrollLockBadge(document.getElementById('peek-body'));
   // Reset the Plan strip so it reloads for the new session (no stale flash).
   _peekPlanLast = 0;
   const _pp = document.getElementById('peek-plan'); if (_pp) _pp.style.display = 'none';
@@ -9165,11 +11915,15 @@ function openPeek(name, opts) {
   if (searchInp) {
     searchInp.value = prefillQuery;
     document.getElementById('peek-search-wrap').classList.toggle('has-value', !!prefillQuery);
+    document.getElementById('peek-search-wrap').hidden = !prefillQuery;
+    document.getElementById('peek-find-toggle').setAttribute('aria-expanded', String(!!prefillQuery));
   }
   // Same draft the session-list card composer uses. Start typing in one, open
   // the other, and the text is already there.
   const draft = _draftGet(name) || '';
   const cmdInp = document.getElementById('peek-cmd-input');
+  document.getElementById('peek-input-fs').classList.remove('open');
+  _draftSyncInputs(name, draft);
   cmdInp.value = draft;
   autoGrow(cmdInp);
   peekCmdOpen = true;
@@ -9179,9 +11933,7 @@ function openPeek(name, opts) {
   document.getElementById('peek-title').textContent = name;
   const _peekSess = sessions.find(s => s.name === name);
   const _peekTask = _peekSess && _peekSess.task_name;
-  const peekTaskRow = document.getElementById('peek-task-row');
-  peekTaskRow.style.display = _peekTask ? 'flex' : 'none';
-  if (_peekTask) document.getElementById('peek-task-label').textContent = _peekTask;
+  _bindPeekTaskIdentity(_peekSess, openIdentity);
   updatePeekStatus();
   document.getElementById('peek-body').innerHTML = '<div class="peek-loading"><div class="peek-spin-lg"></div><span>Loading latest…</span></div>';
   // Reset tab badges; will be repopulated by _peekUpdateTabCounts
@@ -9192,6 +11944,8 @@ function openPeek(name, opts) {
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
+  _peekLoadKindHints(peekSession);   // fast provenance for prompt classification
+  _peekMessagesLoad(false);
   // Every worker opens on its live terminal. A provider-specific default made
   // Codex/Ollama workers jump to Transcript after the reset above, so the
   // default differed by provider and hid the interactive pane at the moment a
@@ -9212,6 +11966,22 @@ function openPeek(name, opts) {
   updateConnectionStatus();
   const peekOv = document.getElementById('peek-overlay');
   peekOv.classList.add('active');
+  // A translated/scaled terminal changes the visible scroll viewport after its
+  // first paint. Keep this contract observable so a future generic-overlay CSS
+  // change announces the bounce in the normal log sweep as well as browser E2E.
+  requestAnimationFrame(() => {
+    if (!_peekIdentityCurrent(openIdentity)) return;
+    const style = getComputedStyle(peekOv);
+    const transitions = style.transitionProperty.split(',').map(v => v.trim());
+    if (style.transform !== 'none' || transitions.includes('transform') || transitions.includes('all')) {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, keepalive: true,
+        body: JSON.stringify({kind:'peek-motion-contract', verdict:'layout_shift',
+          measured:true, n_considered:1, session:name, transform:style.transform,
+          transition:style.transitionProperty, ver:APP_VER}),
+      }).catch(() => {});
+    }
+  });
   showPeekLoading('Loading latest…');   // now the overlay is active — the "loading latest" cue can attach
   // Freeze the page behind the overlay: otherwise iOS scrolls the session list
   // to reveal the focused input, sliding content around under the fixed overlay
@@ -9237,13 +12007,13 @@ function openPeek(name, opts) {
   // the fetch is 300ms+ the cached content — with pre-rendered HTML — paints
   // almost immediately instead of showing "Loading latest..." for 150ms+.
   _idb.get('peek_' + name).then(cached => {
-    if (peekSession !== name || !cached) return;
+    if (!_peekIdentityCurrent(openIdentity) || !cached) return;
     setTimeout(() => {
-      if (peekSession !== name) return;
+      if (!_peekIdentityCurrent(openIdentity)) return;
       if (!lastPeekHTML) {
         if (_paintCachedPeek(cached)) {
           const body = document.getElementById('peek-body');
-          body.scrollTop = body.scrollHeight;
+          if (_peekFollowBottom) body.scrollTop = body.scrollHeight;
         }
       }
     }, 30);
@@ -9253,10 +12023,14 @@ function openPeek(name, opts) {
   // a session now shows the latest immediately instead of waiting on ~120KB of
   // history — and 4 ansiToHtml passes over it — before anything appears.
   _peekLastChangeMs = performance.now();   // snappy first couple seconds after opening a peek
-  // First fetch: live frame with notrim → paints the current terminal (the
-  // LATEST) instantly, without waiting on the ~120KB full-history render. The
-  // full payload follows and fills in scrollback above.
-  refreshPeek(true, true).finally(() => refreshPeek());
+  // Race the small live frame and the full transcript. The former is normally
+  // fastest, but it must not be a serial gate: one stuck live request used to
+  // prevent the healthy full response from even starting, leaving "Loading
+  // latest…" on screen indefinitely. Identity checks make either
+  // arrival order safe, and the client overlap guard keeps a late raw live
+  // frame from duplicating transcript content.
+  refreshPeek(true, true);
+  refreshPeek();
   _schedulePeekPoll();
   // resize-on-peek + its lease removed (AMUX-2981); the capture is a fixed
   // 220-col pane the reader scrolls, so there is nothing to fit or hold.
@@ -9264,73 +12038,101 @@ function openPeek(name, opts) {
   _savePeekState();
 }
 
-// The pane-driven agent switcher (_markAgentRows + agentNav + the ⌂/▲/▼
-// strip) was DELETED (ARE-7): it keyed on a "⏺ main" panel row Claude Code no
-// longer renders — 0 of 50 sessions matched, so three layers plus a server
-// verb were wired end-to-end and reached nobody, forever. The subagent list
-// (AMUX-2635, below) is the replacement: durable transcripts, 50 of 50, no
-// visibility gate to rot. Resurrection: git log -S agentNav.
-
-// ── Subagent list (AMUX-2635) ───────────────────────────────────────────────
-// Reads DURABLE transcripts via GET /api/sessions/<n>/subagents rather than
-// inferring from the pane. The predicate this replaces matched 0 of 50 lanes;
-// the transcripts match 50 of 50. Note there is no visibility gate on the
-// button at all — the fix for a predicate that matched nothing is to need no
-// predicate, not to write a better one.
-function closeSubagents() {
-  document.getElementById('subagents-overlay')?.classList.remove('active');
+// Read-only terminal navigation. Never send terminal keys to choose a child:
+// a provider may interpret them as composer edits or commands (AMUX-4368).
+let _peekAgents = {session:null, items:[], selected:null, loadedAt:0, loading:false, error:false};
+function _peekAgentsReset() {
+  _peekAgents = {session:null, items:[], selected:null, loadedAt:0, loading:false, error:false};
+  _peekAgentsPaint();
 }
-
-async function openSubagents() {
-  if (!peekSession) return;
-  const ov = document.getElementById('subagents-overlay');
-  const list = document.getElementById('subagents-list');
-  const title = document.getElementById('subagents-title');
-  if (!ov || !list) return;
-  if (title) title.textContent = 'Subagents \u00B7 ' + peekSession;
-  list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">Loading\u2026</div>';
-  ov.classList.add('active');
-  const sess = peekSession;
-  let d;
+function _peekAgentsLog(action, extra) {
+  fetch(API + '/api/client-debug', {method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+    body:JSON.stringify({kind:'subagent-navigation',action,session:peekSession,ver:APP_VER,...extra})}).catch(()=>{});
+}
+function _peekAgentsPaint() {
+  const nav = document.getElementById('peek-agent-nav');
+  if (!nav) return;
+  const state = _peekAgents;
+  nav.hidden = !state.items.length && !state.error;
+  const index = state.selected ? state.items.findIndex(s=>s.id===state.selected.id && s.conversation===state.selected.conversation)+1 : 0;
+  const label = document.getElementById('peek-agent-label');
+  label.textContent = state.error ? 'Agents unavailable' : (index ? 'Agent '+index : 'Main') + ' · '+(index+1)+'/'+(state.items.length+1);
+  label.title = state.error ? 'Use either arrow to retry' : state.selected?.description || state.selected?.id || 'Main worker';
+  nav.querySelectorAll('button').forEach(b=>b.disabled=state.loading);
+  const input=document.getElementById('peek-cmd-input');
+  if (input) { input.placeholder = 'Message…'; input.setAttribute('aria-label', state.selected ? 'Message the main worker' : 'Message the worker'); }
+}
+async function _peekAgentsLoad(force=false) {
+  const name = peekSession;
+  const state = _peekAgents;
+  if (!name || state.loading || (!force && Date.now()-state.loadedAt<30000)) return;
+  state.session=name; state.loading=true; _peekAgentsPaint();
   try {
-    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(sess) + '/subagents',
-                          { headers: _authHeaders() });
-    d = await r.json();
-    if (!r.ok) throw new Error(d && d.error ? d.error : ('HTTP ' + r.status));
-  } catch (e) {
-    // Say WHICH failure. The old switcher's one message blamed the panel for
-    // every cause, which is what made this unreachable for months.
-    list.innerHTML = '<div style="color:var(--red);font-size:0.85rem;padding:18px;text-align:center;">'
-      + 'Could not load subagents.<br><span style="color:var(--dim);font-size:0.78rem;">' + esc(e.message) + '</span></div>';
-    return;
+    const r=await fetch(API+'/api/sessions/'+encodeURIComponent(name)+'/subagents', {headers:_authHeaders(),signal:AbortSignal.timeout(15000)});
+    const data=await r.json();
+    if (!r.ok || data.session!==name || !Array.isArray(data.subagents)) throw new Error('Invalid subagent list');
+    if (_peekAgents!==state || peekSession!==name) return;
+    // Keep the navigation order stable while a child's mtime changes.
+    const ids = s=>s.conversation+':'+s.id;
+    const fresh=new Map(data.subagents.map(s=>[ids(s),s]));
+    const ordered=state.items.filter(s=>fresh.has(ids(s))).map(s=>fresh.get(ids(s)));
+    const known=new Set(ordered.map(ids));
+    const all = ordered.concat(data.subagents.filter(s=>!known.has(ids(s))));
+    const cutoff = Date.now() / 1000 - 300;
+    state.items = all.filter(s => s.last_active > cutoff);
+    state.error=false; state.loadedAt=Date.now();
+    _peekAgentsLog('list',{count:state.items.length});
+  } catch(e) {
+    if (_peekAgents!==state || peekSession!==name) return;
+    state.error=true; state.loadedAt=Date.now();
+    _peekAgentsLog('list-failed',{error:String(e)});
+  } finally {
+    state.loading=false;
+    if (_peekAgents===state) _peekAgentsPaint();
   }
-  if (peekSession !== sess) return;   // switched away mid-fetch
-  const subs = (d && d.subagents) || [];
-  if (!subs.length) {
-    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px 12px;text-align:center;">'
-      + 'No subagents for this worker yet.<br>'
-      + '<span style="font-size:0.78rem;">Forks it spawns will appear here.</span></div>';
-    return;
-  }
-  list.innerHTML = subs.map(s => {
-    const when = s.last_active ? timeAgo(s.last_active) : '';
-    // An ABSENT description renders as the agent id in dim type — never a
-    // guessed label. 11 of 66 real transcripts carry none, and an invented
-    // one cannot be told from a real one.
-    const label = s.description
-      ? '<span style="color:var(--text);">' + esc(s.description) + '</span>'
-      : '<span style="color:var(--dim);font-style:italic;">' + esc(s.id) + '</span>';
-    const kind = s.type ? '<span class="chip" style="font-size:0.68rem;">' + esc(s.type) + '</span>' : '';
-    return '<div style="border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:8px;">'
-      + '<div style="display:flex;gap:8px;align-items:flex-start;justify-content:space-between;">'
-      +   '<div style="min-width:0;font-size:0.86rem;line-height:1.35;">' + label + '</div>' + kind
-      + '</div>'
-      + '<div style="color:var(--dim);font-size:0.72rem;margin-top:5px;">'
-      +   (s.turns || 0) + ' turns' + (when ? ' \u00B7 ' + esc(when) : '')
-      + '</div></div>';
-  }).join('');
 }
-
+async function _peekAgentStep(delta) {
+  if (_peekAgents.error) await _peekAgentsLoad(true);
+  const state=_peekAgents;
+  if (state.loading || !state.items.length || !peekSession) return;
+  const index=state.selected ? state.items.findIndex(s=>s.id===state.selected.id && s.conversation===state.selected.conversation)+1 : 0;
+  const next=(index+delta+state.items.length+1)%(state.items.length+1);
+  state.selected=next ? state.items[next-1] : null;
+  hidePeekLoading(); // the parent load indicator does not describe this selected view
+  _peekOpenGeneration++; // invalidate pending parent/child replies on every switch
+  _peekAgentsPaint();
+  _peekAgentsLog('select',{agent:state.selected?.id || 'main'});
+  if (state.selected) {
+    lastPeekHTML='<span class="peek-agent-heading">Loading subagent output…</span>';
+    applyPeekSearch(true,false);
+    await _peekAgentRefresh();
+  } else {
+    lastPeekHTML=_peekEarlierHTML()+_peekHistoryHTML+_lastLiveHTML;
+    applyPeekSearch(true,false);
+    refreshPeek();
+  }
+}
+async function _peekAgentRefresh() {
+  const name=peekSession, state=_peekAgents, selected=state.selected;
+  if (!name || !selected) return;
+  const identity=_peekIdentity(name);
+  const sequence=state.outputSequence=(state.outputSequence || 0)+1;
+  try {
+    const r=await fetch(API+'/api/sessions/'+encodeURIComponent(name)+'/subagents?agent='+encodeURIComponent(selected.id)+'&conversation='+encodeURIComponent(selected.conversation),
+      {headers:_authHeaders(),signal:AbortSignal.timeout(15000)});
+    const data=await r.json();
+    if (!_peekIdentityCurrent(identity) || state!==_peekAgents || state.selected!==selected || state.outputSequence!==sequence) return;
+    if (!r.ok || data.session!==name || data.agent!==selected.id || data.conversation!==selected.conversation || typeof data.output!=='string') throw new Error(data.error || 'Invalid subagent output');
+    const html='<span class="peek-agent-heading">Subagent: '+esc(selected.description || selected.id)+'</span>\n\n'+(data.output ? _peekHtml(data.output) : '<span class="peek-agent-heading">No output yet.</span>');
+    if (lastPeekHTML!==html) {lastPeekHTML=html; applyPeekSearch(true,false);}
+    document.getElementById('peek-status').textContent='Recent subagent output · Updated '+new Date().toLocaleTimeString()+' · v'+APP_VER;
+  } catch(e) {
+    if (!_peekIdentityCurrent(identity) || state!==_peekAgents || state.selected!==selected || state.outputSequence!==sequence) return;
+    lastPeekHTML='<span class="peek-agent-heading">Could not load subagent output. Retrying automatically; use the arrows to switch.</span>';
+    applyPeekSearch(true,false);
+    _peekAgentsLog('output-failed',{agent:selected.id,error:String(e)});
+  }
+}
 
 function copyPeekContent() {
   const body = document.getElementById('peek-body');
@@ -9345,6 +12147,10 @@ function copyPeekContent() {
 }
 
 function closePeek() {
+  _peekFollowBottom = false;
+  _peekStopBottomWatch();
+  _peekAgentsReset();
+  _closePeekFilters();
   _peekLeaseStop();   // AMUX-2634: stop holding the worker's pane at our width
   // Reset peek notes
   // Fold the fullscreen composer (if open) back into the input, and close menus,
@@ -9357,13 +12163,12 @@ function closePeek() {
     _fs.classList.remove('open');
   }
   if (typeof _peekMoreClose === 'function') _peekMoreClose();
-  // Save command draft for this session
+  // Text is committed on edit; closing must not re-save a stale DOM copy
+  // while a cross-tab storage event is still queued.
   if (peekSession) {
-    const inp = document.getElementById('peek-cmd-input');
-    const val = inp ? inp.value : '';
-    _draftSave(peekSession, val);
     _peekFilesStash(peekSession);   // the other half of the same draft
   }
+  _peekOpenGeneration++;   // invalidate every response issued by this open
   peekSession = null;
   peekSearchQuery = '';
   lastPeekHTML = '';
@@ -9377,6 +12182,8 @@ function closePeek() {
   if (splitBtn) splitBtn.classList.remove('active');
   const ov = document.getElementById('peek-overlay');
   ov.classList.remove('active', 'vv-compact', 'peek-focus');
+  delete ov.dataset.session;
+  delete ov.dataset.generation;
   ov.style.height = '';
   ov.style.top = '';
   ov.style.bottom = '';
@@ -9589,6 +12396,22 @@ let _menuBeaconCount = 0;   // card-menu-geo beacons per load (AMUX-1731)
 // Second snapshot with the keyboard UP (fires once, on first input focus) —
 // the keyboard-down beacon can't show keyboard-state bugs.
 let _kbdBeaconSent = false;
+function _peekComposerGeometry() {
+  const input = document.getElementById('peek-cmd-input');
+  if (!input || !input.getClientRects().length) return { measured: false, n_considered: 0, why_unmeasured: 'composer_hidden' };
+  const style = getComputedStyle(input);
+  const ctx = document.createElement('canvas').getContext('2d');
+  if (!ctx) return { measured: false, n_considered: 0, why_unmeasured: 'text_measurement_unavailable' };
+  ctx.font = style.fontSize + ' ' + style.fontFamily;
+  const available = input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const width = ctx.measureText(input.placeholder).width;
+  const fits = width <= available + 1;
+  return { measured: true, n_considered: 1,
+    verdict: !input.value && !fits ? 'composer_placeholder_clipped' : 'composer_readable',
+    placeholder_fits: fits, empty: !input.value,
+    placeholder_width_px: Math.round(width), available_text_width_px: Math.round(available),
+    input_height_px: Math.round(input.getBoundingClientRect().height) };
+}
 function _peekKbdBeacon() {
   if (_kbdBeaconSent || window.innerWidth > 700) return;
   _kbdBeaconSent = true;
@@ -9604,7 +12427,7 @@ function _peekKbdBeacon() {
       fetch(API + '/api/client-debug', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          kind: 'peek-geo-kbd', ver: APP_VER,
+          ..._peekComposerGeometry(), kind: 'peek-geo-kbd', ver: APP_VER,
           appliedZoom: document.documentElement.style.zoom || '1',
           win: window.innerWidth + 'x' + window.innerHeight,
           vvH: Math.round(vv.height || 0), vvTop: Math.round(vv.offsetTop || 0),
@@ -9661,7 +12484,7 @@ function _peekGeoBeacon() {
     fetch(API + '/api/client-debug', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        kind: 'peek-geo', ver: APP_VER, zoom: (typeof _zoomLevel !== 'undefined' ? _zoomLevel : '?'),
+        ..._peekComposerGeometry(), kind: 'peek-geo', ver: APP_VER, zoom: (typeof _zoomLevel !== 'undefined' ? _zoomLevel : '?'),
         win: window.innerWidth + 'x' + window.innerHeight,
         vvH: Math.round(vv.height || 0), vvTop: Math.round(vv.offsetTop || 0), vvScale: vv.scale || 1,
         sab: sabH, fixedBottomAt: sabBottom,
@@ -9745,6 +12568,9 @@ function _peekGeoDebug() {
     const vv = window.visualViewport || {};
     const o = ov.getBoundingClientRect(), b = bar.getBoundingClientRect();
     const r = row ? row.getBoundingClientRect() : { bottom: 0 };
+    const input = document.getElementById('peek-cmd-input').getBoundingClientRect();
+    const more = document.getElementById('peek-composer-more-btn').getBoundingClientRect();
+    const send = row.querySelector('.send-split').getBoundingClientRect();
     const probe = document.createElement('div');
     probe.style.cssText = 'position:fixed;bottom:0;height:env(safe-area-inset-bottom,0px);width:1px;visibility:hidden;';
     document.body.appendChild(probe);
@@ -9757,6 +12583,8 @@ function _peekGeoDebug() {
       ' ovB=' + Math.round(o.bottom) + ' ovPadB=' + getComputedStyle(ov).paddingBottom +
       ' barB=' + Math.round(b.bottom) + ' barPadB=' + getComputedStyle(bar).paddingBottom +
       ' rowB=' + Math.round(r.bottom) +
+      ' inputW=' + Math.round(input.width) +
+      ' actionDelta=' + Math.round(Math.abs(more.bottom - send.bottom)) +
       ' standalone=' + (navigator.standalone ? 1 : 0);
     document.getElementById('peek-status').textContent = s;
     console.log(s);
@@ -10033,7 +12861,8 @@ function ansiToHtml(text) {
       }
       out+=openSpan();
     } else if(p){
-      out+=linkChunk(p);
+      out += p.split('\n').map((line, index) =>
+        (index ? closeSpan() + '\n' + openSpan() : '') + linkChunk(line)).join('');
     }
   }
   return _osc8Resolve(out+closeSpan(), _osc8);
@@ -10190,7 +13019,29 @@ function _linkifyPaths(safeHtml) {
     // break out of the inline onclick below, so such a path is simply not linked
     // rather than linked unsafely.
     const RE = /(^|[\s(\[>"'`,;=])((?:\.?\/)?(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})(:\d+)?(?![^<]*>)/gm;
-    return String(safeHtml).replace(RE, (m, pre, path, line) => {
+    return String(safeHtml).replace(RE, (m, pre, path, line, offset, whole) => {
+      // A HARD WRAP IS NOT A PATH BOUNDARY (Ethan, 2026-09-09: "these links
+      // dont work"). tmux breaks a long line at the pane width mid-token, so
+      // `/private/tmp/claude-501/…/_lt.txt` arrives as `/private/tmp/c` +
+      // newline + `laude-501/…/_lt.txt`. The head has no extension and is not
+      // linked. The TAIL matches the relative-path shape perfectly, so it was
+      // linked and resolved against the worker's cwd — a blue span pointing at
+      // /Users/ethan/Dev/mixpeek/laude-501/… , which cannot exist. Dead links
+      // are worse than plain text: they invite the click.
+      //
+      // The discriminator is the previous line's last token. If it starts a
+      // path and does not finish one (no extension), this fragment is its
+      // continuation rather than a path of its own. Scoped to matches at
+      // start-of-line, which is the only place a wrap can put one.
+      // `pre` is the CONSUMED boundary char, so at a line start it is the
+      // newline itself and only an at-offset-0 match gives ''. Testing for ''
+      // alone silently never fires.
+      if ((pre === '' || pre === '\n') && offset >= 0) {
+        const before = String(whole).slice(0, offset + pre.length);
+        const lastLine = before.slice(before.lastIndexOf('\n', offset - 1) + 1).replace(/<[^>]*>/g, '');
+        const lastTok = (lastLine.trim().split(/[\s(\[>"'`,;=]+/).pop() || '');
+        if (/^\.?\//.test(lastTok) && !/\.[A-Za-z0-9]{1,8}$/.test(lastTok)) return m;
+      }
       // Trailing sentence punctuation is prose, not filename: "…prospects.csv."
       let p = path, tail = line || '';
       const dot = p.match(/\.$/);
@@ -10217,86 +13068,199 @@ function _linkifyPaths(safeHtml) {
 function _peekHtml(raw) {
   return wrapBoxBlocks(_fitRules(highlightPrompts(_linkifyPaths(ansiToHtml(raw)))));
 }
+// True when a terminal ❯ draft is really a steering message shown elsewhere:
+// the provider's "Press up to edit queued messages" hint, or the text of a
+// message sitting in this session's Steering queue. Compared after stripping a
+// leading [HH:MM ...] stamp and collapsing whitespace so a stamped queue row
+// still matches its unstamped pane echo.
+function _draftEchoesSteering(input) {
+  const norm = s => String(s || '').replace(/^\s*\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s*/i, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const n = norm(input);
+  if (!n) return false;
+  if (n === 'press up to edit queued messages') return true;
+  const sess = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(s => s.name === peekSession) : null;
+  return _steerQueueFor(sess).some(m => { const t = norm(m.text); return t && (t === n || t.includes(n) || n.includes(t)); });
+}
+// Only the current frame has a composer. Its ruled input box is terminal UI,
+// not a delivered message, even when it contains a collapsed paste or a stamp.
+function _peekLiveHtml(raw) {
+  const lines = raw.split('\n');
+  const plain = lines.map(line => _stripAnsi(line).replace(/\u00a0/g, ' '));
+  const rule = line => /^\s*─{3,}[^\n]*$/.test(line);
+  for (let i = plain.length - 1; i > 0; i--) {
+    if (!/^\s*❯(?:\s|$)/.test(plain[i]) || !rule(plain[i - 1])) continue;
+    const end = plain.findIndex((line, n) => n > i && rule(line));
+    if (end < 0 || !plain.slice(end + 1).some(line => /⏵|bypass permissions|\/rc failed|shift\+tab/.test(line))) continue;
+    const input = plain.slice(i, end).join('\n').replace(/^\s*❯\s?/, '').trim();
+    // Do NOT echo a message that already lives in the Steering tab (Ethan,
+    // 2026-09-12: "this message is in here despite being in steering, it's
+    // duplicated"). Two shapes: the provider's "Press up to edit queued
+    // messages" hint, and the queued text itself when a steer is mid-delivery.
+    // A genuinely typed-but-unsent draft (nothing matching in the queue) still
+    // shows, so the terminal never hides what only it knows.
+    const showDraft = input && !_draftEchoesSteering(input);
+    const draft = showDraft ? '<div class="peek-queued-msg"><span class="peek-queued-prompt">❯</span> ' + esc(input) + '</div>' : '';
+    return _peekHtml(lines.slice(0, i - 1).join('\n')) + draft
+      + '<div class="peek-worker-footer">' + ansiToHtml(lines.slice(end + 1).join('\n')) + '</div>';
+  }
+  return _peekHtml(raw);
+}
 
 // The MARKERS amux stamps on everything it injects into a pane. Structural, not
 // heuristic: each one is a literal prefix the server writes, so matching it is
 // reading amux's own label rather than guessing at prose.
 const _NON_HUMAN_PROMPT_MARKS = [
   ['[amux-origin:', 'session'],     // a peer worker, server-verified origin
+  ['[UNVERIFIED INJECTION:', 'unstamped'], // raw-tmux fallback when server was unreachable
+  ['[Request interrupted by user]', 'amux'], // Claude Code system chrome
   ['[amux auto-pickup]', 'amux'],
   ['[amux staged-guard]', 'amux'],
   ['[amux]', 'amux'],               // idle nudges, advance nudges, digests
   ['[amux ', 'amux'],               // any other bracketed amux subsystem
   ['[Scheduled]', 'schedule'],
-  // amux's AUTO context-low compact (Ethan 2026-08-13: a /compact reminder was
-  // polluting the human navigator). The reminder text ("Context is at N%
-  // remaining … Compacting now keeps you working …") is amux-injected, so the
-  // prefix `/compact Context is at` is the tell — a human's bare `/compact`
-  // still reads as human.
   ['/compact Context is at', 'amux'],
+  // AMUX'S OWN NOTICES WERE READING AS "Unclassified" (Ethan, 2026-09-11,
+  // studio-plg). These are delivered BY the harness, not typed by anyone, and
+  // the table simply did not list them — so they fell to the honest-but-useless
+  // 'unknown' bucket alongside genuinely unattributable text.
+  //
+  // Taken from the producers in crates/amux-server, not from one screenshot:
+  //   "[board note on {id}: {}] ..."   board.rs peer-note delivery
+  //   "[task callback {}: {}] ..."     runtime task-callback delivery
+  //   "[capture] {}: redacted ..."     capture notices
+  // Each is a literal prefix the server writes, so matching it is reading
+  // amux's own label rather than guessing at prose.
+  ['[board note on', 'amux'],
+  ['[task callback', 'amux'],
+  ['[capture]', 'amux'],
 ];
 
+// Normalize terminal wrapping without losing provenance. A different worker's
+// "continue" must never classify this worker's command.
+function _peekGeminiPrompts() {
+  return sessionProvider(sessions.find(worker => worker.name === peekSession)) === 'gemini';
+}
+function _peekPromptNormalized(text) {
+  const glyph = _peekGeminiPrompts() ? /^[ \t\u00a0]*[❯›>][ \t\u00a0]*/ : /^[ \t\u00a0]*[❯›][ \t\u00a0]*/;
+  return String(text || '').replace(glyph, '')
+    .replace(/^\[\d{1,2}:\d{2}(?:\s*[AP]M)?\]\s*/i, '').replace(/\s+/g, ' ').trim();
+}
+// CLASSIFICATION MUST NOT WAIT ON THE MESSAGES TAB'S FULL PAGE.
+// _peekMessagesLoad fetches 200 rows so the tab can render, and under fleet
+// load that request measured 12-26s against a query that runs in 0.03s — the
+// wait is read-pool contention, not this data. Until it lands, every prompt
+// falls through to marker matching and a human message reads "Unclassified",
+// which is what made a worker with 13 human messages report zero (Ethan,
+// 2026-09-10). This is a small first page fetched on open purely for
+// provenance: 50 rows measured ~3s against the same endpoint, and it is
+// additive — the tab's full page still replaces it.
+let _peekKindHints = [];
+let _peekKindHintsFor = '';
+async function _peekLoadKindHints(sess) {
+  if (_peekKindHintsFor === sess) return;
+  _peekKindHintsFor = sess;
+  _peekKindHints = [];
+  try {
+    const rows = await _peekMsgFetch({ level: 'worker', name: sess }, 0, 50);
+    if (peekSession !== sess) return;
+    _peekKindHints = rows;
+    _peekReclassifyPrompts();
+  } catch (e) { /* markers still classify; the tab's page may still arrive */ }
+}
+
 function _classifyPromptKind(promptText) {
-  const clean = promptText.replace(/^❯\s*/, '').trim();
-  if (!clean) return 'human';
-  // STRUCTURE FIRST, BEFORE THE ROW LOOKUP (Ethan, 2026-08-11: the navigator
-  // "should scroll thru human messages not amux/session/system/peer messages
-  // by default").
-  //
-  // The row match below is the precise path and stays the primary one, but it
-  // FAILS OPEN TO 'human': a prompt that matches no known row — because the
-  // rows are not loaded yet, or the window has scrolled past it, or the
-  // terminal wrapped the text so the first line no longer starts with the
-  // message's first 60 chars — was classified as a person typing. So amux's
-  // own nudges and peer relays landed in the human filter, which is exactly
-  // the set the navigator exists to isolate. Observed as "H 3/9" on a pane
-  // whose 9 prompts were mostly system traffic.
-  //
-  // Checking the marker first also makes the classification independent of
-  // whether the message trail happens to be loaded, which is why it goes
-  // BEFORE the lookup rather than into the fallback.
+  const clean = _peekPromptNormalized(promptText);
+  if (!clean) return 'unknown';
+  // The Messages tab is a fetched snapshot; cmdHistoryAdd is the immediate
+  // record of a prompt submitted while this terminal is open. Using the
+  // snapshot EXCLUSIVELY made every new prompt "Unclassified" until Messages
+  // happened to reload. Merge both provenance sources, scoped to this worker.
+  const rows = [];
+  if (_peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows)) rows.push(..._peekMsgRows);
+  if (_peekKindHintsFor === peekSession && Array.isArray(_peekKindHints)) rows.push(..._peekKindHints);
+  if (typeof _cmdHistory !== 'undefined' && Array.isArray(_cmdHistory)) rows.push(..._cmdHistory);
+  const kinds = new Set();
+  let best = 0;
+  for (const row of rows) {
+    if (!row || typeof row === 'string' || row.session !== peekSession) continue;
+    const text = _peekPromptNormalized(row.text);
+    if (!text) continue;
+    const exact = text === clean;
+    const length = Math.min(text.length, clean.length);
+    if (!exact && (length < 32 || !(clean.startsWith(text) || text.startsWith(clean)))) continue;
+    const score = exact ? Number.MAX_SAFE_INTEGER : length;
+    if (score > best) { kinds.clear(); best = score; }
+    if (score === best) kinds.add(_msgKind(row));
+  }
+  if (kinds.size === 1) return [...kinds][0];
+  if (kinds.size > 1) return 'unknown';
   for (const [mark, kind] of _NON_HUMAN_PROMPT_MARKS) {
     if (clean.startsWith(mark)) return kind;
   }
-  if (typeof _peekMsgRows === 'undefined') return 'human';
-  const rows = (_peekMsgRows || _cmdHistory || []);
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const r = rows[i];
-    if (!r || typeof r === 'string') continue;
-    const t = (r.text || '').trim();
-    if (t && clean.startsWith(t.slice(0, 60))) return _msgKind(r);
-  }
-  return 'human';
+  // Absence from a loaded history window is not evidence of human authorship.
+  return 'unknown';
 }
 function highlightPrompts(html) {
+  const gemini = _peekGeminiPrompts();
+  const promptStart = gemini ? /^[ \t]{0,2}[❯›>](?:[ \t]+|$)/ : /^[ \t]{0,2}[❯›](?:[ \t]+|$)/;
   const lines = html.split('\n');
-  let inPrompt = false;
-  let promptText = '';
+  const decoder = document.createElement('textarea');
+  const plain = lines.map(line => {
+    decoder.innerHTML = line.replace(/<[^>]*>/g, '');
+    return decoder.value.replace(/\u00a0/g, ' ');
+  });
   const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const textStart = raw.replace(/^(<[^>]*>)+/, '');
-    const isPromptStart = textStart.startsWith('❯');
-    const isContinuation = inPrompt && /^  \S/.test(textStart);
-    if (isPromptStart) {
-      inPrompt = true;
-      promptText = textStart;
-      const kind = _classifyPromptKind(textStart);
-      out.push('<span class="peek-prompt peek-prompt-' + kind + '" data-msg-kind="' + kind + '">' + raw);
-    } else if (isContinuation) {
-      promptText += '\n' + textStart;
-      out.push(raw);
-    } else {
-      if (inPrompt) {
-        out[out.length - 1] += '</span>';
-        inPrompt = false;
-        promptText = '';
+  for (let i = 0; i < lines.length;) {
+    const start = promptStart.test(plain[i]);
+    const content = _peekPromptNormalized(plain[i]);
+    // Empty composers and numbered selectors are controls, not messages.
+    if (!start || !content || /^\d+\.\s/.test(content)) { out.push(lines[i++]); continue; }
+    let end = i + 1;
+    while (end < lines.length) {
+      if (promptStart.test(plain[end])) break;
+      if (/^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*)\s.*(?:·|context left)/i.test(plain[end])) break;
+      if (/^[ \t]{2,}\S/.test(plain[end]) && !/^\s*[│┃⏵]/.test(plain[end])) { end++; continue; }
+      // Paragraph breaks belong to a message only when followed by another
+      // indented paragraph, not by assistant output or terminal chrome.
+      if (!plain[end].trim()) {
+        let next = end + 1;
+        while (next < lines.length && !plain[next].trim()) next++;
+        if (next < lines.length && /^[ \t]{2,}\S/.test(plain[next])
+            && !promptStart.test(plain[next]) && !/^\s*[│┃⏵❯›]/.test(plain[next])) { end = next; continue; }
       }
-      out.push(raw);
+      break;
     }
+    const text = plain.slice(i, end).join('\n');
+    const kind = _classifyPromptKind(text);
+    // Codex's final input hint sits immediately above its model/status footer.
+    // Saved output contains older copies of this footer too, followed by later
+    // frames. Only the adjacent footer matters; a recorded message still wins.
+    const tail = plain.slice(end).filter(line => line.trim());
+    const composer = kind === 'unknown' && tail.length > 0 &&
+      (/^\s*(?:gpt-[\w.-]+|o[1-9][\w.-]*)\s.*(?:·|context left)/i.test(tail[0])
+        || (gemini && content === 'Type your message or @path/to/file'
+          && tail.slice(0, 4).some(line => line.includes('workspace (/directory)') && line.includes('sandbox') && line.includes('/model'))));
+    if (composer) { out.push('<span class="peek-composer-hint">' + lines.slice(i, end).join('\n') + '</span>'); i = end; continue; }
+    const label = (_MSG_KIND[kind] || _MSG_KIND.unknown).label;
+    // Close each block before opening its successor. Nested prompt wrappers
+    // made scrollIntoView target a whole conversation instead of one message.
+    out.push('<span class="peek-prompt peek-prompt-' + kind + '" data-msg-kind="' + kind
+      + '" data-msg-label="' + esc(label) + '">' + lines.slice(i, end).join('\n') + '</span>');
+    i = end;
   }
-  if (inPrompt) out[out.length - 1] += '</span>';
   return out.join('\n');
+}
+function _peekReclassifyPrompts() {
+  const body = document.getElementById('peek-body');
+  if (!body) return;
+  for (const el of body.querySelectorAll('.peek-prompt')) {
+    const kind = _classifyPromptKind(el.textContent);
+    for (const previous of _MSG_KIND_ORDER) el.classList.remove('peek-prompt-' + previous);
+    el.classList.add('peek-prompt-' + kind);
+    el.dataset.msgKind = kind;
+    el.dataset.msgLabel = (_MSG_KIND[kind] || _MSG_KIND.unknown).label;
+  }
+  _peekMsgCount(_peekMsgPrompts());
 }
 
 // Wrap each contiguous run of box-drawing lines (tables, framed boxes, wide rules)
@@ -10336,26 +13300,159 @@ function wrapBoxBlocks(html) {
 
 let peekSelecting = false;
 let _peekScrollLocked = false;
+let _peekBufferedOutput = false;
+let _peekFollowBottom = false;
+let _peekLastScrollTop = 0;
+let _peekBottomResize = null, _peekBottomMutation = null, _peekBottomFrame = 0;
+
+function _peekKeepBottom() {
+  if (!_peekFollowBottom || _peekScrollLocked || peekSearchQuery.trim() || _peekAgents.selected || peekSelecting) return;
+  const body = document.getElementById('peek-body');
+  if (!document.getElementById('peek-overlay').classList.contains('active')) return;
+  const gap = body.scrollHeight - body.scrollTop - body.clientHeight;
+  body.scrollTop = body.scrollHeight;
+  if (gap > 40) _peekPollBeacon('bottom-anchor-restored', peekSession, { gap_px: Math.round(gap), verdict: 'following_latest' });
+}
+function _peekWatchBottom() {
+  _peekStopBottomWatch();
+  const body = document.getElementById('peek-body');
+  const schedule = () => {
+    if (_peekBottomFrame) return;
+    _peekBottomFrame = requestAnimationFrame(() => { _peekBottomFrame = 0; _peekKeepBottom(); });
+  };
+  // Content and viewport change independently: history/cache paints, font
+  // wrapping, the plan strip, and the phone keyboard all move the bottom.
+  _peekBottomResize = new ResizeObserver(schedule);
+  _peekBottomResize.observe(body);
+  _peekBottomMutation = new MutationObserver(() => {
+    _peekBottomResize.disconnect();
+    _peekBottomResize.observe(body);
+    for (const child of body.children) _peekBottomResize.observe(child);
+    schedule();
+  });
+  _peekBottomMutation.observe(body, { childList: true, subtree: true, characterData: true });
+  schedule();
+}
+function _peekStopBottomWatch() {
+  if (_peekBottomResize) _peekBottomResize.disconnect();
+  if (_peekBottomMutation) _peekBottomMutation.disconnect();
+  cancelAnimationFrame(_peekBottomFrame); _peekBottomFrame = 0;
+}
+function _peekStopFollowing(e) {
+  if (_peekFollowBottom) {
+    const body = document.getElementById('peek-body');
+    _peekLastScrollTop = body.scrollTop;
+    _peekPollBeacon('bottom-follow-paused', peekSession, {
+      verdict: 'reader_scrolling', input: e?.type || 'navigation',
+      gap_px: Math.round(body.scrollHeight - body.scrollTop - body.clientHeight),
+      measured: true, n_considered: 1,
+    });
+  }
+  _peekFollowBottom = false;
+}
+
 
 function _isScrolledToBottom(el, threshold) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < (threshold || 40);
 }
 
-function _showScrollLockBadge(scrollEl, onClickResume) {
-  let badge = scrollEl.querySelector('.scroll-lock-badge');
+function _scrollLockContainer(scrollEl) {
+  return scrollEl;
+}
+function _showScrollLockBadge(scrollEl, onClickResume, buffered) {
+  const container = _scrollLockContainer(scrollEl);
+  let badge = container.querySelector('.scroll-lock-badge');
   if (!badge) {
-    badge = document.createElement('div');
+    badge = document.createElement('button');
+    badge.type = 'button';
     badge.className = 'scroll-lock-badge';
-    badge.textContent = 'Scrolled up \u2014 click to resume';
-    badge.onclick = (e) => { e.stopPropagation(); onClickResume(); };
-    scrollEl.appendChild(badge);
+    container.append(badge);
   }
+  // Two different facts, so two different labels. Claiming "New output" when
+  // none arrived would be the control lying about why it is there.
+  const hasNew = buffered !== false;
+  badge.textContent = hasNew ? 'New output \u2193' : 'Jump to bottom \u2193';
+  badge.title = hasNew
+    ? 'New output is buffered while you read earlier lines'
+    : 'You are scrolled up — jump back to the newest output';
+  badge.onclick = e => { e.stopPropagation(); onClickResume(); };
   badge.style.display = '';
 }
 
+// SHOW IT WHENEVER THERE IS SOMETHING BELOW, NOT ONLY WHEN OUTPUT ARRIVES
+// (Ethan, 2026-09-09: "make sure that we have the scroll to the bottom thing
+// at the bottom of the terminal when there's stuff to scroll down at").
+// The badge was driven solely by _peekScrollLocked, which is set when a frame
+// lands while the reader is scrolled up. On an IDLE worker no frame ever
+// lands, so scrolling up through history offered no way back down and the
+// control looked deleted. This drives it from scroll position, which is the
+// condition the reader can actually see.
+function _peekScrollAffordance() {
+  const body = document.getElementById('peek-body');
+  if (!body) return;
+  const overlay = document.getElementById('peek-overlay');
+  if (!overlay || !overlay.classList.contains('active')) return;
+  if (_isScrolledToBottom(body)) { _hideScrollLockBadge(body); return; }
+  _showScrollLockBadge(body, () => {
+    _peekScrollLocked = false;
+    _peekFollowBottom = true;
+    _peekBufferedOutput = false;
+    applyPeekSearch(false, false);
+    body.scrollTop = body.scrollHeight;
+    _hideScrollLockBadge(body);
+  }, _peekBufferedOutput);
+}
+// app.js is loaded at the END of body, so DOMContentLoaded may already have
+// fired and a listener registered for it would never run. Bind now when the
+// element exists, and fall back to the event only if it does not.
+function _bindPeekScrollAffordance() {
+  const body = document.getElementById('peek-body');
+  if (!body || body._peekAffordanceBound) return;
+  body._peekAffordanceBound = true;
+  body.addEventListener('scroll', _peekScrollAffordance, { passive: true });
+}
+if (document.getElementById('peek-body')) _bindPeekScrollAffordance();
+else document.addEventListener('DOMContentLoaded', _bindPeekScrollAffordance);
+
 function _hideScrollLockBadge(scrollEl) {
-  const badge = scrollEl.querySelector('.scroll-lock-badge');
+  const badge = _scrollLockContainer(scrollEl).querySelector('.scroll-lock-badge');
   if (badge) badge.style.display = 'none';
+}
+
+// Defence in depth for the transcript/live seam. Old servers and cached
+// responses can return the viewport beginning inside transcript history. The
+// renderer owns the final composition, so it must never paint a submitted
+// prompt twice even if an upstream trim misses it.
+function _trimPeekLiveOverlap(history, live) {
+  if (!history || !live) return live;
+  const normalize = line => String(line || '').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/[\s\u00a0]+/g, ' ').trim().toLowerCase();
+  const histLines = history.split('\n'), liveLines = live.split('\n');
+  const histNorm = histLines.map(normalize), liveNorm = liveLines.map(normalize);
+  const eligible = new Set(histNorm.filter(line => line.length >= 12));
+  const generalMatches = [];
+  liveNorm.forEach((line, index) => { if (eligible.has(line)) generalMatches.push(index); });
+  if (generalMatches.length >= 3) {
+    return liveLines.slice(generalMatches[generalMatches.length - 1] + 1).join('\n').replace(/^\n+/, '');
+  }
+  // A timestamped prompt is an amux-stamped submission identity. One exact
+  // anchor is sufficient and safer than requiring three arbitrary output
+  // lines, which was the server bug when a long answer pushed the other two
+  // matches outside its short transcript tail.
+  const stampedPrompt = line => /^[❯›>]\s*\[\d{1,2}:\d{2}(?:\s*[ap]m)?\]\s+\S/i.test(line);
+  const promptRows = new Map();
+  histNorm.forEach((line, index) => { if (stampedPrompt(line)) promptRows.set(line, index); });
+  let liveAnchor = -1, histAnchor = -1;
+  liveNorm.forEach((line, index) => {
+    if (stampedPrompt(line) && promptRows.has(line)) {
+      liveAnchor = index; histAnchor = promptRows.get(line);
+    }
+  });
+  if (liveAnchor < 0) return live;
+  let matched = 1;
+  while (liveAnchor + matched < liveNorm.length && histAnchor + matched < histNorm.length
+      && liveNorm[liveAnchor + matched] === histNorm[histAnchor + matched]) matched++;
+  return liveLines.slice(liveAnchor + matched).join('\n').replace(/^\n+/, '');
 }
 
 // ── Peek 'Plan' strip: read-only view of the session's Claude Code task list ──
@@ -10461,10 +13558,9 @@ function _peekLeaseStart() { /* removed — no more resize-on-peek to lease (AMU
 // the reader scrolls, so a browser resize changes nothing server-side.
 
 // ── "Load earlier output" — scrollback for the alt-screen ──
-// tmux keeps zero history for Claude's alternate screen; the pipe-pane log
-// (~/.amux/logs/<name>.log) is the only record of what scrolled off. The bar
-// sits above the live view; tapping it prepends the log tail (ANSI-stripped,
-// server-sliced via ?tail_kb so a multi-MB log never ships to a phone).
+// Claude history comes from complete conversation records. Terminal pipe logs
+// contain cursor paint deltas: stripping ANSI turns spinners and partial word
+// updates into vertical gibberish (TubeScience). Other providers retain logs.
 let _lastLiveHTML = '';
 let _peekEarlier = { chunks: [], loadedKb: 0, done: false, hidden: false, loading: false };
 const _PEEK_LOG_CHUNK_KB = 192;
@@ -10473,29 +13569,73 @@ function _peekEarlierHTML() {
   // The bar persists until the actual beginning of the log — every tap pages
   // one chunk further back, so the whole session is always scrollable.
   const bar = _peekEarlier.done
-    ? '<div class="peek-earlier-bar">&mdash; beginning of log &mdash;</div>'
+    ? '<div class="peek-earlier-bar">&mdash; beginning of saved output &mdash;</div>'
     : '<div class="peek-earlier-bar" onclick="_peekLoadEarlier()">&#x25B2; Load earlier output' +
-      (_peekEarlier.chunks.length ? '' : ' (worker log)') + '</div>';
+      (_peekEarlier.chunks.length ? '' : ' (saved output)') + '</div>';
   const blocks = _peekEarlier.chunks.length
     ? '<div class="peek-earlier-block">' + _peekEarlier.chunks.join('') + '</div>' +
-      '<div class="peek-earlier-bar">&mdash; end of log &middot; live view below &mdash;</div>'
+      '<div class="peek-earlier-bar">&mdash; end of saved output &middot; live view below &mdash;</div>'
     : '';
   return bar + blocks;
 }
-async function _peekLoadEarlier() {
+// Exact overlap only: repeated words or quoted messages must not erase output.
+// The live renderer may start mid-record after its character cap, so match its
+// first complete line against the saved page's suffix.
+function _peekAfterConversation(saved, current) {
+  if (!saved || !current) return current;
+  // Peek collapses blank lines (including ANSI-only lines) server-side. Match
+  // that representation before comparing the complete record page with it.
+  let blanks = 0;
+  saved = saved.split('\n').flatMap(line => {
+    if (!stripAnsi(line).trim()) return ++blanks <= 1 ? [''] : [];
+    blanks = 0;
+    return [line];
+  }).join('\n');
+  if (saved.includes(current)) return '';
+  const first = current.split('\n').find(line => line.length > 0);
+  if (!first) return current;
+  let at = saved.indexOf(first);
+  while (at >= 0) {
+    const suffix = saved.slice(at);
+    if (current.startsWith(suffix)) return current.slice(suffix.length).replace(/^\n+/, '');
+    at = saved.indexOf(first, at + 1);
+  }
+  return current;
+}
+async function _peekLoadEarlier(options) {
+  if (_peekAgents.selected) return 'subagent-tail';
+  const quiet = !!(options && options.quiet);
   const name = peekSession;
-  if (!name || _peekEarlier.loading || _peekEarlier.done) return;
-  _peekEarlier.loading = true;
+  const identity = _peekIdentity(name);
+  const earlier = _peekEarlier;
+  if (!name || earlier.loading) return 'busy';
+  if (earlier.done) return 'beginning';
+  earlier.loading = true;
+  let verdict = 'error';
   try {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) +
-      '/log?plain=1&tail_kb=' + _PEEK_LOG_CHUNK_KB + '&before_kb=' + _peekEarlier.loadedKb,
+      '/log?plain=1&source=conversation&tail_kb=' + _PEEK_LOG_CHUNK_KB + '&before_kb=' + earlier.loadedKb +
+      (earlier.conversation ? '&conversation=' + encodeURIComponent(earlier.conversation) + '&before=' + earlier.before : ''),
       { headers: _authHeaders() });
-    if (peekSession !== name) return;
+    const responseSession = r.headers.get('X-Amux-Session') || '';
+    if (!_peekIdentityCurrent(identity)) {
+      _peekIdentityDiscard('earlier-log', identity, responseSession);
+      return 'stale';
+    }
+    if (r.ok && responseSession !== name) {
+      _peekIdentityDiscard('earlier-log', identity, responseSession);
+      return 'identity-mismatch';
+    }
     if (!r.ok) {
-      showToast('No saved log for this worker');
-      if (r.status === 404) _peekEarlier.hidden = true;
+      if (!quiet) showToast(r.status === 409 ? 'Conversation changed. Reopen the worker to load its history.' : 'No saved conversation for this worker');
+      if (r.status === 404) earlier.hidden = true;
+      verdict = 'missing';
     } else {
       const text = await r.text();
+      if (!_peekIdentityCurrent(identity)) {
+        _peekIdentityDiscard('earlier-log-body', identity, responseSession);
+        return 'stale';
+      }
       const remaining = parseInt(r.headers.get('X-Log-Remaining') || '0', 10);
       // THROUGH THE SAME PIPELINE AS THE LIVE VIEW (AMUX-4021). This was
       // `esc(text)`, which is raw escaped text with none of the peek render
@@ -10513,9 +13653,20 @@ async function _peekLoadEarlier() {
       // stops a 220-column pane rule forcing a scroller; `_linkifyPaths` and
       // `highlightPrompts` make the earlier text behave like the live text it
       // is continuous with.
-      _peekEarlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
-      _peekEarlier.loadedKb += _PEEK_LOG_CHUNK_KB;
-      _peekEarlier.done = remaining <= 0;
+      if (r.headers.get('X-Log-Source') === 'conversation') {
+        if (!earlier.conversation) {
+          // The first record page contains the current transcript tail too.
+          // Replace that tail once, then keep only new records from polls.
+          earlier.tailRaw = text;
+          _peekHistoryHTML = _peekHtml(_peekAfterConversation(text, _peekHistoryRaw));
+        }
+        earlier.conversation = r.headers.get('X-Log-Conversation');
+        earlier.before = remaining;
+      }
+      earlier.chunks.unshift('<span class="pe-chunk">' + _peekHtml(text) + '</span>');
+      earlier.loadedKb += _PEEK_LOG_CHUNK_KB;
+      earlier.done = remaining <= 0;
+      verdict = text.trim() ? 'loaded' : (earlier.done ? 'beginning' : 'empty');
     }
     // Paint immediately (refreshPeek skips DOM writes while scrolled up) and
     // anchor at the bottom of the just-loaded chunk so reading continues
@@ -10525,8 +13676,12 @@ async function _peekLoadEarlier() {
     const body = document.getElementById('peek-body');
     const first = body && body.querySelector('.pe-chunk');
     if (first) body.scrollTop = Math.max(0, first.offsetTop + first.offsetHeight - 80);
-  } catch (e) { showToast('Could not load log'); }
-  finally { _peekEarlier.loading = false; }
+  } catch (e) {
+    if (!quiet) showToast('Could not load log');
+    verdict = 'error';
+  }
+  finally { earlier.loading = false; }
+  return verdict;
 }
 
 // ── Fitted border rules ──
@@ -10547,26 +13702,31 @@ function _fitRules(html) {
 }
 
 async function refreshPeek(liveOnly, bypassTrim) {
+  if (_peekAgents.selected) return _peekAgentRefresh();
+  _peekAgentsLoad();
   const name = peekSession;
+  const identity = _peekIdentity(name);
   if (!name) return;
   // Refresh the Plan strip (throttled — task files change slowly).
   if (performance.now() - _peekPlanLast > 8000) { _peekPlanLast = performance.now(); _peekLoadPlan(); }
   if (peekSelecting) return;
-  const sel = window.getSelection();
-  if (sel && sel.toString().length > 0) return;
+  if (_peekHasSelection()) return;
   const body = document.getElementById('peek-body');
   const statusEl = document.getElementById('peek-status');
+  const _peekAc = new AbortController();
+  // Headers are not a completed frame. Keep the deadline armed through body
+  // consumption; otherwise a half-open response strands the awaited poll loop.
+  const _peekTimeout = setTimeout(() => _peekAc.abort(), 15000);
+  let phase = 'headers';
   try {
     // liveOnly (open path): a few-KB live frame — the CURRENT terminal — so the
     // peek paints the latest instantly on click. The full payload (~138KB, mostly
     // transcript history) follows and fills in scrollback. Only the full response
     // carries the ETag the poll conditions on.
     const _et = liveOnly ? _peekLiveEtag : _peekEtag;
-    const r = await fetch(API + '/api/sessions/' + name + '/peek?lines=300' + (liveOnly ? '&live=1' : '') + (bypassTrim ? '&notrim=1' : ''),
-      _et ? { headers: { 'If-None-Match': _et } } : undefined);
-    if (peekSession !== name) return;
-    hidePeekLoading();   // a response arrived (200 painted below, or 304 = already latest) → drop the "Loading latest…" cue
-    if (!liveOnly) _peekLastFullMs = performance.now();   // history is fresh (200 or 304)
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/peek?lines=300' + (liveOnly ? '&live=1' : '') + (bypassTrim ? '&notrim=1' : ''),
+      { ...(_et ? { headers: { 'If-None-Match': _et } } : {}), signal: _peekAc.signal });
+    if (!_peekIdentityCurrent(identity)) return;
     // AF-83: a peek on a session that NO LONGER EXISTS 404s, and this poller had
     // no r.ok check. It fell straight through to r.json(), parsed the error body
     // {"error":"session 'X' not found"}, found no .live/.output, and painted
@@ -10578,6 +13738,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // and SAY what happened; a poller that cannot fail is how a dead tab bills
     // the server forever.
     if (r.status === 404) {
+      hidePeekLoading();
       _stopPeekPoll();
       _peekPollActive = false;
       try { _peekPollBeacon('stop-404', name); } catch (e) {}
@@ -10585,37 +13746,82 @@ async function refreshPeek(liveOnly, bypassTrim) {
       return;
     }
     if (r.status === 304) {   // unchanged — nothing transferred, skip parse + render entirely
+      hidePeekLoading();
+      if (!liveOnly) _peekLastFullMs = performance.now();
       if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
       return;
     }
-    if (liveOnly) _peekLiveEtag = r.headers.get('ETag') || _peekLiveEtag;
-    else _peekEtag = r.headers.get('ETag') || _peekEtag;
+    if (!r.ok) throw new Error('Terminal request failed (HTTP ' + r.status + ')');
+    phase = 'body';
     const data = await r.json();
+    if (!_peekIdentityCurrent(identity)) return;
+    if (data.name !== name) {
+      _peekIdentityDiscard('live-peek', identity, data.name || '');
+      return;
+    }
+    // Selection can begin while the body downloads. Do not acknowledge its
+    // ETag or raw frame until it can be painted/buffered: the next request must
+    // retrieve it again instead of accepting 304 for content we never showed.
+    if (peekSelecting || _peekHasSelection()) return;
+    phase = 'render';
     // Alt-screen peeks return history + live SEPARATELY so a poll can re-render just
     // the live frame. A live=1 poll carries no history (keep what we already have);
     // non-alt/legacy shapes send one `output` blob — treat that as the live part.
-    const output = (data.live != null) ? data.live : (data.output || '(no output)');
+    // WRAP AT THE WORKER'S OWN WIDTH, NOT THE VIEWER'S (Ethan, 2026-09-09:
+    // "fix why this formatting is off"). The pane's text was laid out by a
+    // program running in a terminal of `pane_cols` columns — measured 154 for
+    // that worker. `.overlay-body` is pre-wrap, so on a wide desktop the same
+    // text re-flows to whatever the window allows: measured 224 characters per
+    // line at 1700px. Every paragraph the worker wrote for 154 columns is then
+    // re-broken at 224, which is why the spacing reads as wrong even though no
+    // character was lost. Capping the text flow restores the author's line
+    // breaks. Box blocks are unaffected — wrapBoxBlocks gives them their own
+    // horizontal scroller, and that runs inside these regions.
+    if (data.pane_cols > 0) {
+      const b = document.getElementById('peek-body');
+      if (b) b.style.setProperty('--peek-cols', data.pane_cols);
+    }
+    const rawOutput = (data.live != null) ? data.live : (data.output || '(no output)');
     const histRaw = (data.history != null) ? data.history : null;   // null ⇒ live-only poll
+    if (typeof rawOutput !== 'string' || (histRaw !== null && typeof histRaw !== 'string')) throw new Error('Malformed terminal frame');
+    const overlapBase = histRaw !== null ? histRaw : _peekHistoryRaw;
+    const output = _trimPeekLiveOverlap(overlapBase, rawOutput);
+    const acceptFrame = () => {
+      if (liveOnly) _peekLiveEtag = r.headers.get('ETag');
+      else { _peekEtag = r.headers.get('ETag'); _peekLastFullMs = performance.now(); }
+      hidePeekLoading();
+    };
     // Skip re-render when nothing we'd paint changed — saves ansiToHtml work on every
     // poll tick. This also applies with an active search: the highlights are already in
     // the DOM, so re-running applyPeekSearch would needlessly scroll the view back to
     // the current match every tick (the "force-scroll back to result" bug on idle sessions).
     if (output === _lastPeekRaw && (histRaw === null || histRaw === _peekHistoryRaw) && lastPeekHTML) {
+      acceptFrame();
       if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
       return;
     }
-    _lastPeekRaw = output;
-    _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
+    // Prepare both regions before committing the raw-frame dedupe keys. A
+    // failed conversion must remain retryable just like a failed body read.
+    const newHTML = _peekLiveHtml(output);
     let histChanged = false;
     if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
+      const historyTail = _peekEarlier.conversation ? _peekAfterConversation(_peekEarlier.tailRaw, histRaw) : histRaw;
+      _peekHistoryHTML = historyTail ? _peekHtml(historyTail) : '';
       _peekHistoryRaw = histRaw;
-      _peekHistoryHTML = histRaw ? _peekHtml(histRaw) : '';
       histChanged = true;
     }
-    const atBottom = _isScrolledToBottom(body);
-    if (atBottom) _peekScrollLocked = false;
-    const newHTML = _peekHtml(output);
-    if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
+    _lastPeekRaw = output;
+    _peekLastChangeMs = performance.now();   // real content change → drives fast adaptive polling
+    // A poll cannot infer renewed consent to follow from proximity. The
+    // reader may have moved only a few pixels up since the previous frame.
+    const atBottom = _peekFollowBottom && _isScrolledToBottom(body);
+    if (atBottom && !body.querySelector('.peek-msg-current, .peek-highlight.current')) {
+      _peekScrollLocked = false;
+      _peekBufferedOutput = false;
+    }
+    if (newHTML.includes('class="peek-queued-msg"') && !_lastLiveHTML.includes('class="peek-queued-msg"')) {
+      _peekPollBeacon('worker-input-separated', name, { verdict: 'composer_excluded_from_messages' });
+    }
     if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
     // Claude runs on the terminal's ALT SCREEN: tmux holds only the viewport,
     // so the top of the capture is a hard cutoff mid-conversation. Compose a
@@ -10624,10 +13830,13 @@ async function refreshPeek(liveOnly, bypassTrim) {
     _lastLiveHTML = newHTML;
     lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
     const hasSearch = peekSearchQuery.trim().length > 0;
+    if (_peekScrollLocked || hasSearch) _peekBufferedOutput = true;
     // When user has scrolled up, skip DOM update to avoid fidgeting the view.
     // Buffer in lastPeekHTML and flush when they resume.
-    if (hasSearch) {
-      // Output changed while a search is active: re-highlight matches in the new
+    if (hasSearch && (!_peekScrollLocked || _peekPendingFindScroll)) {
+      // A selected search result stays pinned while output is buffered, just
+      // like message navigation. Only an unlocked search or pending Locate
+      // should replace its nodes. Re-highlight matches in the new
       // DOM but DON'T scroll to the current match — preserve wherever the user
       // scrolled. Auto-scroll only happens on explicit search actions (typing /
       // next / prev). Restoring scrollTop keeps position across the innerHTML swap.
@@ -10640,35 +13849,46 @@ async function refreshPeek(liveOnly, bypassTrim) {
       if (_peekPendingFindScroll && _peekMatches.length) {
         _peekPendingFindScroll = false;
         _peekScrollTo(peekSearchIndex, true, true);
+        _peekNavBeacon('deferred-search-landed', _peekMsgPrompts(), _peekMatches[peekSearchIndex]);
       }
     } else if (!_peekScrollLocked) {
       const _liveEl = document.getElementById('pk-live');
-      if (!histChanged && _liveEl) _liveEl.innerHTML = _lastLiveHTML;   // live tick → swap the small region only
+      if (!histChanged && _liveEl) { _liveEl.innerHTML = _lastLiveHTML; _peekReclassifyPrompts(); }   // live tick → swap the small region only
       else applyPeekSearch(false);
     }
-    if (!_peekScrollLocked && atBottom && !hasSearch) {
+    if (!_peekScrollLocked && (atBottom || _peekFollowBottom) && !hasSearch) {
       body.scrollTop = body.scrollHeight;
+      _peekBufferedOutput = false;
       _hideScrollLockBadge(body);
-    } else if (_peekScrollLocked) {
+    } else if (_peekBufferedOutput) {
       _showScrollLockBadge(body, () => {
         _peekScrollLocked = false;
+        _peekFollowBottom = true;
+        _peekBufferedOutput = false;
         applyPeekSearch(false, false);
         body.scrollTop = body.scrollHeight;
         _hideScrollLockBadge(body);
       });
     }
     if (performance.now() > _peekGeoHold) statusEl.textContent = (data.saved ? 'Saved log' : 'Updated') + ' ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+    acceptFrame();
     // Cache peek output for offline browsing
     // Cache BOTH slices — since the live-split, `output` alone is just the tiny
     // live frame (sometimes ''), which painted an EMPTY black peek from cache
     // (social, 2026-07-16). Never write an entry with no content.
-    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + peekSession, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
+    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + name, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
   } catch(e) {
+    if (!_peekIdentityCurrent(identity)) return;
     console.error('peek:', e);
+    _peekPollBeacon('refresh-failed', name, { phase,
+      reason: _peekAc.signal.aborted ? 'timeout' : 'request_or_render_error',
+      verdict: 'retrying', measured: true, n_considered: 1 });
+    statusEl.textContent = 'Reconnecting… retrying terminal updates';
     hidePeekLoading();   // fetch failed — stop the "Loading latest…" cue (we fall back to cache / retry below)
     // Offline: load cached peek
     if (!lastPeekHTML || lastPeekHTML.includes('Loading...')) {
-      const cached = await _idb.get('peek_' + peekSession);
+      const cached = await _idb.get('peek_' + name);
+      if (!_peekIdentityCurrent(identity)) return;
       if (!_paintCachedPeek(cached)) {
         // No usable cache and the fetch failed (typically the server mid-restart,
         // ~11s). Say so — the poll keeps retrying and heals within seconds; a
@@ -10677,7 +13897,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
         statusEl.textContent = 'Reconnecting…';
       }
     }
-  }
+  } finally { clearTimeout(_peekTimeout); }
 }
 
 // Split DOM: history lives in a stable container and the live frame in its own,
@@ -10685,9 +13905,11 @@ async function refreshPeek(liveOnly, bypassTrim) {
 // re-innerHTML'ing the whole ~100K-char scrollback every 900ms — that wholesale
 // reflow was the visible "janky" churn when watching an active session.
 function _paintPeekRegions(body) {
+  if (_peekAgents.selected) { body.innerHTML=lastPeekHTML; _peekReclassifyPrompts(); return; }
   const hist = _peekEarlierHTML() + _peekHistoryHTML;
-  if (!hist && !_lastLiveHTML && lastPeekHTML) { body.innerHTML = lastPeekHTML; return; }  // IDB cached open paint
+  if (!hist && !_lastLiveHTML && lastPeekHTML) { body.innerHTML = lastPeekHTML; _peekReclassifyPrompts(); return; }  // IDB cached open paint
   body.innerHTML = '<div id="pk-hist">' + hist + '</div><div id="pk-live">' + _lastLiveHTML + '</div>';
+  _peekReclassifyPrompts();
 }
 function applyPeekSearch(keepIndex, doScroll) {
   const body = document.getElementById('peek-body');
@@ -10695,34 +13917,76 @@ function applyPeekSearch(keepIndex, doScroll) {
   if (!body) return;
   const q = peekSearchQuery.trim();
   if (!q) {
+    _peekPendingFindScroll = false;
     _paintPeekRegions(body);
     _peekMatches = [];
     peekSearchIndex = 0;
     if (countEl) countEl.textContent = '';
     return;
   }
-  // Highlight all matches in text nodes only (not inside tags)
-  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp('(' + escaped + ')', 'gi');
-  const parts = lastPeekHTML.split(/(<[^>]+>)/);
-  let idx = 0;
-  body.innerHTML = parts.map(p => {
-    if (p.startsWith('<')) return p;
-    return p.replace(re, (match) => `<span class="peek-highlight" data-idx="${idx++}">${esc(match)}</span>`);
-  }).join('');
-  _peekMatches = Array.from(body.querySelectorAll('.peek-highlight'));
+  // Search the rendered text, not serialized HTML. Entities and ANSI/link
+  // spans must not turn one visible phrase into missing or duplicate matches.
+  body.innerHTML = lastPeekHTML;
+  _peekReclassifyPrompts();
+  const roots = !_peekFiltersActive() ? [body]
+    : [...body.querySelectorAll('.peek-prompt')].filter(el => _peekPromptMatchesFilters(el));
+  _peekMatches = [];
+  for (const root of roots) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let text = '', node;
+    while ((node = walker.nextNode())) {
+      nodes.push({node, start:text.length, end:text.length + node.data.length});
+      text += node.data;
+    }
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ranges = [...text.matchAll(new RegExp(escaped, 'gi'))].map(m => ({start:m.index,end:m.index + m[0].length}));
+    const matchBase = _peekMatches.length;
+    let firstRange = 0;
+    for (const entry of nodes) {
+      while (firstRange < ranges.length && ranges[firstRange].end <= entry.start) firstRange++;
+      if (firstRange >= ranges.length || ranges[firstRange].start >= entry.end) continue;
+      const fragment = document.createDocumentFragment();
+      let offset = 0;
+      for (let i = firstRange; i < ranges.length && ranges[i].start < entry.end; i++) {
+        const start = Math.max(0, ranges[i].start - entry.start), end = Math.min(entry.node.length, ranges[i].end - entry.start);
+        fragment.append(document.createTextNode(entry.node.data.slice(offset, start)));
+        const mark = document.createElement('span');
+        mark.className = 'peek-highlight'; mark.dataset.idx = String(matchBase + i);
+        mark.textContent = entry.node.data.slice(start, end); fragment.append(mark);
+        if (!_peekMatches[matchBase + i]) _peekMatches[matchBase + i] = mark;
+        offset = end;
+      }
+      fragment.append(document.createTextNode(entry.node.data.slice(offset)));
+      entry.node.replaceWith(fragment);
+    }
+  }
+  _peekReclassifyPrompts();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
+  // Typed Find has the same late-history race as Locate: an empty live frame
+  // is not proof that the requested text is absent from the arriving history.
+  if (!keepIndex && doScroll !== false) _peekPendingFindScroll = !_peekMatches.length;
   _peekScrollTo(peekSearchIndex, doScroll);
   if (countEl) countEl.textContent = _peekMatches.length > 0 ? (peekSearchIndex + 1) + '/' + _peekMatches.length : 'no matches';
 }
 function _peekScrollTo(i, doScroll, instant) {
-  _peekMatches.forEach((m, j) => m.classList.toggle('current', j === i));
+  document.querySelectorAll('#peek-body .peek-highlight').forEach(m => m.classList.toggle('current', Number(m.dataset.idx) === i));
   const cur = _peekMatches[i];
   // instant: the one-shot Locate jump — a smooth animation would be frozen
   // mid-flight by the next poll tick's savedTop restore.
-  if (cur && doScroll !== false) cur.scrollIntoView({ block: 'center', behavior: instant ? 'auto' : 'smooth' });
+  if (cur && doScroll !== false) _peekJumpTo(cur);
   const countEl = document.getElementById('peek-search-count');
   if (countEl && _peekMatches.length) countEl.textContent = (i + 1) + '/' + _peekMatches.length;
+  _peekMsgCount(_peekMsgPrompts());
+}
+function togglePeekFind(open) {
+  const wrap = document.getElementById('peek-search-wrap');
+  const btn = document.getElementById('peek-find-toggle');
+  open = open == null ? wrap.hidden : open;
+  wrap.hidden = !open;
+  btn.setAttribute('aria-expanded', String(open));
+  if (open) document.getElementById('peek-search').focus();
+  else { clearPeekSearch(); btn.focus(); }
 }
 function peekSearchNext() {
   if (!_peekMatches.length) return;
@@ -10736,81 +14000,377 @@ function peekSearchPrev() {
 }
 
 // ── Peek more-menu ──
+let _peekMoreDismissTimer = 0;
 function togglePeekMoreMenu() {
+  _closePeekFilters();
   const dd = document.getElementById('peek-more-dropdown');
   if (!dd) return;
   const s = (sessions || []).find(row => row.name === peekSession);
   if (s) _renderPeekWorkerActions(s);
   const opening = !dd.classList.contains('open');
-  dd.classList.toggle('open');
-  if (opening) {
-    if (s) requestAnimationFrame(() => _reportWorkerActionParity(s));
-    setTimeout(() => document.addEventListener('click', _closePeekMore, {once: true}), 0);
-  }
+  if (!opening) { _closePeekMore(); return; }
+  dd.classList.add('open');
+  document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => {
+    if (s) _reportWorkerActionParity(s);
+    if (!dd.classList.contains('open')) {
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'worker-action-menu',verdict:'open-lost',session:peekSession,
+          measured:true,n_considered:dd.querySelectorAll('[role="menuitem"]').length,ver:APP_VER})}).catch(() => {});
+    }
+  });
+  _peekMoreDismissTimer = setTimeout(() => {
+    _peekMoreDismissTimer = 0;
+    document.addEventListener('click', _closePeekMore, {once: true});
+  }, 0);
 }
 function _closePeekMore() {
+  // Menu actions stop propagation, so the document's one-shot listener never
+  // fires for them. Retire it here or it consumes the next opening click.
+  clearTimeout(_peekMoreDismissTimer);
+  _peekMoreDismissTimer = 0;
+  document.removeEventListener('click', _closePeekMore);
   const dd = document.getElementById('peek-more-dropdown');
   if (dd) dd.classList.remove('open');
+  document.getElementById('peek-worker-menu-btn')?.setAttribute('aria-expanded', 'false');
 }
 
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
-let _peekMsgNavKind = 'human';
+let _peekMsgNavKind = 'all';
+let _peekMsgNavContent = 'any';
+const _PEEK_SOURCE_LABELS = {all:'Everyone', human:'Human', session:'Workers', schedule:'Scheduled', amux:'Harness', unstamped:'Unstamped', unknown:'Unclassified'};
+const _PEEK_CONTENT_LABELS = {any:'Any message', board:'Board references', files:'Files', links:'Links'};
+function _peekFiltersActive() { return _peekMsgNavKind !== 'all' || _peekMsgNavContent !== 'any'; }
+// True when the visible count depends on prompt KIND, which is the only part
+// that needs fetched provenance. A content filter (board/files/links) reads
+// the DOM and is answerable immediately, so it must not be reported unknown.
+function _peekFilterIsKindScoped() { return _peekMsgNavKind !== 'all'; }
+// How many messages of `kind` the FETCHED provenance shows for this worker.
+// `atLeast` is true when that provenance filled its page, because then the
+// number is a floor and not a total — saying "13" when we only looked at 50
+// rows of a longer history would be asserting more than was measured.
+function _peekKnownKindCount(kind) {
+  let rows = null, page = 0;
+  if (_peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows)) {
+    rows = _peekMsgRows; page = _PEEK_MSG_PAGE;
+  } else if (_peekKindHintsFor === peekSession && Array.isArray(_peekKindHints)) {
+    rows = _peekKindHints; page = 50;
+  }
+  if (!rows) return { n: 0, atLeast: false };
+  const n = rows.filter(r => r && r.session === peekSession && _msgKind(r) === kind).length;
+  return { n, atLeast: rows.length >= page };
+}
+function _peekFilterSummary() {
+  const source = _peekMsgNavKind === 'all' ? '' : _PEEK_SOURCE_LABELS[_peekMsgNavKind];
+  const content = _peekMsgNavContent === 'any' ? '' : _PEEK_CONTENT_LABELS[_peekMsgNavContent];
+  return [source, content].filter(Boolean).join(' · ') || 'All messages';
+}
+// Both navigation and Find select message blocks with the same predicate.
+// Content filters inspect actual references, never guesses about task intent.
+function _peekPromptMatchesFilters(el) {
+  if (!el || (_peekMsgNavKind !== 'all' && el.dataset.msgKind !== _peekMsgNavKind)) return false;
+  if (_peekMsgNavContent === 'board') return /\b[A-Z]{2,8}-\d{1,6}\b/.test(el.textContent);
+  if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  return true;
+}
+function _peekFilterSync() {
+  const button = document.getElementById('peek-filter-btn');
+  const summary = document.getElementById('peek-filter-summary');
+  if (!button || !summary) return;
+  const label = _peekFilterSummary();
+  summary.textContent = label;
+  button.title = 'Filter messages: ' + label;
+  button.classList.toggle('active', _peekFiltersActive());
+  for (const input of document.querySelectorAll('[name="peek-filter-source"]')) input.checked = input.value === _peekMsgNavKind;
+  for (const input of document.querySelectorAll('[name="peek-filter-content"]')) input.checked = input.value === _peekMsgNavContent;
+  document.getElementById('peek-filter-reset').disabled = !_peekFiltersActive();
+}
+function togglePeekFilters() {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  if (!panel.hidden) { _closePeekFilters(true); return; }
+  _closePeekMore();
+  _peekFilterSync();
+  panel.hidden = false;
+  document.getElementById('peek-filter-btn').setAttribute('aria-expanded', 'true');
+  panel.querySelector('input:checked')?.focus({preventScroll:true});
+  document.addEventListener('pointerdown', _peekFiltersOutside);
+  document.addEventListener('focusin', _peekFiltersOutside);
+  document.addEventListener('keydown', _peekFiltersKey, true);
+}
+function _peekFiltersOutside(event) {
+  if (!event.target.closest('.peek-msg-filter')) _closePeekFilters();
+}
+function _peekFiltersKey(event) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault(); event.stopPropagation();
+  _closePeekFilters(true);
+}
+function _closePeekFilters(returnFocus = false) {
+  const panel = document.getElementById('peek-filter-panel');
+  if (!panel) return;
+  panel.hidden = true;
+  const button = document.getElementById('peek-filter-btn');
+  button?.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('pointerdown', _peekFiltersOutside);
+  document.removeEventListener('focusin', _peekFiltersOutside);
+  document.removeEventListener('keydown', _peekFiltersKey, true);
+  if (returnFocus) button?.focus({preventScroll:true});
+}
+function _peekFilterContentSelect(content) {
+  if (!Object.hasOwn(_PEEK_CONTENT_LABELS, content)) return;
+  _peekMsgNavContent = content;
+  _peekFiltersChanged();
+}
+function _peekFiltersReset() {
+  _peekMsgNavKind = 'all'; _peekMsgNavContent = 'any';
+  _peekFiltersChanged();
+}
+function _peekFiltersChanged() {
+  _peekMsgIndex = -1;
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  if (peekSearchQuery.trim()) applyPeekSearch(false, true);
+  else _peekReclassifyPrompts();
+  const loaded = [...document.querySelectorAll('#peek-body .peek-prompt')];
+  const matched = loaded.filter(el => _peekPromptMatchesFilters(el)).length;
+  fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:'peek-message-filter',verdict:matched ? 'matches' : 'no-matches',
+      session:peekSession,measured:true,n_considered:loaded.length,matched_messages:matched,
+      source_filter:_peekMsgNavKind,content_filter:_peekMsgNavContent,
+      searching:!!peekSearchQuery.trim(),search_matches:_peekMatches.length,ver:APP_VER})}).catch(() => {});
+}
+let _peekMsgNavGesture = null;
+function _peekMsgNavArm(e) {
+  const body = document.getElementById('peek-body');
+  _peekMsgNavGesture = {
+    pointerId: e.pointerId,
+    x: e.clientX,
+    y: e.clientY,
+    scrollTop: body ? body.scrollTop : 0,
+    at: performance.now(),
+  };
+}
+function _peekMsgNavIsExplicit(e) {
+  // Keyboard activation produces a trusted click with detail=0 and no pointer
+  // gesture. Programmatic .click() is intentionally not user intent.
+  if (!e || !e.isTrusted) return false;
+  if (e.detail === 0) return true;
+  const body = document.getElementById('peek-body');
+  const armed = _peekMsgNavGesture;
+  _peekMsgNavGesture = null;
+  if (!armed || performance.now() - armed.at > 1500) return false;
+  if (e.pointerId != null && armed.pointerId != null && e.pointerId !== armed.pointerId) return false;
+  const moved = Math.hypot((e.clientX || 0) - armed.x, (e.clientY || 0) - armed.y);
+  const scrolled = !!body && Math.abs(body.scrollTop - armed.scrollTop) > 1;
+  return moved <= 8 && !scrolled;
+}
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
   if (!body) return [];
-  if (peekSearchQuery) {
-    return Array.from(body.querySelectorAll('.peek-search-match'));
-  }
-  const all = Array.from(body.querySelectorAll('.peek-prompt'));
-  if (_peekMsgNavKind === 'all') return all;
-  // Classify FRESH here, not from the render-time `data-msg-kind`. Prompts are
-  // rendered (and their kind stamped) BEFORE `_loadCmdHistoryFromServer`
-  // resolves, so at render time a prompt that matches no marker and no loaded
-  // row FAILS OPEN to 'human' — a scheduled command ("Board push …"), a peer
-  // relay, or an amux nudge then pollutes the human navigator and it never gets
-  // re-stamped. By the time a human presses ↑/↓, cmd_history IS loaded, so
-  // re-running the classifier yields the TRUE kind and the default human filter
-  // shows only real human messages (Ethan 2026-08-13: "simple default scroll
-  // thru + highlight human messages, not amux/session/schedule/peer").
-  return all.filter(el => _classifyPromptKind(el.textContent) === _peekMsgNavKind);
+  if (peekSearchQuery.trim()) return _peekMatches.filter(el => el.isConnected);
+  return Array.from(body.querySelectorAll('.peek-prompt')).filter(el =>
+    _peekPromptMatchesFilters(el));
 }
-function _peekMsgUpdate(prompts) {
-  const countEl = document.getElementById('peek-msg-count');
-  if (!countEl) return;
-  document.querySelectorAll('.peek-prompt.peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
-  if (!prompts.length) {
-    countEl.textContent = peekSearchQuery ? '0' : '❯';
+function _peekMsgCount(prompts) {
+  const searching = !!peekSearchQuery.trim();
+  const selectedKind = _peekFilterSummary();
+  const label = searching ? selectedKind + ' matches' : selectedKind;
+  const count = document.getElementById('peek-msg-count');
+  if (count) {
+    // A KIND COUNT BEFORE PROVENANCE HAS LOADED IS NOT ZERO, IT IS UNKNOWN.
+    // Kinds come from matching pane text against fetched message rows. Until
+    // a row set for THIS worker has arrived, every unmarked prompt classifies
+    // as 'unknown', so a kind-scoped filter renders a confident "0" over a
+    // worker with 13 human messages. Printing an em-dash says the measurement
+    // has not run, which is the true statement (ethos rule 4).
+    const ready = (_peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows))
+      || (_peekKindHintsFor === peekSession && Array.isArray(_peekKindHints) && _peekKindHints.length > 0);
+    const scoped = !searching && _peekFilterIsKindScoped();
+    const selected = prompts.findIndex(p => p.classList.contains(searching ? 'current' : 'peek-msg-current'));
+    let value = (scoped && !ready)
+      ? '\u2026'
+      : String(selected < 0 ? prompts.length : (selected + 1) + '/' + prompts.length);
+    let aria = (scoped && !ready)
+      ? label + ': still loading message provenance for this worker'
+      : label + ': ' + value + ' in loaded output';
+    // ZERO IN THE LOADED WINDOW IS NOT ZERO FOR THE WORKER. This counts
+    // `.peek-prompt` elements in the terminal that is currently loaded, which
+    // is a short window; the worker's history holds far more. Reporting a bare
+    // "0" over a worker whose history has 13 human messages is the report
+    // Ethan filed (2026-09-10). When the loaded window has none but the
+    // fetched provenance says the kind exists, say where they are instead.
+    if (scoped && ready && prompts.length === 0) {
+      const known = _peekKnownKindCount(_peekMsgNavKind);
+      if (known.n > 0) {
+        value = '0';
+        aria = label + ': none in the loaded output; ' + known.n + (known.atLeast ? '+' : '')
+             + ' earlier in this worker\u2019s history — load earlier output to reach them';
+        count.title = known.n + (known.atLeast ? '+' : '') + ' earlier — load earlier output';
+      }
+    } else if (count.title) {
+      count.removeAttribute('title');
+    }
+    if (count.textContent !== value) count.textContent = value;
+    count.setAttribute('aria-label', aria);
+  }
+  _peekFilterSync();
+  for (const btn of document.querySelectorAll('#peek-msg-nav .peek-nav-btn')) {
+    // Zero loaded matches still permits loading earlier output. It is not a
+    // disabled action; explain that fallback instead of drawing a dead arrow.
+    btn.removeAttribute('aria-disabled');
+    const direction = btn.getAttribute('aria-label').startsWith('Previous') ? 'Previous' : 'Next';
+    btn.title = direction + (searching ? ' search result' : ' message')
+      + (!prompts.length ? ' — look in earlier output' : '');
+  }
+  _peekToolbarCheck();
+}
+let _peekToolbarFrame = 0, _peekToolbarFault = '';
+function _peekToolbarCheck() {
+  if (_peekToolbarFrame) return;
+  _peekToolbarFrame = requestAnimationFrame(() => {
+    _peekToolbarFrame = 0;
+    const toolbar = document.querySelector('.peek-toolbar');
+    if (!toolbar || !toolbar.getClientRects().length) return;
+    const controls = [...toolbar.querySelectorAll('button,select')].filter(el =>
+      el.getClientRects().length && !el.closest('.peek-filter-panel, .peek-more-dropdown'));
+    const rect = toolbar.getBoundingClientRect();
+    // Layout sizes are independent of the user's deliberate UI zoom. Comparing
+    // scaled screen rectangles to CSS sizes falsely flagged every 80% control.
+    const small = controls.filter(el => el.offsetWidth < 43 || el.offsetHeight < 43);
+    const overflow = rect.right > document.documentElement.clientWidth + 1 || toolbar.scrollWidth > toolbar.clientWidth + 1;
+    const caption = document.getElementById('peek-nav-label');
+    const clippedCaption = !!caption?.getClientRects().length && caption.scrollWidth > caption.clientWidth + 1;
+    const fault = overflow || small.length || clippedCaption || toolbar.offsetHeight > 48;
+    const key = fault ? [innerWidth, toolbar.offsetHeight, overflow, small.length].join(':') : '';
+    if (key && key !== _peekToolbarFault) {
+      try { fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'peek-toolbar-layout',verdict:'unusable-controls',session:peekSession,
+          measured:true,n_considered:controls.length,viewport:innerWidth,height:toolbar.offsetHeight,rendered_height:rect.height,
+          overflow,small_targets:small.length,clipped_filter_caption:clippedCaption,ver:APP_VER})}).catch(() => {}); } catch(e) {}
+    }
+    _peekToolbarFault = key;
+  });
+}
+window.addEventListener('resize', _peekToolbarCheck);
+// getBoundingClientRect uses rendered pixels; scrollTop uses unzoomed layout
+// pixels. Use computed border-box height (not rounded offsetHeight) to convert.
+function _peekScrollScale(el) {
+  const style = getComputedStyle(el);
+  const extra = style.boxSizing === 'border-box' ? 0 : ['paddingTop','paddingBottom','borderTopWidth','borderBottomWidth']
+    .reduce((sum, key) => sum + (parseFloat(style[key]) || 0), 0);
+  return el.getBoundingClientRect().height / (parseFloat(style.height) + extra) || 1;
+}
+function _peekJumpGeometry(el) {
+  const body = document.getElementById('peek-body');
+  const bounds = body.getBoundingClientRect(), rect = el.getBoundingClientRect();
+  const scale = _peekScrollScale(body);
+  const viewportTop = bounds.top + body.clientTop * scale;
+  // Padding protects the first line at rest; explicit jumps must also respect
+  // the controls that float above the scrolling output.
+  let inset = Math.max(12, parseFloat(getComputedStyle(body).paddingTop) || 0);
+  for (const control of document.querySelectorAll('#peek-overlay .peek-copy-btn, #peek-overlay .peek-agent-nav')) {
+    if (!control.getClientRects().length) continue;
+    const r = control.getBoundingClientRect();
+    if (r.bottom > viewportTop && r.top < bounds.bottom) inset = Math.max(inset, (r.bottom - viewportTop) / scale + 6);
+  }
+  const offset = (rect.top - viewportTop) / scale;
+  const max = Math.max(0, body.scrollHeight - body.clientHeight);
+  const wanted = Math.max(0, Math.min(max, body.scrollTop + offset - inset));
+  return {body, bounds, rect, scale, inset, offset, wanted, max,
+    visible: rect.top >= viewportTop + inset * scale - 1 && rect.top < bounds.bottom
+      && rect.right > bounds.left && rect.left < bounds.right};
+}
+function _peekJumpTo(el) {
+  _peekFollowBottom = false;
+  const g = _peekJumpGeometry(el);
+  _peekScrollLocked = true;
+  // A search match inside a wide terminal table also needs its own horizontal
+  // scroller moved. Never scroll the page or an unrelated overlay.
+  for (let box = el.parentElement; box && box !== g.body; box = box.parentElement) {
+    if (box.scrollWidth <= box.clientWidth) continue;
+    const r = box.getBoundingClientRect(), match = el.getBoundingClientRect(), scale = _peekScrollScale(box);
+    if (match.left < r.left || match.right > r.right) box.scrollLeft += (match.left - r.left) / scale - 8;
+  }
+  g.body.scrollTo({top:g.wanted, behavior:'instant'});
+}
+function _peekNavBeacon(verdict, prompts, target) {
+  const body = document.getElementById('peek-body');
+  const geometry = target && _peekJumpGeometry(target);
+  const searching = !!peekSearchQuery.trim();
+  if (target && _peekFiltersActive() && !_peekPromptMatchesFilters(target.closest('.peek-prompt'))) verdict = 'filter-mismatch';
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'peek-message-nav', verdict, session: peekSession, ver: APP_VER,
+        provider: sessionProvider(sessions.find(worker => worker.name === peekSession)),
+        measured: true, n_considered: prompts.length, filter: _peekMsgNavKind, content_filter: _peekMsgNavContent,
+        mode: searching ? 'search' : 'messages',
+        index: searching ? peekSearchIndex : _peekMsgIndex, target_kind: target?.closest('.peek-prompt')?.dataset.msgKind || null,
+        target_visible: !!geometry && geometry.visible,
+        target_offset: geometry ? Math.round(geometry.offset * 100) / 100 : null,
+        desired_inset: geometry ? Math.round(geometry.inset * 100) / 100 : null,
+        scroll_error_px: geometry ? Math.round((geometry.wanted - body.scrollTop) * 100) / 100 : null,
+        zoom: geometry ? Math.round(geometry.scale * 1000) / 1000 : null,
+        scroll_top: Math.round(body.scrollTop),
+        composer_hints_excluded: body.querySelectorAll('.peek-composer-hint').length,
+        unclassified: body.querySelectorAll('.peek-prompt-unknown').length }) }).catch(() => {});
+  } catch (e) {}
+}
+async function _peekMsgMove(direction, event) {
+  if (!_peekMsgNavIsExplicit(event)) {
+    const prompts = _peekMsgPrompts();
+    _peekNavBeacon('suppressed-scroll-gesture', prompts, null);
     return;
   }
-  if (_peekMsgIndex < 0 || _peekMsgIndex >= prompts.length) _peekMsgIndex = prompts.length - 1;
-  prompts[_peekMsgIndex].classList.add('peek-msg-current');
-  prompts[_peekMsgIndex].scrollIntoView({ block: 'center', behavior: 'smooth' });
-  const label = peekSearchQuery ? '' : (_peekMsgNavKind === 'all' ? '' : _peekMsgNavKind.slice(0,1).toUpperCase());
-  countEl.textContent = (label ? label + ' ' : '') + (_peekMsgIndex + 1) + '/' + prompts.length;
+  _peekReclassifyPrompts();
+  let prompts = _peekMsgPrompts();
+  if (!prompts.length) {
+    const earlier = await _peekLoadEarlier({quiet: true});
+    _peekReclassifyPrompts();
+    prompts = _peekMsgPrompts();
+    if (prompts.length) {
+      _peekNavBeacon('loaded-earlier', prompts, null);
+    } else {
+      _peekMsgCount(prompts);
+      _peekNavBeacon('no-targets', prompts, null);
+      const label = _peekMsgNavKind === 'all' ? 'messages'
+        : ((_MSG_KIND[_peekMsgNavKind] || _MSG_KIND.unknown).label.toLowerCase() + ' messages');
+      const why = earlier === 'subagent-tail' ? 'Only recent subagent output is loaded.' : earlier === 'beginning' ? 'Reached the beginning of the saved output.'
+        : earlier === 'loaded' || earlier === 'empty' ? 'Loaded an earlier output page.'
+        : earlier === 'missing' ? 'This worker has no saved earlier output.'
+        : 'Earlier output could not be loaded.';
+      showToast('No matching ' + label + '. ' + why);
+      return;
+    }
+  }
+  const selected = prompts.findIndex(p => p.classList.contains(peekSearchQuery.trim() ? 'current' : 'peek-msg-current'));
+  if (selected >= 0) _peekMsgIndex = (selected + direction + prompts.length) % prompts.length;
+  else {
+    const g = _peekJumpGeometry(prompts[0]);
+    const top = g.bounds.top + g.inset * g.scale + 1;
+    const visible = prompts.findIndex(p => p.getBoundingClientRect().top >= top);
+    _peekMsgIndex = direction > 0 ? (visible < 0 ? 0 : visible)
+      : (visible <= 0 ? prompts.length - 1 : visible - 1);
+  }
+  document.querySelectorAll('#peek-body .peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  const target = prompts[_peekMsgIndex];
+  target.classList.add('peek-msg-current');
+  if (peekSearchQuery.trim()) {
+    peekSearchIndex = _peekMsgIndex;
+    _peekScrollTo(peekSearchIndex, false);
+  }
+  _peekJumpTo(target);
+  _peekMsgCount(prompts);
+  const landed = _peekJumpGeometry(target);
+  _peekNavBeacon(landed.visible && Math.abs(landed.wanted - landed.body.scrollTop) < 2 ? 'landed' : 'target-not-visible', prompts, target);
 }
-function peekMsgNext() {
-  const p = _peekMsgPrompts();
-  if (!p.length) return;
-  _peekMsgIndex = _peekMsgIndex < p.length - 1 ? _peekMsgIndex + 1 : 0;
-  _peekMsgUpdate(p);
-}
-function peekMsgPrev() {
-  const p = _peekMsgPrompts();
-  if (!p.length) return;
-  _peekMsgIndex = _peekMsgIndex <= 0 ? p.length - 1 : _peekMsgIndex - 1;
-  _peekMsgUpdate(p);
-}
-function _peekMsgNavCycle() {
-  const kinds = ['human', 'session', 'schedule', 'amux', 'all'];
-  const i = kinds.indexOf(_peekMsgNavKind);
-  _peekMsgNavKind = kinds[(i + 1) % kinds.length];
-  _peekMsgIndex = -1;
-  const p = _peekMsgPrompts();
-  const label = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || {}).label || _peekMsgNavKind;
-  const countEl = document.getElementById('peek-msg-count');
-  if (countEl) countEl.textContent = label + ' ' + p.length;
-  showToast('Navigate: ' + label + ' messages (' + p.length + ')');
+function peekMsgNext(event) { _peekMsgMove(1, event); }
+function peekMsgPrev(event) { _peekMsgMove(-1, event); }
+function _peekMsgNavSelect(kind) {
+  if (!Object.hasOwn(_PEEK_SOURCE_LABELS, kind)) return;
+  _peekMsgNavKind = kind;
+  _peekFiltersChanged();
 }
 
 // ── Peek command bar ──
@@ -10890,6 +14450,7 @@ function _expandPeekInput() {
   const ta = document.getElementById('peek-input-fs-ta');
   if (!inp || !fs || !ta) return;
   ta.value = inp.value;
+  _atAttach(ta);
   fs.classList.add('open');
   setTimeout(() => { ta.focus(); try { ta.selectionStart = ta.selectionEnd = ta.value.length; } catch (e) {} }, 50);
 }
@@ -10897,7 +14458,7 @@ function _collapsePeekInput() {
   const inp = document.getElementById('peek-cmd-input');
   const fs = document.getElementById('peek-input-fs');
   const ta = document.getElementById('peek-input-fs-ta');
-  if (inp && ta) { inp.value = ta.value; if (typeof autoGrow === 'function') autoGrow(inp); }
+  if (inp && ta) { inp.value = ta.value; _draftInputChanged(inp); if (typeof autoGrow === 'function') autoGrow(inp); }
   if (fs) fs.classList.remove('open');
   if (inp) setTimeout(() => inp.focus({ preventScroll: true }), 30);
 }
@@ -10905,7 +14466,7 @@ function _fsSend() {
   const inp = document.getElementById('peek-cmd-input');
   const ta = document.getElementById('peek-input-fs-ta');
   const fs = document.getElementById('peek-input-fs');
-  if (inp && ta) { inp.value = ta.value; if (typeof autoGrow === 'function') autoGrow(inp); }
+  if (inp && ta) { inp.value = ta.value; _draftInputChanged(inp); if (typeof autoGrow === 'function') autoGrow(inp); }
   if (fs) fs.classList.remove('open');
   sendPeekCmd();
 }
@@ -10982,7 +14543,7 @@ async function _smRefresh() {
     };
     el.onclick = () => {
       const inp = document.getElementById('peek-cmd-input');
-      if (inp) { inp.value = it.text || ''; if (typeof autoGrow === 'function') autoGrow(inp); }
+      if (inp) { inp.value = it.text || ''; _draftInputChanged(inp); if (typeof autoGrow === 'function') autoGrow(inp); }
       _closeSavedMessages();
       if (inp) setTimeout(() => inp.focus({ preventScroll: true }), 40);
     };
@@ -11065,10 +14626,10 @@ function _renderPeekFileChips() {
     let statusHtml = '';
     if (f.error) {
       statusHtml = `<span class="chip-err" title="${esc(f.error)}">!</span>` +
-        `<span class="chip-retry" onclick="event.stopPropagation();retryPeekFile(${i})" title="Retry upload">↻</span>`;
+        `<button type="button" class="chip-retry" onclick="event.stopPropagation();retryPeekFile(${i})" title="Retry upload">Retry</button>`;
     } else if (isUploading) {
       const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
-      statusHtml = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`;
+      statusHtml = `<span style="color:var(--dim);font-size:0.6rem;">${esc(f.status || (pct + '%'))}</span>`;
     } else {
       statusHtml = `<span style="color:var(--green);font-size:0.75rem;margin-right:2px;">✓</span>`;
     }
@@ -11077,7 +14638,7 @@ function _renderPeekFileChips() {
       ${thumb}
       <span class="chip-name">${esc(f.name)}</span>
       ${statusHtml}
-      <span class="chip-remove" onclick="event.stopPropagation();removePeekFile(${i})" title="Remove">×</span>
+      <button type="button" class="chip-remove" aria-label="Remove attachment" onclick="event.stopPropagation();removePeekFile(${i})" title="Remove">×</button>
     </div>`;
   }).join('');
 }
@@ -11087,7 +14648,7 @@ function removePeekFile(idx) {
   // Cancel BEFORE splicing. Removing the chip no longer stops the transfer by
   // itself — that was the membership inference this fix removed — so the intent
   // has to be stated (AF-235).
-  _cancelUpload(f);
+  if (!_cancelUpload(f)) return;
   if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl);
   peekFiles.splice(idx, 1);
   renderPeekFiles();
@@ -11096,22 +14657,37 @@ function removePeekFile(idx) {
 // Say "stop" explicitly, and abort the in-flight request so a large chunk is not
 // still on the wire after the chip is gone.
 function _cancelUpload(f) {
-  if (!f) return;
+  if (!f) return true;
+  // Persist the small cancellation intent synchronously. The IndexedDB delete
+  // can be interrupted by a reload immediately after this click (AMUX-4417).
+  // Per-ID keys avoid losing another tab's cancellation in an array rewrite.
+  try { if (f.id) _writeUserStorage(_attachmentCancelKey(f.id), '1'); }
+  catch (error) {
+    _uploadStorageError('cancel-intent-failed', error);
+    showToast('Could not save attachment removal — attachment kept. Retry removal.');
+    return false;
+  }
   f.cancelled = true;
+  if (f.interactionId) _interactionSet(f.interactionId, {phase:'refused', feedback:{message:'Upload cancelled'}});
+  if (f.id) _persistAttachment(f).then(() => {
+    _durableAttachments.delete(f.id);
+    localStorage.removeItem(_attachmentCancelKey(f.id));
+  }).catch(error => _uploadStorageError('remove-failed', error));
   try { if (f.aborter) f.aborter.abort(); } catch (e) {}
   f.inflight = false;
+  return true;
 }
 
 function retryPeekFile(idx) {
   const f = peekFiles[idx];
-  if (!f || f.inflight || f.path) return;
-  _runUpload(f, _peekSink());
+  if (!f || f.inflight || f.queued || f.path) return;
+  _queueAttachment(f, _peekSink());
 }
 
 function retryCardFile(name, idx) {
   const f = (_cardFiles[name] || [])[idx];
-  if (!f || f.inflight || f.path) return;
-  _runUpload(f, _cardSink(name));
+  if (!f || f.inflight || f.queued || f.path) return;
+  _queueAttachment(f, _cardSink(name));
 }
 
 /// Clear the composer: text, the saved draft, and any staged attachments.
@@ -11138,6 +14714,7 @@ function _peekClearInput() {
   inp.style.height = 'auto';
   _draftClear(peekSession);
   if (nFiles) clearPeekFiles();
+  if (peekFiles.length) { showToast('Text cleared; attachment removal was not saved. Retry removal.'); return; }
   try { inp.focus(); } catch (e) {}
   showToast(
     nFiles
@@ -11147,11 +14724,17 @@ function _peekClearInput() {
 }
 
 function clearPeekFiles() {
-  peekFiles.forEach(f => { _cancelUpload(f); if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
-  peekFiles = [];
+  peekFiles = peekFiles.filter(f => {
+    if (!_cancelUpload(f)) return true;
+    if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+    return false;
+  });
   // Drop the stash too, or a send would clear the bar and the next open would
   // resurrect the files that were just sent.
-  try { if (peekSession) delete _peekFilesBySession[peekSession]; } catch (e) {}
+  if (peekSession) {
+    if (peekFiles.length) _peekFilesBySession[peekSession] = peekFiles;
+    else delete _peekFilesBySession[peekSession];
+  }
   renderPeekFiles();
 }
 
@@ -11178,7 +14761,7 @@ function _peekFilesRestore(session) {
   // the reporting user was staring at — it rendered "0%" forever, which reads
   // as "still working" and is why they waited instead of removing it.
   peekFiles.forEach(f => {
-    if (!f.path && !f.inflight && !f.error) f.error = 'upload did not finish — retry or remove';
+    if (!f.path && !f.inflight && !f.queued && !f.error) f.error = 'upload did not finish — retry or remove';
   });
   renderPeekFiles();
 }
@@ -11218,12 +14801,12 @@ function _renderCardFileChips(name) {
     let status;
     if (f.path) status = `<span style="color:var(--green);font-size:0.75rem;">✓</span>`;
     else if (f.error) status = `<span class="chip-err" title="${esc(f.error)}">!</span>` +
-      `<span class="chip-retry" onclick="event.stopPropagation();retryCardFile('${name}',${i})" title="Retry upload">↻</span>`;
+      `<button type="button" class="chip-retry" onclick="event.stopPropagation();retryCardFile('${name}',${i})" title="Retry upload">Retry</button>`;
     else { const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
-           status = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`; }
+           status = `<span style="color:var(--dim);font-size:0.6rem;">${esc(f.status || (pct + '%'))}</span>`; }
     // The × is on EVERY chip in EVERY state — an escape hatch that only exists
     // once an upload finishes is not one (the peek's own AMUX-85 lesson).
-    const rm = `<span class="chip-remove" onclick="event.stopPropagation();removeCardFile('${name}',${i})" title="Remove">×</span>`;
+    const rm = `<button type="button" class="chip-remove" aria-label="Remove attachment" onclick="event.stopPropagation();removeCardFile('${name}',${i})" title="Remove">×</button>`;
     return `<div class="peek-attach-chip${f.path ? '' : (f.error ? ' failed' : ' uploading')}">${thumb}<span class="chip-name">${esc(f.name)}</span>${status}${rm}</div>`;
   }).join('');
 }
@@ -11231,14 +14814,18 @@ function removeCardFile(name, idx) {
   const a = _cardFiles[name] || [];
   const f = a[idx];
   if (!f) return;
-  _cancelUpload(f);
+  if (!_cancelUpload(f)) return;
   if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
   a.splice(idx, 1);
   renderCardFiles(name);
 }
 function _clearCardFiles(name) {
-  (_cardFiles[name] || []).forEach(f => { _cancelUpload(f); if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
-  delete _cardFiles[name];
+  _cardFiles[name] = (_cardFiles[name] || []).filter(f => {
+    if (!_cancelUpload(f)) return true;
+    if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+    return false;
+  });
+  if (!_cardFiles[name].length) delete _cardFiles[name];
   renderCardFiles(name);
 }
 // Drop files onto a card's composer. Scoped to the send-row, not the whole card,
@@ -11282,16 +14869,16 @@ function _blockedByAttachment(files) {
   const arr = files || [];
   const pending = arr.filter(f => !f.path);
   if (!pending.length) return false;
-  const inflight = pending.filter(f => f.inflight);
-  const stuck = pending.filter(f => !f.inflight);
+  const inflight = pending.filter(f => f.inflight || f.queued);
+  const stuck = pending.filter(f => !f.inflight && !f.queued);
   const say = (typeof showToast === 'function') ? showToast : function () {};
   if (stuck.length) {
     // Name the FIRST stuck file — a count alone does not tell you which chip to
     // press, and past 12 files the chips are collapsed behind a summary row.
     const n = stuck[0].name;
     say(stuck.length === 1
-      ? `"${n}" did not upload — Retry (↻) or remove (×) it to send`
-      : `${stuck.length} attachments did not upload, starting with "${n}" — Retry (↻) or remove (×) them to send`);
+      ? `"${n}" did not upload — Retry or remove (×) it to send`
+      : `${stuck.length} attachments did not upload, starting with "${n}" — Retry or remove (×) them to send`);
     return true;
   }
   const n = inflight[0].name;
@@ -11302,15 +14889,18 @@ function _blockedByAttachment(files) {
 }
 
 function _peekSink() {
+  const files = peekFiles; // bind to the originating worker before any queue wait
   return {
-    push: (p) => peekFiles.push(p),
-    has: (p) => peekFiles.indexOf(p) >= 0,
-    drop: (p) => { const i = peekFiles.indexOf(p); if (i >= 0) peekFiles.splice(i, 1); },
+    session:peekSession, surface:'peek',
+    push: (p) => files.push(p),
+    has: (p) => files.indexOf(p) >= 0,
+    drop: (p) => { const i = files.indexOf(p); if (i >= 0) files.splice(i, 1); },
     render: _scheduleRenderPeekFiles,
   };
 }
 function _cardSink(name) {
   return {
+    session:name, surface:'card',
     push: (p) => (_cardFiles[name] = _cardFiles[name] || []).push(p),
     has: (p) => (_cardFiles[name] || []).indexOf(p) >= 0,
     drop: (p) => { const a = _cardFiles[name] || []; const i = a.indexOf(p); if (i >= 0) a.splice(i, 1); },
@@ -11318,14 +14908,95 @@ function _cardSink(name) {
   };
 }
 function _enqueueUpload(file, sink) {
-  _uploadQueue.push({ file, sink: sink || _peekSink() });
-  _drainUploadQueue();
+  if (!file) return;
+  sink = sink || _peekSink();
+  _queueAttachment(_createAttachment(file, sink), sink);
+}
+async function _queueAttachment(f, sink) {
+  if (f.queued || f.inflight || f.cancelled) return;
+  f.error = null; f.queued = true; f.status = 'Saving locally…';
+  sink.render();
+  try {
+    await _persistAttachment(f);
+    if (f.cancelled) return;
+    f.status = 'Queued';
+    if (f.interactionId) _interactionSet(f.interactionId, {phase:'queued', feedback:{message:'File saved on this device; queued for upload'}});
+    _uploadQueue.push({ f, sink });
+    sink.render();
+    _drainUploadQueue();
+  } catch (error) {
+    f.queued = false; f.error = 'Not saved locally — retry or keep the original file'; f.retryable = false;
+    if (f.interactionId) _interactionFail(f.interactionId, f.error, false);
+    _uploadStorageError('attachment-save-failed', error);
+    sink.render();
+  }
+}
+
+// Bytes and destination survive reload. Persist each attachment independently;
+// whole-array writes lose concurrent additions and repeatedly copy every blob.
+const _attachmentCancelPrefix = 'amux_attachment_cancel:';
+const _attachmentCancelKey = id => _attachmentCancelPrefix + id;
+const _durableAttachments = new Map();
+let _attachmentRestorePromise = null;
+function _storedUploadFile(row) {
+  return {name:row.name, size:row.size, type:row.mime || '',
+    slice:async (start, end) => {
+      const index = Math.floor(start / CHUNK_SIZE);
+      const bytes = await _idb.uploadChunk(row.id, index);
+      return new Blob([bytes], {type:row.mime}).slice(start % CHUNK_SIZE, start % CHUNK_SIZE + end - start);
+    }};
+}
+function _persistAttachment(f) {
+  if (!f.id) return Promise.resolve();
+  f.persistence = (f.persistence || Promise.resolve()).catch(() => {}).then(async () => {
+    if (f.cancelled) return _idb.deleteUpload(f.id);
+    if (f.stored) return _idb.updateUpload(f.id, {path:f.path, url:f.url, uploadId:f.uploadId, nextChunk:f.nextChunk});
+    await _idb.putUpload({id:f.id, session:f.session, surface:f.surface, name:f.name, file:f.file,
+      dir:f.dir, path:f.path, url:f.url, isImage:f.isImage, sizeMB:f.sizeMB, totalChunks:f.totalChunks}, (done, total) => {
+        f.status = 'Saving locally ' + Math.round(done / total * 100) + '%';
+        if (f.interactionId) _interactionSet(f.interactionId, {phase:'running', progress:{completed:done,total}, feedback:{message:'Saving file on this device'}});
+        _durableAttachments.get(f.id)?.sink.render();
+      });
+    f.stored = true;
+  });
+  return f.persistence;
+}
+function _restoreAttachments() {
+  if (_attachmentRestorePromise) return _attachmentRestorePromise;
+  _attachmentRestorePromise = _idb.getUploads().then(rows => {
+    // Recover IDs even when only partial byte chunks remain, or deletion
+    // committed before the old page could clear its cancellation journal.
+    const cancelled = new Set(Object.keys(localStorage).filter(key => key.startsWith(_attachmentCancelPrefix))
+      .map(key => key.slice(_attachmentCancelPrefix.length)));
+    for (const id of cancelled) {
+      _idb.deleteUpload(id).then(() => localStorage.removeItem(_attachmentCancelKey(id)))
+        .catch(error => _uploadStorageError('cancel-recovery-failed', error));
+    }
+    for (const row of rows) {
+      // Never restore or retransmit cancelled bytes while cleaning up.
+      if (cancelled.has(row.id)) continue;
+      if (row.surface === 'directory' || _durableAttachments.has(row.id)) continue;
+      const files = row.surface === 'card' ? (_cardFiles[row.session] ||= [])
+        : row.session === peekSession ? peekFiles : (_peekFilesBySession[row.session] ||= []);
+      const sink = row.surface === 'card' ? _cardSink(row.session) : {
+        session:row.session, surface:'peek', push:f => files.push(f),
+        render:() => { if (peekSession === row.session) renderPeekFiles(); }
+      };
+      const f = {...row, file:_storedUploadFile(row), stored:true, previewUrl:null,
+        chunk:0, queued:false, inflight:false, cancelled:false, status:'Saved locally',
+        error:row.path ? null : 'Saved locally — retrying when connected'};
+      files.push(f); _durableAttachments.set(f.id, {f, sink}); sink.render();
+    }
+  }).catch(error => { _attachmentRestorePromise = null; throw error; });
+  return _attachmentRestorePromise;
 }
 function _drainUploadQueue() {
   while (_uploadQueue.length && _uploadActive < _UPLOAD_CONCURRENCY) {
+    const { f, sink } = _uploadQueue.shift();
+    f.queued = false;
+    if (f.cancelled) continue;
     _uploadActive++;
-    const { file, sink } = _uploadQueue.shift();
-    uploadAndAttach(file, sink).finally(() => { _uploadActive--; _drainUploadQueue(); });
+    _runUpload(f, sink).finally(() => { _uploadActive--; _drainUploadQueue(); });
   }
 }
 
@@ -11341,7 +15012,7 @@ function _scheduleRenderPeekFiles() {
   }
 }
 
-async function uploadAndAttach(file, sink) {
+function _createAttachment(file, sink) {
   sink = sink || _peekSink();
   const isImage = file.type.startsWith('image/');
   let previewUrl = null;
@@ -11356,12 +15027,22 @@ async function uploadAndAttach(file, sink) {
   // placeholder never gets its .path (send then stalls on "wait for upload").
   // `file` is RETAINED so a failed upload can be retried from the chip itself,
   // and `cancelled`/`inflight` are EXPLICIT rather than inferred (AF-235).
-  const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB,
+  const placeholder = { id:crypto.randomUUID(), session:sink.session, surface:sink.surface, name: file.name, path: null, url: null, isImage, previewUrl, sizeMB,
                         chunk: 0, totalChunks, file, error: null, inflight: false,
-                        cancelled: false, aborter: null };
+                        cancelled: false, aborter: null, queued: false, status: 'Queued' };
+  placeholder.interactionId = 'int_upload_' + placeholder.id;
+  _interactions.accept({interactionId:placeholder.interactionId,
+    command:{id:placeholder.interactionId,kind:'filesystem.upload',target:{primitive:'filesystem',id:placeholder.id,label:file.name}}, request:{method:'POST',path:'/api/upload/start'}});
+  _durableAttachments.set(placeholder.id, {f:placeholder, sink});
   sink.push(placeholder);
   sink.render();
-  await _runUpload(placeholder, sink);
+  return placeholder;
+}
+async function uploadAndAttach(file, sink) {
+  sink = sink || _peekSink();
+  const f = _createAttachment(file, sink);
+  await _persistAttachment(f);
+  await _runUpload(f, sink);
 }
 
 // Drive one attachment to completion. Safe to call again on a failed chip.
@@ -11382,71 +15063,125 @@ async function uploadAndAttach(file, sink) {
 // the chip still lands on its path. That was already the right shape against one
 // array; since AMUX-3372 added card composers there are now several sinks, and it
 // is the only shape that works.
-async function _runUpload(f, sink) {
-  const file = f.file;
-  if (!file) { f.error = 'file no longer held — re-attach it'; f.inflight = false; sink.render(); return; }
-  f.error = null; f.cancelled = false; f.inflight = true; f.chunk = 0;
-  f.aborter = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const _sig = f.aborter ? f.aborter.signal : undefined;
-  const totalChunks = f.totalChunks;
-  sink.render();
-
+const _UPLOAD_ATTEMPTS = 3;
+function _uploadDiagnostic(f, action, error) {
+  fetch(API + '/api/client-debug', {method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+    signal:AbortSignal.timeout(5000),
+    body:JSON.stringify({kind:'attachment-upload', action, phase:f.phase, attempt:f.attempt,
+      bytes:f.file?.size, completedChunks:f.chunk, totalChunks:f.totalChunks,
+      error:error?.message, httpStatus:error?.status, measured:true, ver:APP_VER})}).catch(()=>{});
+}
+// Deadline includes reading the response body. A header-only response used to
+// leave response.json() pending forever, just like an unanswered fetch.
+async function _uploadRequest(f, phase, url, options) {
+  f.phase = phase;
+  const controller = new AbortController();
+  f.aborter = controller;
+  // Live upload/start reached 30.8s under host contention; allow that measured
+  // slow path before retrying. Chunk requests include up to 5MB of transfer.
+  const timeoutMs = phase === 'chunk' ? 60000 : 45000;
+  let timer, onAbort;
+  const cancelled = new Promise((_, reject) => {
+    onAbort = () => reject(Object.assign(new Error('Upload cancelled'), {name:'AbortError'}));
+    controller.signal.addEventListener('abort', onAbort, {once:true});
+  });
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(new Error('Upload timed out during ' + phase), {retryable:true}));
+      controller.abort();
+    }, timeoutMs);
+  });
   try {
-    const startR = await fetch(API + '/api/upload/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: file.name, size: file.size, chunks: totalChunks }),
-      signal: _sig
-    });
-    const startD = await startR.json();
-    if (!startR.ok || startD.error) throw new Error(startD.error || 'start failed');
-    const uploadId = startD.id;
-
-    for (let i = 0; i < totalChunks; i++) {
-      if (f.cancelled) return;
-      const start = i * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, file.size);
-      const blob = file.slice(start, end);
-      const r = await fetch(API + '/api/upload/' + uploadId + '/chunk/' + i, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: blob,
-        signal: _sig
-      });
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        throw new Error(d.error || 'chunk ' + i + ' failed');
+    return await Promise.race([deadline, cancelled, (async () => {
+      const response = await fetch(url, {...options, _interactionWorkflow:true,
+        headers:_authHeaders({...options.headers, 'X-Amux-Interaction-Id':f.interactionId + '_' + phase + '_' + (f.chunk || 0), 'X-Amux-Command-Kind':'filesystem.upload'}), signal:controller.signal});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.error) {
+        const status = response.status;
+        throw Object.assign(new Error(data.error || ('Upload request failed (HTTP ' + status + ')')),
+          {status, retryable:[408,425,429,500,502,503,504].includes(status) || (status === 404 && phase !== 'start')});
       }
-      f.chunk = i + 1;
-      sink.render();
-    }
-
-    const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST', signal: _sig });
-    const finD = await finR.json();
-    if (!finR.ok || finD.error) throw new Error(finD.error || 'finalize failed');
-    if (f.cancelled) return;
-    f.path = finD.path;
-    f.url = finD.url;
-    f.error = null;
-  } catch(e) {
-    // A DELIBERATE CANCEL IS NOT A FAILURE — it has already removed the chip.
-    if (f.cancelled || (e && e.name === 'AbortError')) return;
-    console.error('Upload error:', e);
-    // KEEP THE CHIP. This used to `sink.drop(placeholder)` behind a single
-    // toast, which silently lost the file: the only record that you had
-    // attached anything was a message that disappears. The chip now presents
-    // as something to act on, and `file` above is what makes Retry real.
-    //
-    // Note the card composer has rendered an `f.error` state since AMUX-3372
-    // and NOTHING HAS EVER SET IT — the sole failure path dropped the chip, so
-    // that branch and its `.failed` style were unreachable. This is the write
-    // that makes them live.
-    f.error = (e && e.message) ? e.message : 'upload failed';
-    showToast('Upload failed: ' + f.error + ' — use Retry on the chip');
+      return data;
+    })()]);
   } finally {
-    f.inflight = false;
-    f.aborter = null;
-    sink.render();
+    clearTimeout(timer);
+    controller.signal.removeEventListener('abort', onAbort);
+    if (f.aborter === controller) f.aborter = null;
+  }
+}
+async function _runUpload(f, sink) {
+  if (f.inflight || f.cancelled) return;
+  f.interactionId ||= 'int_upload_' + f.id;
+  _interactions.accept({interactionId:f.interactionId,
+    command:{id:f.interactionId, kind:'filesystem.upload', target:{primitive:'filesystem', id:f.id, label:f.name || f.file?.name}},
+    request:{method:'POST', path:'/api/upload/start'}});
+  const workflow = AmuxState.uploadActor(_interactions, f.interactionId);
+  workflow.send({type:'SEND'});
+  const file = f.file;
+  if (!file) { f.error = 'file no longer held — re-attach it'; f.inflight = false; workflow.send({type:'FAIL'}); workflow.stop(); sink.render(); return; }
+  f.error = null; f.inflight = true; f.queued = false;
+  try {
+    for (let attempt = 1; attempt <= _UPLOAD_ATTEMPTS; attempt++) {
+      if (f.cancelled) return;
+      f.attempt = attempt; f.chunk = f.nextChunk || 0;
+      f.status = attempt === 1 ? 'Starting…' : 'Retrying ' + attempt + '/' + _UPLOAD_ATTEMPTS + '…';
+      sink.render();
+      try {
+        const start = f.uploadId ? {id:f.uploadId} : await _uploadRequest(f, 'start', API + '/api/upload/start', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({name:file.name, size:file.size, chunks:f.totalChunks})});
+        if (typeof start.id !== 'string' || !start.id) throw new Error('Server did not return an upload ID');
+        f.uploadId = start.id;
+        await _persistAttachment(f);
+        const uploadUrl = API + '/api/upload/' + encodeURIComponent(start.id);
+        for (let i = f.nextChunk || 0; i < f.totalChunks; i++) {
+          if (f.cancelled) return;
+          f.status = 'Uploading ' + Math.round(i / f.totalChunks * 100) + '%'; sink.render();
+          await _uploadRequest(f, 'chunk', uploadUrl + '/chunk/' + i, {
+            method:'PUT', headers:{'Content-Type':'application/octet-stream'},
+            body:await file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size))});
+          f.chunk = i + 1; f.nextChunk = i + 1;
+          _interactionSet(f.interactionId, {phase:'sending', progress:{completed:Math.min((i + 1) * CHUNK_SIZE, file.size), total:file.size}, feedback:{message:'Uploading'}});
+          await _persistAttachment(f);
+        }
+        if (f.cancelled) return;
+        f.status = 'Finishing…'; sink.render();
+        workflow.send({type:'WAIT'});
+        const destination = f.surface === 'directory' ? '?dir=' + encodeURIComponent(f.dir) + '&name=' + encodeURIComponent(f.name) : '';
+        const done = await _uploadRequest(f, 'finish', uploadUrl + '/finish' + destination, {method:'POST'});
+        if (typeof done.path !== 'string' || !done.path || typeof done.url !== 'string' || !done.url)
+          throw new Error('Server did not confirm the uploaded file');
+        if (f.cancelled) return;
+        f.path = done.path; f.url = done.url; f.error = null; f.status = '';
+        _interactions.effect(f.interactionId, {id:'upload:' + f.uploadId, kind:'file.created', entity:{primitive:'filesystem', id:done.path}});
+        workflow.send({type:'COMPLETE'});
+        await _persistAttachment(f);
+        _uploadDiagnostic(f, 'complete');
+        return;
+      } catch (error) {
+        if (f.cancelled) return;
+        // Resume confirmed chunks on transient failure. A server restart can
+        // discard its in-flight map; only that explicit 404 starts a fresh upload.
+        if (error.status === 404) { f.uploadId = null; f.nextChunk = 0; await _persistAttachment(f); }
+        const retryable = error.retryable === true || error instanceof TypeError || error.name === 'AbortError';
+        f.retryable = retryable;
+        _uploadDiagnostic(f, retryable && attempt < _UPLOAD_ATTEMPTS ? 'retry' : 'failed', error);
+        if (!retryable || attempt === _UPLOAD_ATTEMPTS) throw error;
+        f.status = 'Retrying ' + (attempt + 1) + '/' + _UPLOAD_ATTEMPTS + '…'; sink.render();
+        workflow.send({type:'SEND'});
+        await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+      }
+    }
+  } catch (error) {
+    if (!f.cancelled) {
+      workflow.send({type:'FAIL'});
+      f.error = error.message || 'Upload failed'; f.status = '';
+      showToast('Upload failed: ' + f.error + ' — use Retry on the chip');
+    }
+  } finally {
+    if (f.cancelled) workflow.send({type:'CANCEL'});
+    workflow.stop();
+    f.inflight = false; f.aborter = null; sink.render();
   }
 }
 
@@ -11541,110 +15276,114 @@ function _updateSendSplit() {
     const main = split.querySelector('.send-split-main');
     if (main) main.textContent = _sendMode === 'queue' ? 'Queue' : 'Send';
   });
+  _syncComposerPending();
 }
 setTimeout(_updateSendSplit, 0);
 
+const _composerPendingSends = new Set();
+function _composerUnconfirmed(session, result, attachments) {
+  // The local log is available even with analytics disabled. Never send message
+  // contents, upload paths or credentials in a failure beacon.
+  fetch(API + '/api/client-debug', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({kind: 'composer-delivery', verdict: result === 'local-failed' ? 'local_storage_failed' : 'unconfirmed', session,
+      result, attachments, draft_retained: true, measured: true, n_considered: 1, ver: APP_VER})
+  }).catch(() => {});
+}
+
+function _syncComposerPending() {
+  const sync = (btn, session) => {
+    if (!btn) return;
+    const pending = _composerPendingSends.has(session);
+    btn.disabled = pending;
+    // The brief lock covers local persistence only; delivery belongs in Messages.
+    btn.textContent = _sendMode === 'queue' ? 'Queue' : 'Send';
+  };
+  sync(document.querySelector('#peek-overlay .send-split-main'), peekSession);
+  document.querySelectorAll('.card[data-session]').forEach(card =>
+    sync(card.querySelector('.send-split-main'), card.dataset.session));
+}
+
 async function sendPeekCmd() {
-  if (!peekSession) return;
+  const session = peekSession;
+  if (!session || _composerPendingSends.has(session)) return;
   if (_blockedByAttachment(peekFiles)) return;
   const inp = document.getElementById('peek-cmd-input');
-  const text = inp.value.trim();
+  const original = inp.value;
+  const text = original.trim();
   const files = peekFiles.filter(f => f.path);
-  if (!text && files.length === 0) {
-    // Empty send = extract + submit the suggested prompt from the session
-    _submitSuggestion(peekSession, true);
-    return;
-  }
-  // Queue mode: enqueue to the steering queue — no status check. The client's
-  // status is a snapshot, and racing it was exactly how queued messages fell
-  // through to direct sends. The server delivers at the next turn boundary; an
-  // idle session picks it up within seconds via the fast steering tick.
-  //
-  // ATTACHMENTS QUEUE TOO (Ethan 2026-08-13: "why are queue messages not queued
-  // here — with a file it sent in the box?"). This used to require
-  // `files.length === 0`, so ANY attached file fell through to the immediate
-  // direct send below — attaching a file silently bypassed the queue. But the
-  // uploaded files persist at their paths and the message that carries them is
-  // just `text @path1 @path2`, which is plain text — exactly what the steering
-  // queue delivers. So build the @path refs (same as the direct path does) and
-  // queue that. "steering carries text only" is true and irrelevant: @path IS
-  // text.
-  //
-  // EXCEPTION: when the session is at a selector (status 'waiting' = NEEDS
-  // INPUT), it is explicitly parked ON your answer. The steering queue only
-  // delivers at an IDLE boundary, never at a picker — so a queued reply would
-  // sit undelivered forever (you "keep sending commands and they don't go
-  // through"). Send those DIRECT so they land immediately.
-  const _atSelector = (sessions.find(s => s.name === peekSession) || {}).status === 'waiting';
-  if (_sendMode === 'queue' && !_atSelector) {
-    let queuedMsg = text;
-    if (files.length > 0) {
-      const refs = files.map(f => '@' + f.path).join(' ');
-      queuedMsg = text ? `${text} ${refs}` : refs;
-    }
-    cmdHistoryAdd(text || queuedMsg, {type:'steering'});
-    inp.value = '';
-    inp.style.height = 'auto';
-    _draftClear(peekSession);
-    clearPeekFiles();
-    const peekSendBtn = document.querySelector('.peek-cmd-bar .send-split-main, .peek-cmd-bar .btn.primary');
-    if (peekSendBtn) { peekSendBtn.dataset.prevText = peekSendBtn.textContent; peekSendBtn.textContent = 'Queuing…'; peekSendBtn.disabled = true; peekSendBtn.style.opacity = '0.6'; }
-    await steerSession(peekSession, queuedMsg);
-    if (peekSendBtn) { peekSendBtn.textContent = peekSendBtn.dataset.prevText || 'Queue'; peekSendBtn.disabled = false; peekSendBtn.style.opacity = ''; }
-    const sess = sessions.find(s => s.name === peekSession);
-    const cnt = _steerHumanCount(sess);
-    showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : '')
-              + (files.length ? ' · ' + files.length + ' file' + (files.length === 1 ? '' : 's') : ''));
-    return;
-  }
-  // 'send' mode + active session sends immediately. The old confirmation dialog
-  // here required a second Enter (or click) to confirm — that was the real
-  // "press enter twice" bug. The safe default is 'queue' mode (handled just
-  // above), which reliably delivers at the next turn boundary; use the send-mode
-  // toggle to switch between queue and send.
-  cmdHistoryAdd(text);
-
-  // Build message: inline @path references (no newlines — tmux treats \n as Enter,
-  // which would split the message and send the path as a separate submit)
+  if (!text && !files.length) { _submitSuggestion(session, true); return; }
   let message = text;
-  if (files.length > 0) {
-    const refs = files.map(f => '@' + f.path).join(' ');
-    message = text ? `${text} ${refs}` : refs;
+  if (files.length) message = [text, ...files.map(f => '@' + f.path)].filter(Boolean).join(' ');
+  const atSelector = (sessions.find(s => s.name === session) || {}).status === 'waiting';
+  const queued = _sendMode === 'queue' && !atSelector;
+  if (!queued) {
+    const routed = _atRoute(message);
+    if (routed && routed.target !== session) {
+      // The channel drawer now owns this draft; opening it is the explicit handoff.
+      inp.value = ''; inp.style.height = 'auto'; _draftClear(session); clearPeekFiles();
+      channelOpen(session, routed.target, routed.message);
+      return;
+    }
+    message = _expandAtMentions(message);
   }
-  // @-route at start of message → open channel drawer prefilled
-  const routed = _atRoute(message);
-  if (routed && routed.target !== peekSession) {
-    inp.value = '';
-    inp.style.height = 'auto';
-    _draftClear(peekSession);
-    clearPeekFiles();
-    channelOpen(peekSession, routed.target, routed.message);
-    return;
+  // Persist text and upload references in the local outbox before clearing.
+  // A network refusal remains reviewable in Sync and pending Messages.
+  const draftRevision = _draftSave(session, original);
+  _composerPendingSends.add(session);
+  _syncComposerPending();
+  let result = 'failed';
+  try {
+    const identity = {};
+    result = queued ? (await steerSession(session, message, identity) ? 'queued' : 'failed')
+      : await doSend(session, message, identity);
+    if (!['sent', 'queued'].includes(result)) {
+      _composerUnconfirmed(session, result, files.length);
+      showToast(result === 'local-failed' ? _writeError + ' — draft and attachments kept'
+        : 'Message not confirmed — draft and attachments kept');
+      return;
+    }
+    cmdHistoryAdd(text || message, { session, type: queued ? 'steering' : 'direct', msg_id:identity.msg_id });
+    _composerAcceptLocal(session, original, draftRevision);
+    // Remove only the acknowledged files, never a new attachment added while
+    // waiting, or attachments belonging to a different worker's composer.
+    const sent = new Set();
+    for (const f of files) {
+      if (!_cancelUpload(f)) continue;
+      sent.add(f);
+      if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+    }
+    if (peekSession === session) {
+      peekFiles = peekFiles.filter(f => !sent.has(f));
+      _peekFilesStash(session);
+      renderPeekFiles();
+      inp.style.borderColor = 'var(--green)';
+      setTimeout(() => { inp.style.borderColor = ''; }, 400);
+      _refreshPeekSoon();
+    } else if (_peekFilesBySession[session]) {
+      _peekFilesBySession[session] = _peekFilesBySession[session].filter(f => !sent.has(f));
+    }
+  } catch (e) {
+    _composerUnconfirmed(session, 'exception', files.length);
+    showToast('Message not confirmed — draft and attachments kept');
+  } finally {
+    _composerPendingSends.delete(session);
+    _syncComposerPending();
   }
-
-  inp.value = '';
-  inp.style.height = 'auto';
-  _draftClear(peekSession);
-  clearPeekFiles();
-
-  // @mentions in the middle of a message stay as text + API hints (Claude can reach them).
-  message = _expandAtMentions(message);
-  await doSend(peekSession, message);
-  inp.style.borderColor = 'var(--green)';
-  setTimeout(() => { inp.style.borderColor = ''; }, 400);
-  _refreshPeekSoon();
 }
-// Repaint the peek FAST after a send/keystroke instead of a fixed 500ms wait:
-// Claude repaints a picker/selection in <50ms and the peek endpoint serves in
-// ~8ms, so a 90ms refresh + one catch-up feels instant. Coalesced so holding an
-// arrow key (or rapid selection) doesn't storm the endpoint.
-let _peekSoonA = null, _peekSoonB = null;
+/// A refused send puts the text back where it was typed. If the next message
+/// is already being typed there, the refused one goes above it rather than
+/// over it.
+function _composerRestore(session, original) {
+  const live = _liveComposerValue(session);
+  const text = (live != null && live !== '' && live !== original) ? original + '\n' + live : original;
+  _draftSave(session, text);
+  _draftSyncInputs(session, text);
+}
+// One bounded live-frame poll loop after input. Full history can be hundreds
+// of KB; it must not delay seeing the bytes that just reached the terminal.
 function _refreshPeekSoon() {
-  if (!peekSession) return;
-  clearTimeout(_peekSoonA); clearTimeout(_peekSoonB);
-  _peekSoonA = setTimeout(() => refreshPeek(), 90);
-  _peekSoonB = setTimeout(() => refreshPeek(), 320);
-  _peekKickFast();   // run the poll loop fast so the streaming response is picked up promptly
+  if (!peekSession || document.hidden) return;
+  _peekKickFast();
 }
 async function peekQuickSend(text) {
   if (!peekSession) return;
@@ -11653,8 +15392,9 @@ async function peekQuickSend(text) {
 }
 async function peekQuickKeys(keys) {
   if (!peekSession) return;
-  await doKeys(peekSession, keys);
+  const result = await doKeys(peekSession, keys);
   _refreshPeekSoon();
+  return result;
 }
 async function _submitSuggestion(name, isPeek, fallbackKeys) {
   showSendingIndicator();
@@ -11664,13 +15404,33 @@ async function _submitSuggestion(name, isPeek, fallbackKeys) {
       body: JSON.stringify({text: ''})
     });
     const d = await r.json().catch(() => ({}));
-    if (d.message === 'no suggestion found') {
-      if (fallbackKeys) { if (isPeek) peekQuickKeys(fallbackKeys); else doKeys(name, fallbackKeys); }
-      else showToast('No suggestion to submit');
+    if (d.submission === 'no_effect' || d.message === 'no suggestion found') {
+      if (fallbackKeys) {
+        const keyResult = isPeek
+          ? await peekQuickKeys(fallbackKeys)
+          : await doKeys(name, fallbackKeys);
+        if (keyResult && keyResult.accepted) {
+          showToast(`No suggestion found — pressed ${fallbackKeys}; effect ${keyResult.effect}. If nothing changes, restart the worker.`);
+          amuxTrack('suggestion_fallback', {
+            session: name, key: fallbackKeys, verdict: keyResult.effect, ver: APP_VER
+          });
+        } else {
+          const why = keyResult && keyResult.message ? ': ' + keyResult.message : '';
+          showToast(`No suggestion found — ${fallbackKeys} was not confirmed${why}`);
+          amuxTrack('suggestion_fallback', {
+            session: name, key: fallbackKeys, verdict: 'not_sent', ver: APP_VER
+          });
+        }
+      } else showToast('No suggestion to submit');
     } else if (d.ok) {
       showToast('Sent suggestion');
+    } else {
+      showToast('Suggestion control failed: ' + (d.message || d.error || `HTTP ${r.status}`));
     }
-  } catch(e) {}
+  } catch(e) {
+    showToast('Suggestion control failed: ' + (e.message || String(e)));
+    amuxTrack('suggestion_fallback', { session: name, verdict: 'request_failed', ver: APP_VER });
+  }
   if (isPeek) _refreshPeekSoon();
   else if (_gridPanes && _gridPanes[name]) setTimeout(() => _updateGridPane(name), 500);
 }
@@ -11678,6 +15438,7 @@ async function _submitSuggestion(name, isPeek, fallbackKeys) {
 function _showSteerPrompt(text) {
   return new Promise(resolve => {
     const bg = document.createElement('div');
+    bg.className = 'amux-dialog-backdrop';
     bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:400;display:flex;align-items:center;justify-content:center;';
     const box = document.createElement('div');
     box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:400px;width:90%;box-shadow:0 12px 40px rgba(0,0,0,0.4);max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;';
@@ -11698,25 +15459,22 @@ function _showSteerPrompt(text) {
     bg.onclick = (e) => { if (e.target === bg) cleanup('cancel'); };
   });
 }
-async function steerSession(name, text) {
-  if (!text) return;
-  const msgId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random();
-  const r = await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/steer', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ text, record_history: true, msg_id: msgId })
-  });
-  if (r) {
-    const d = await r.json().catch(() => ({}));
-    const newEntry = { id: d.id || ('steer-' + Date.now()), text, queued_at: Date.now() / 1000, guard: '' };
-    const sess = sessions.find(s => s.name === name);
-    if (sess) {
-      if (!sess.steering) sess.steering = [];
-      sess.steering.push(newEntry);
+async function steerSession(name, text, identity = {}) {
+  if (!text) return false;
+  identity.msg_id = crypto.randomUUID();
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/steer', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text, record_history:true, msg_id:identity.msg_id})
+    });
+    if (!_isLocallyQueued(r)) {
+      if (!r.ok) return false;
+      _validateMessageAcknowledgement(await r.clone().json(), '/steer');
     }
     if (peekSession === name && _peekTab === 'steering') _steeringRender();
-    _steeringUpdateBadge();
-    render();
-  }
+    _steeringUpdateBadge(); render();
+    return true;
+  } catch (e) { _outboxDiagnostic('steering_accept_failed', {session:name}); return false; }
 }
 function peekDownloadLog() {
   if (!peekSession) return;
@@ -12035,7 +15793,7 @@ function _atGenPick(i) {
   if (!at) return;
   const name = cur.dd._atItems[i].name;
   const after = inp.value.slice(inp.selectionStart);
-  inp.value = inp.value.slice(0, at.idx) + '@' + name + ' ' + after;
+  inp.value = inp.value.slice(0, at.idx) + '@' + name + ' ' + after; _draftInputChanged(inp);
   const pos = at.idx + name.length + 2;
   inp.setSelectionRange(pos, pos);
   cur.dd.classList.remove('open');
@@ -12139,7 +15897,7 @@ function _atInsert(inp, el) {
   if (!at || !items || !items[sel]) return;
   const name = items[sel].name;
   const val = inp.value;
-  inp.value = val.slice(0, at.idx) + '@' + name + ' ' + val.slice(inp.selectionStart);
+  inp.value = val.slice(0, at.idx) + '@' + name + ' ' + val.slice(inp.selectionStart); _draftInputChanged(inp);
   const newPos = at.idx + name.length + 2;
   inp.selectionStart = inp.selectionEnd = newPos;
   el._atItems = null; el._atSel = -1;
@@ -12496,13 +16254,13 @@ function _chipAction(chip, sessionName, isPeek) {
   } else if (chip.action === 'slash') {
     if (isPeek) {
       const inp = document.getElementById('peek-cmd-input');
-      if (inp) { inp.value = chip.value; inp.focus({ preventScroll: true }); autoGrow(inp); slashAcUpdate(); }
+      if (inp) { inp.value = chip.value; _draftInputChanged(inp); inp.focus({ preventScroll: true }); autoGrow(inp); slashAcUpdate(); }
     } else {
       // Try card input first, then workspace pane input
       const cardInp = document.getElementById('input-' + sessionName);
       const gpInp = document.getElementById(_gpSafeId(sessionName) + '-input');
       const inp = cardInp || gpInp;
-      if (inp) { inp.value = chip.value; inp.focus({ preventScroll: true }); autoGrow(inp); }
+      if (inp) { inp.value = chip.value; _draftInputChanged(inp); inp.focus({ preventScroll: true }); autoGrow(inp); }
       if (cardInp) cardSlashAcUpdate(sessionName);
     }
   } else if (chip.action === 'special') {
@@ -12640,7 +16398,7 @@ function openChipPicker() {
   const existingIds = new Set(existing.map(c => c.id));
   let html = '<div class="chip-picker-overlay" onclick="if(event.target===this)closeChipPicker()">'
     + '<div class="chip-picker">'
-    + '<div class="chip-picker-header"><input id="chip-picker-search" placeholder="Search commands..." oninput="filterChipPicker()"></div>'
+    + '<div class="chip-picker-header"><input id="chip-picker-search" placeholder="Search commands..." oninput="filterChipPicker()"><button class="btn" onclick="closeChipPicker()" aria-label="Close command picker">&#x2715;</button></div>'
     + '<div class="chip-picker-body" id="chip-picker-body">'
     + '<div class="chip-picker-section">Custom</div>'
     + '<div class="chip-picker-item" data-search="create custom new" onclick="openCustomChipForm()" style="color:var(--accent);font-weight:600;">'
@@ -13516,7 +17274,7 @@ function slashAcPick(i) {
     // inserting text. peekSession is the "me" side of the channel.
     if (peekSession && target !== peekSession && inp.value.trimStart().startsWith('@')) {
       const after = inp.value.replace(/^\s*@[\w][\w.-]*\s*/, '').trim();
-      inp.value = '';
+      inp.value = ''; _draftInputChanged(inp);
       inp.style.height = 'auto';
       el.classList.remove('open'); el._atItems = null; el._atSel = -1;
       channelOpen(peekSession, target, after);
@@ -13527,7 +17285,7 @@ function slashAcPick(i) {
     inp.focus({ preventScroll: true });
     return;
   } else {
-    inp.value = slashAcItems[i].cmd;
+    inp.value = slashAcItems[i].cmd; _draftInputChanged(inp);
     el.classList.remove('open');
     slashAcItems = [];
   }
@@ -13560,10 +17318,16 @@ function _btnDbg(obj) {
       body: JSON.stringify(Object.assign({ ver: APP_VER }, obj)) }).catch(() => {});
   } catch (e) {}
 }
+function _btnGestureStart(e) {
+  const button = e.target?.closest?.('button');
+  if (button) button._fireTs = 0;
+}
+// A distinct press is not an echo of the previous press, even within 350 ms.
+document.addEventListener('pointerdown', _btnGestureStart, true);
 function _btnFire(e, fn) {
   const t = e.currentTarget;
   const now = performance.now();
-  if (t._fireTs && now - t._fireTs < 350) { _tapTraceEv('DEDUP'); return; }   // click echo of the same tap
+  if (!(e.type === 'click' && e.detail === 0) && t._fireTs && now - t._fireTs < 350) { _tapTraceEv('DEDUP'); return; }   // click echo of the same tap
   t._fireTs = now;
   _tapTraceEv('FIRE');
   // Mobile diagnostic: no dead-tap beacon means events DO reach the button, so
@@ -13593,6 +17357,7 @@ function _btnFire(e, fn) {
 // click duplicates when they do arrive.
 let _btnTouchX = 0, _btnTouchY = 0;
 function _btnTouchStart(e) {
+  _btnGestureStart(e);
   const t = e.touches && e.touches[0];
   if (t) { _btnTouchX = t.clientX; _btnTouchY = t.clientY; }
   _tapTraceEv('touchstart');
@@ -13665,18 +17430,24 @@ async function _loadCmdHistoryFromServer() {
     const r = await fetch(API + '/api/history?limit=500');
     if (!r.ok) return;
     const rows = await r.json();
-    if (!rows.length && _cmdHistory.length) {
+    if (!rows.length && _cmdHistory.length && !_readQueue().some(q => /\/(send|steer)$/.test(q.url.split('?')[0]))) {
+      // Pending messages are optimistic history, not past deliveries. Importing
+      // them ahead of replay manufactures sent-history before server acceptance.
       // First load with empty server but local data — migrate localStorage entries up
       const entries = _cmdHistory.map(e => typeof e === 'string' ? { text: e, type: 'direct', session: '', time: Date.now() } : e);
-      await fetch(API + '/api/history/import', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
+      const imported = await fetch(API + '/api/history/import', {
+        _skipOutbox:true, method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ entries })
       });
+      if (!imported.ok) return;
       _cmdHistoryServerLoaded = true;
       return;
     }
-    // Server is authoritative — merge and deduplicate
-    _cmdHistory = rows.reverse().map(r => ({ text: r.text, type: r.type, session: r.session, time: r.ts, id: r.id, origin: r.origin || '', card_id: r.card_id || '' }));
+    // A response may have been read before a new local send was accepted.
+    // Preserve unechoed local entries just like the scoped Messages views do.
+    const serverRows = rows.reverse().map(_msgNorm);
+    _cmdHistory = _mergeUnechoed(serverRows, '').slice(-500);
+    _peekReclassifyPrompts();
     localStorage.setItem('amux_cmd_history', JSON.stringify(_cmdHistory));
     _cmdHistoryServerLoaded = true;
   } catch(e) {}
@@ -13685,10 +17456,13 @@ _loadCmdHistoryFromServer();
 
 function cmdHistoryAdd(text, opts) {
   if (!text.trim()) return;
-  const entry = { text, type: (opts && opts.type) || 'direct', session: (opts && opts.session) || peekSession || '', time: Date.now() };
+  const entry = { text, type: (opts && opts.type) || 'direct', session: (opts && opts.session) || peekSession || '', time: Date.now(), msg_id:opts?.msg_id };
   const prev = _cmdHistory[_cmdHistory.length - 1];
-  if (prev && (typeof prev === 'string' ? prev : prev.text) === text) { _cmdHistoryIdx = -1; return; }
+  if (!entry.msg_id && prev && typeof prev !== 'string' && prev.text === text && prev.session === entry.session && prev.type === entry.type) { _cmdHistoryIdx = -1; return; }
   _cmdHistory.push(entry);
+  if (entry.msg_id && _pendingSendsFor(entry.session).some(p => p.msg_id === entry.msg_id)) {
+    _outboxDiagnostic('message_display_joined', {measured:true,n_considered:1,msg_id:entry.msg_id});
+  }
   if (_cmdHistory.length > 500) _cmdHistory = _cmdHistory.slice(-500);
   // localStorage is best-effort bookkeeping — it must NEVER kill the send.
   // On a full store (iOS PWA quota), setItem throws QuotaExceededError; the
@@ -13720,6 +17494,9 @@ function cmdHistoryAdd(text, opts) {
   // (the "sent from phone, missing on desktop" bug, 2026-07-16). The push above
   // is just this device's optimistic local copy; the server pull reconciles it.
   _cmdHistoryIdx = -1;
+  // The live frame can arrive before local queue persistence resolves. Repaint
+  // provenance even when the next frame has identical bytes.
+  try { if (entry.session === peekSession) _peekReclassifyPrompts(); } catch(e) {}
   // Keep the peek Messages tab + its count badge live as you send.
   try { _peekMessagesBadge(); if (_peekTab === 'messages') _peekMessagesRender(); } catch(e) {}
 }
@@ -13790,6 +17567,10 @@ function closeCmdHistoryModal() {
 // session messages). Kind chips are rendered from the same _MSG_KIND_ORDER the
 // peek tab uses, so the two surfaces cannot drift apart.
 let _cmdHistKind = 'human';   // all | human | session | schedule
+// AMUX-4695. `{field, value}` or null. SERVER-SIDE, like the kind filter
+// beside it: a client-side filter runs over one page and then reports
+// "1 message" when the population is 207 (AMUX-4666).
+let _cmdHistCtx = null;
 let _cmdHistRows = null;      // server window for the CURRENT kind+session, or null
 // Ask the server for the slice we are showing. Filtering the shared 500-row
 // global cache client-side meant "Human across every session" showed 48 rows
@@ -13821,6 +17602,7 @@ async function _cmdHistFetch(more) {
   const qsess = sess ? '&session=' + encodeURIComponent(sess) : '';
   let u = API + '/api/history?limit=' + _CMDHIST_PAGE + '&offset=' + _cmdHistOffset + qsess;
   if (_cmdHistKind !== 'all') u += '&kind=' + encodeURIComponent(_cmdHistKind);
+  if (_cmdHistCtx) u += '&' + _cmdHistCtx.field + '=' + encodeURIComponent(_cmdHistCtx.value);
   try {
     const [r, rc] = await Promise.all([
       fetch(u, { headers: _authHeaders() }),
@@ -13844,6 +17626,44 @@ async function _cmdHistFetch(more) {
 }
 function _cmdHistMore() { _cmdHistFetch(true); }
 function _cmdHistSetKind(k) { _cmdHistKind = k; _renderCmdHistoryList(); _cmdHistFetch(); }
+function _cmdHistSetCtx(field, value) {
+  // Tapping the active chip clears it, so the filter has an exit that does not
+  // need a separate "clear" control competing for width at 375px.
+  const same = _cmdHistCtx && _cmdHistCtx.field === field && _cmdHistCtx.value === value;
+  _cmdHistCtx = same ? null : { field, value };
+  _cmdHistOffset = 0;   // a new predicate is a new population; page 3 of it may not exist
+  _renderCmdHistoryList();
+  _cmdHistFetch();
+}
+
+/// Context filter chips, BUILT FROM THE SERVER'S FACETS.
+///
+/// Never from a fixed list: the bar can only ever offer a value that selects at
+/// least one message, so there is no dead control and nothing goes stale when a
+/// new device appears. When the server omits a facet entirely (nothing carries
+/// it) this renders '' and the bar collapses to nothing, which is the correct
+/// rendering for a fleet where no message has ever carried a place.
+function _cmdHistRenderCtxChips() {
+  const bar = document.getElementById('cmd-history-ctx-filter');
+  if (!bar) return;
+  const facets = _cmdHistCounts || {};
+  const groups = [['device', facets.devices], ['place', facets.places]];
+  const chips = [];
+  for (const [field, vals] of groups) {
+    if (!vals || typeof vals !== 'object') continue;
+    for (const [value, n] of Object.entries(vals)) {
+      const on = !!(_cmdHistCtx && _cmdHistCtx.field === field && _cmdHistCtx.value === value);
+      chips.push('<button class="msg-kind-chip" title="Only messages sent from ' + esc(value) + '"'
+        + ' onclick="_cmdHistSetCtx(\u0027' + escJs(field) + '\u0027,\u0027' + escJs(value) + '\u0027)" style="'
+        + 'border:1px solid ' + (on ? 'var(--accent)' : 'var(--border)') + ';'
+        + 'background:' + (on ? 'rgba(88,166,255,0.14)' : 'transparent') + ';'
+        + 'color:' + (on ? 'var(--accent)' : 'var(--dim)') + ';">' + esc(value) + ' ' + n + '</button>');
+    }
+  }
+  bar.innerHTML = chips.join('');
+  bar.style.paddingBottom = chips.length ? '10px' : '0';
+}
+
 function _cmdHistRenderChips(items) {
   const bar = document.getElementById('cmd-history-filter');
   if (!bar) return;
@@ -13884,6 +17704,7 @@ function _renderCmdHistoryList() {
   let filtered = items;
   if (sessFilter) filtered = filtered.filter(e => (typeof e === 'string' ? '' : (e.session || '')) === sessFilter);
   _cmdHistRenderChips(filtered);
+  _cmdHistRenderCtxChips();
   if (_cmdHistKind !== 'all') filtered = filtered.filter(e => _msgKind(e) === _cmdHistKind);
   if (q) filtered = filtered.filter(e => { const t = typeof e === 'string' ? e : e.text; return t.toLowerCase().includes(q); });
   if (!filtered.length) {
@@ -14124,7 +17945,18 @@ function _linkifyUrls(safeHtml) {
     });
   } catch (e) { return safeHtml; }
 }
-function _msgCardChip(cardId, message) {
+function _msgOpenCard(cardId) {
+  const id = String(cardId || '').trim();
+  if (!id) {
+    _bdAudit('message-card-nav', { verdict: 'refused-empty', measured: true, n_considered: 0 });
+    return;
+  }
+  _bdAudit('message-card-nav', { verdict: 'opened', card_id: id, measured: true, n_considered: 1 });
+  switchView('board');
+  setTimeout(() => openBoardDetail(id), 250);
+}
+
+function _msgCardChip(cardId, message, linkedCard) {
   if (!cardId) return '';
   const live = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
     ? boardItems.find(i => i.id === cardId) : null;
@@ -14132,9 +17964,8 @@ function _msgCardChip(cardId, message) {
   // Treat the history API's authoritative issues-table metadata as a real card,
   // rather than claiming an archived/older card is "gone" merely because this
   // browser has not loaded it into `boardItems` (MSG-38618 / TUBES-2372).
-  const recorded = message && typeof message === 'object'
-    && (message.card_title != null || message.card_status != null);
-  const c = live || (recorded ? {
+  const recorded = linkedCard || (message && typeof message === 'object'
+    && (message.card_title != null || message.card_status != null) ? {
     id: cardId,
     title: message.card_title || '',
     status: message.card_status || 'todo',
@@ -14142,6 +17973,7 @@ function _msgCardChip(cardId, message) {
     deleted: message.card_deleted != null,
     log: ''
   } : null);
+  const c = live || recorded;
   const stC = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
@@ -14151,12 +17983,29 @@ function _msgCardChip(cardId, message) {
     : st;
   const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
-  return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
+  return '<button type="button" class="msg-card-chip" onclick="event.stopPropagation();_msgOpenCard(\'' + escJs(cardId) + '\');" '
+    + 'aria-label="Open task ' + esc(cardId) + (displaySt ? ', ' + esc(displaySt) : '') + '" '
     + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
-    + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? stC(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
+    + 'style="border-color:' + (c ? stC(st) : 'var(--border)') + ';'
     + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
     + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : displaySt) : ' \u00B7 gone')
-    + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
+    + (lastCommit ? ' \u00B7 \u2318' : '') + '</button>';
+}
+
+function _msgCardChips(message) {
+  if (!message || typeof message === 'string') return '';
+  // The scalar is retained for old servers and historical rows. New servers
+  // return the complete durable epic lineage, because one source prompt can be
+  // decomposed into a parent plus several independently actionable children.
+  const linked = Array.isArray(message.linked_cards) ? message.linked_cards : [];
+  if (!linked.length) return _msgCardChip(message.card_id || '', message, null);
+  const seen = new Set();
+  return linked.map(card => {
+    const id = String((card && card.id) || '').trim();
+    if (!id || seen.has(id)) return '';
+    seen.add(id);
+    return _msgCardChip(id, message, card);
+  }).join('');
 }
 
 // Canonical message row. THREE surfaces fetch /api/history and each kept its own
@@ -14184,11 +18033,19 @@ function _msgCtxMessages() {
 function _msgNorm(x) {
   if (typeof x === 'string') return x;
   const t = (x.time !== undefined && x.time !== null) ? x.time : x.ts;
-  return { id: x.id, text: x.text, type: x.type, session: x.session,
+  return { id: x.id, msg_id:x.msg_id, text: x.text, type: x.type, session: x.session,
            time: t, ts: t, origin: x.origin || '', kind: x.kind,
-           queued: x.queued, card_id: x.card_id || '',
+           queued: x.queued, delivery: x.delivery, queued_at: x.queued_at,
+           delivered_at: x.delivered_at, queue_wait_ms: x.queue_wait_ms,
+           submit_verdict: x.submit_verdict, card_id: x.card_id || '',
            card_title: x.card_title, card_status: x.card_status,
-           card_archived: x.card_archived, card_deleted: x.card_deleted };
+           card_archived: x.card_archived, card_deleted: x.card_deleted,
+           // Carried only when the server sent it. The server REMOVES the key
+           // for a message with no metadata rather than sending null, so
+           // `client_meta` here is either an object or absent, never an empty
+           // shell a renderer could mistake for a value (AMUX-4694).
+           ...(x.client_meta && typeof x.client_meta === 'object' ? {client_meta: x.client_meta} : {}),
+           linked_cards: Array.isArray(x.linked_cards) ? x.linked_cards : [] };
 }
 // ONE row renderer for all three message surfaces. `ctx` carries only what
 // genuinely differs — which selection set the checkbox belongs to, which resend
@@ -14216,6 +18073,114 @@ function _msgToggleCollapse(btn, key, ev) {
   btn.innerHTML = nowCollapsed ? '&#9656;' : '&#9662;';
   btn.setAttribute('aria-expanded', String(!nowCollapsed));
   btn.title = nowCollapsed ? 'Expand message' : 'Collapse message';
+}
+
+// ── A message's context: the inline chip and the full block (AMUX-4694) ──
+//
+// ABSENCE IS NOT A VALUE, and that is the load-bearing rule here rather than a
+// nicety. 11,526 of the 11,591 stored messages predate the capture, and every
+// client that sends none adds more, so "no metadata" is the DEFAULT rendering,
+// not an edge case. A placeholder chip or an "unknown" would therefore be what
+// almost every row shows. Both functions below return '' for that case and the
+// row is byte-identical to what it renders today.
+
+/// ONE short fact for the inline chip: device OR place, never both.
+///
+/// A named place wins when there is one, because "Home" is both shorter and
+/// more informative than "iPhone". COORDINATES ARE NOT A PLACE NAME and stay
+/// out of here: "40.7128, -74.0060" does not fit beside the time at 375px, and
+/// it would render the same six digits on all 100 rows of a page. They go in
+/// the tap block, which has room to label them.
+///
+/// `place` is read but never currently sent: resolving a fix to a named place
+/// needs a saved-places store and a proximity test, and neither primitive
+/// exists in this codebase today (checked: no places table, no radius logic).
+/// Reading it here means the chip needs no change on the day one lands.
+function _msgContextShort(m) {
+  if (m && typeof m.place === 'string' && m.place.trim()) return m.place.trim();
+  if (m && typeof m.device === 'string' && m.device.trim()) return m.device.trim();
+  return '';
+}
+
+/// The inline chip, beside the time. '' when the message carries no metadata.
+function _msgContextChip(e) {
+  const m = (e && typeof e === 'object') ? e.client_meta : null;
+  if (!m || typeof m !== 'object') return '';
+  const label = _msgContextShort(m);
+  if (!label) return '';
+  // The row's own click inserts into the composer, so this MUST stop
+  // propagation or tapping the chip would both open the block and overwrite
+  // whatever the user was typing.
+  const enc = encodeURIComponent(JSON.stringify({m, ts: (e.time !== undefined ? e.time : e.ts) || null}));
+  return `<span class="msg-ctx-chip" role="button" tabindex="0"`
+    + ` title="Where this was sent from. Click for the full context"`
+    + ` onclick="event.stopPropagation();_msgContextOpen('${enc}')">${esc(label)}</span>`;
+}
+
+/// One labelled row of the block, or '' when the value is missing.
+/// Never prints a label with nothing beside it.
+function _msgCtxRow(label, value) {
+  if (value === undefined || value === null || String(value).trim() === '') return '';
+  return `<div class="msg-ctx-row"><span class="msg-ctx-k">${esc(label)}</span>`
+    + `<span class="msg-ctx-v">${esc(String(value))}</span></div>`;
+}
+
+/// The full block, on tap.
+function _msgContextOpen(enc) {
+  let payload;
+  try { payload = JSON.parse(decodeURIComponent(enc)); } catch (_) { return; }
+  const m = (payload && payload.m) || {};
+  const serverTs = payload && payload.ts;
+  const server = serverTs ? new Date(serverTs).toLocaleString() : '';
+
+  // SENDER'S LOCAL TIME BESIDE THE SERVER TIME, which is the whole point of
+  // carrying a timezone: the two differ exactly when the sender was somewhere
+  // else, and that is the fact worth seeing. Shown as one row so they cannot
+  // be read apart.
+  const tzOff = (typeof m.tz_offset_min === 'number')
+    ? (m.tz_offset_min >= 0 ? `UTC+${(m.tz_offset_min/60).toFixed(2).replace(/\.00$/,'')}`
+                            : `UTC${(m.tz_offset_min/60).toFixed(2).replace(/\.00$/,'')}`)
+    : '';
+  const tz = [m.tz, tzOff].filter(Boolean).join(' · ');
+
+  // COORDINATES, NOT A PLACE, and labelled as coordinates so nobody reads
+  // them as one. A named place needs a saved-places store and a proximity
+  // test; neither exists yet, so the honest rendering is the raw fix plus its
+  // accuracy, which at least says how much to trust it.
+  let loc = '';
+  if (m.place && String(m.place).trim()) {
+    loc = _msgCtxRow('Place', m.place);
+  } else if (m.geo && typeof m.geo === 'object'
+             && typeof m.geo.lat === 'number' && typeof m.geo.lon === 'number') {
+    const acc = (typeof m.geo.accuracy_m === 'number') ? ` (±${Math.round(m.geo.accuracy_m)}m)` : '';
+    loc = _msgCtxRow('Coordinates', `${m.geo.lat.toFixed(5)}, ${m.geo.lon.toFixed(5)}${acc}`);
+  }
+
+  const body = _msgCtxRow('Device', m.device)
+    + _msgCtxRow('Platform', m.platform)
+    + _msgCtxRow('App version', m.app_ver)
+    + _msgCtxRow('Timezone', tz)
+    + (m.local_time || server
+        ? `<div class="msg-ctx-row"><span class="msg-ctx-k">Time</span><span class="msg-ctx-v">`
+          + (m.local_time ? `${esc(String(m.local_time))} <span class="msg-ctx-dim">sender</span>` : '')
+          + (m.local_time && server ? '<br>' : '')
+          + (server ? `${esc(server)} <span class="msg-ctx-dim">server</span>` : '')
+          + `</span></div>`
+        : '')
+    + loc;
+  if (!body) return;   // nothing to say, so say nothing
+
+  document.querySelectorAll('.msg-ctx-overlay').forEach(n => n.remove());
+  const o = document.createElement('div');
+  // `amux-dialog-backdrop` so this inherits the shared viewport treatment,
+  // including the safe-area top clamp, rather than growing a private copy.
+  o.className = 'amux-dialog-backdrop msg-ctx-overlay';
+  o.onclick = (ev) => { if (ev.target === o) o.remove(); };
+  o.innerHTML = `<div class="msg-ctx-box" onclick="event.stopPropagation()">`
+    + `<div class="msg-ctx-title">Message context</div>${body}`
+    + `<button class="btn msg-ctx-close" onclick="this.closest('.msg-ctx-overlay').remove()">Close</button>`
+    + `</div>`;
+  document.body.appendChild(o);
 }
 
 function _cmdHistItemHTML(e, ctx) {
@@ -14256,8 +18221,9 @@ function _cmdHistItemHTML(e, ctx) {
   const idTag = _mid
     ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
     : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag
-    + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''), e);
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag
+    + _msgContextChip(e) + idTag
+    + _msgCardChips(e);
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   // A MATCHING message is force-expanded while a search is active, even if the
@@ -14286,34 +18252,57 @@ function _pendingSendsFor(session) {
   (offlineQueue || []).forEach((op, idx) => {
     const m = (op.url || '').match(/\/api\/sessions\/([^/]+)\/(send|steer)$/);
     if (!m || decodeURIComponent(m[1]) !== session) return;
-    let text = '';
-    try { text = (JSON.parse(op.options?.body || '{}').text) || ''; } catch(e) {}
-    if (text) out.push({ text, ts: op.timestamp, kind: m[2], idx });
+    let text = '', msg_id = '';
+    try { const body = JSON.parse(op.options?.body || '{}'); text = body.text || ''; msg_id = body.msg_id || ''; } catch(e) {}
+    if (text) out.push({ text, msg_id, ts: op.timestamp, kind: m[2], idx, attempted: !!(op.attempted_at || op.attempts || !op.not_attempted), id:op.id });
   });
   return out;
 }
-function _pendingCancel(idx) {
-  if (idx < 0 || idx >= offlineQueue.length) return;
-  offlineQueue.splice(idx, 1);
-  saveQueue();
+function _pendingMessageProjection(history, pending) {
+  const grouped = pending.map(p => ({...p, local_notes:[]}));
+  const normalized = text => String(text || '').replace(/^\[\d{1,2}:\d{2} [AP]M\]\s*/, '').trim();
+  const candidates = e => grouped.filter(p => e.msg_id ? p.msg_id === e.msg_id :
+    !e.id && Math.abs(Number(e.time || e.ts) - Number(p.ts)) < 5000 && normalized(e.text) === normalized(p.text));
+  const items = history.filter(e => {
+    if (!e || typeof e === 'string' || (e.session || '') !== peekSession) return true;
+    const matches = candidates(e);
+    if (matches.length !== 1) return true;
+    // Multiple intentional repeats must remain distinct, including legacy ones.
+    if (!e.msg_id && history.filter(other => !other?.id && !other?.msg_id && candidates(other).includes(matches[0])).length !== 1) return true;
+    matches[0].local_notes.push(e);
+    return false;
+  });
+  return {items, pending:grouped};
+}
+async function _pendingCancel(id) {
+  if (typeof id !== 'string' || !id) return;
+  let removed = false;
+  await _mutateQueue(current => {
+    const at = current.findIndex(q => q.id === id);
+    if (at < 0 || !current[at].not_attempted || current[at].attempted_at || current[at].attempts || _outboxActive.has(id)) return;
+    current.splice(at, 1); removed = true;
+  });
   updateConnectionStatus();
   _peekMessagesRender();
-  showToast('Removed from queue');
+  showToast(removed ? 'Removed from queue' : 'Already attempted — check the worker before retrying or removing it');
 }
-// Amber "⏳ N queued" pill above the composer — visible whenever this session has
-// unsent messages, so pending work is obvious without opening the Messages tab.
+// Normal delivery is visible in Messages. Only offline or delayed messages
+// need a notice above the composer; do not flash a queued pill on every Send.
 function _updatePendingPill() {
   const pill = document.getElementById('peek-pending-pill');
   if (!pill) return;
-  const n = peekSession ? _pendingSendsFor(peekSession).length : 0;
+  const n = peekSession ? _pendingSendsFor(peekSession)
+    .filter(message => !online || _outboxNeedsAttention(offlineQueue[message.idx])).length : 0;
   pill.style.display = n ? '' : 'none';
-  if (n) pill.innerHTML = '&#x23F3; ' + n + ' queued ' + (online ? '(sending soon)' : '&middot; offline') + ' &mdash; tap to view';
+  if (n) pill.innerHTML = '&#x23F3; ' + n + ' message' + (n === 1 ? '' : 's')
+    + (online ? ' waiting' : ' saved offline') + ' &mdash; view details';
 }
 function _peekMessagesBadge() {
   const badge = document.getElementById('peek-tab-messages-count');
   if (!badge) return;
-  const n = _peekMessagesFor().length;
-  const p = peekSession ? _pendingSendsFor(peekSession).length : 0;
+  const projection = _pendingMessageProjection(_peekMessagesFor(), _pendingSendsFor(peekSession));
+  const n = projection.items.length;
+  const p = projection.pending.length;
   badge.textContent = p ? (n + '+' + p) : (n ? n : '');
   badge.classList.toggle('has-count', (n + p) > 0);
   badge.classList.toggle('has-pending', p > 0);
@@ -14325,13 +18314,33 @@ function _peekMessagesBadge() {
 // 753 schedule vs 2784 human across the fleet, but concentrated on a handful
 // of sessions where they bury everything you typed).
 let _peekMsgFilter = 'human';   // all | human | session | schedule
-function _peekMsgSetFilter(k) { _peekMsgFilter = k; _peekMessagesRender(); }
+function _peekMsgSetFilter(k) {
+  if (_peekMsgFilter === k) return;
+  _peekMsgFilter = k;
+  _peekMsgPage = 1;            // a page number against a different population means nothing
+  _peekMessagesLoad(false);    // the SERVER applies the kind now
+}
 function _peekMsgRenderChips(items) {
   const bar = document.getElementById('peek-messages-filter');
   if (!bar) return;
   // Count by kind so each chip shows how many of that type exist.
-  const counts = { all: items.length, human: 0, session: 0, schedule: 0, amux: 0 };
-  items.forEach(e => { counts[_msgKind(e)]++; });
+  // Seed from _MSG_KIND_ORDER so every chip reads 0 rather than undefined
+  // when no messages of that kind exist (unstamped/unknown were missing).
+  const counts = _MSG_KIND_ORDER.reduce((a, k) => (a[k] = 0, a), { all: 0 });
+  // Server totals when we have them: the list is ONE PAGE now, so counting the
+  // loaded rows would label each chip with its share of this page (AMUX-4666).
+  if (_peekMsgCounts && _peekMsgCountsFor === peekSession) {
+    Object.keys(counts).forEach(k => { counts[k] = +(_peekMsgCounts[k] || 0); });
+  } else {
+    items.forEach(e => { const k = _msgKind(e); if (k in counts) counts[k]++; counts.all++; });
+  }
+  // Same rule as the body: a chip reading "Human 0" while the fetch is still
+  // running is a measurement that has not run, rendered as a result. An
+  // ellipsis is the honest placeholder — it cannot be mistaken for a count.
+  const _countsUnknown = _peekMsgLoading
+    || _peekMsgRowsFor !== peekSession
+    || !Array.isArray(_peekMsgRows);   // unmeasured covers both loading and failed
+  const _n = k => (_countsUnknown && !counts[k] ? '\u2026' : String(counts[k]));
   // Every kind chip is ALWAYS shown, even at zero. Hiding empty ones made the
   // filter row change shape as you moved between sessions, and an absent chip
   // reads as "this kind does not exist" rather than "none here".
@@ -14341,15 +18350,16 @@ function _peekMsgRenderChips(items) {
     const on = _peekMsgFilter === k;
     const km = _MSG_KIND[k];
     const col = km ? km.color : 'var(--accent)';
-    return `<button class="msg-kind-chip" onclick="_peekMsgSetFilter('${k}')" style="border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl} ${counts[k]}</button>`;
+    return `<button class="msg-kind-chip" onclick="_peekMsgSetFilter('${k}')" style="border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl} ${_n(k)}</button>`;
   }).join('');
 }
 function _peekMessagesRender() {
   const list = document.getElementById('peek-messages-list');
   if (!list) return;
   const q = (document.getElementById('peek-messages-search')?.value || '').trim().toLowerCase();
-  let items = _peekMessagesFor();
-  _peekMsgRenderChips(items);   // chips reflect the full (pre-filter) set's counts
+  const projection = _pendingMessageProjection(_peekMessagesFor(), _pendingSendsFor(peekSession));
+  let items = projection.items;
+  _peekMsgRenderChips(items.concat(projection.pending.map(p => ({type:'user',text:p.text}))));   // chips reflect the full (pre-filter) set's counts
   if (_peekMsgFilter !== 'all') items = items.filter(e => _msgKind(e) === _peekMsgFilter);
   if (q) items = items.filter(e => (typeof e === 'string' ? e : e.text).toLowerCase().includes(q));
   // Pending (offline-queued, NOT yet on the server) shown FIRST — clearly marked,
@@ -14357,20 +18367,24 @@ function _peekMessagesRender() {
   // always YOURS, so they belong to the human filter and must disappear under
   // session/schedule — otherwise a "Scheduled" view shows a message you typed.
   const _showPending = (_peekMsgFilter === 'all' || _peekMsgFilter === 'human');
-  let pending = _showPending ? _pendingSendsFor(peekSession) : [];
+  let pending = _showPending ? projection.pending : [];
   if (q) pending = pending.filter(p => p.text.toLowerCase().includes(q));
   const pendingHTML = pending.map(p => {
     const ts = p.ts ? new Date(p.ts).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
     const safe = _hlSearch(p.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'), q);
     return `<div style="padding:8px 12px;background:rgba(210,153,34,0.07);border:1px solid rgba(210,153,34,0.45);border-radius:6px;font-size:0.85rem;color:var(--text);display:flex;gap:10px;align-items:flex-start;">
-      <div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">
-        <div style="margin-bottom:4px;"><span style="display:inline-block;font-size:0.7rem;padding:1px 6px;border-radius:3px;background:rgba(210,153,34,0.16);color:#d29922;margin-right:6px;">&#x23F3; pending${p.kind==='steer'?' &middot; queue':''}</span><span style="color:var(--dim);font-size:0.7rem;">${ts} &mdash; not yet delivered${online?', sending soon':', waiting for connection'}</span></div>
-        ${safe}</div>
-      <button onclick="event.stopPropagation();_pendingCancel(${p.idx})" title="Remove from the offline queue (will NOT be sent)" style="border:none;background:none;color:var(--dim);cursor:pointer;font-size:0.95rem;padding:2px 6px;min-width:24px;min-height:24px;">&#215;</button>
+      <div style="flex:1;min-width:0;word-break:break-word;line-height:1.45;">
+        <div style="margin-bottom:4px;"><span style="display:inline-block;font-size:0.7rem;padding:1px 6px;border-radius:3px;background:rgba(210,153,34,0.16);color:#d29922;margin-right:6px;">${p.attempted ? 'Awaiting confirmation' : 'Saved on this device'}</span><span style="color:var(--dim);font-size:0.7rem;">${ts} &mdash; ${p.attempted ? 'may already be with the worker' : online ? 'waiting to sync' : 'waiting for connection'}</span></div>
+        <div style="white-space:pre-wrap">${safe}</div>${p.local_notes.some(e => !e.msg_id) ? '<details style="margin-top:4px;color:var(--dim)"><summary>Matching local history note</summary>' + p.local_notes.map(e => esc(e.text)).join('<br>') + '</details>' : ''}</div>
+      <button ${p.attempted ? 'hidden disabled' : ''} onclick="event.stopPropagation();_pendingCancel('${escJs(p.id)}')" title="Remove this unattempted local message" style="border:none;background:none;color:var(--dim);cursor:pointer;font-size:0.95rem;padding:2px 6px;min-width:24px;min-height:24px;">&#215;</button>
     </div>`;
   }).join('');
   const cnt = document.getElementById('peek-messages-count');
-  if (cnt) cnt.textContent = (pending.length ? pending.length + ' pending · ' : '') + items.length + (items.length === 1 ? ' message' : ' messages');
+  if (cnt) {
+    const isFallback = !_peekMsgRows || _peekMsgRowsFor !== peekSession;
+    const loadingHint = _peekMsgLoading && isFallback ? ' (loading…)' : '';
+    cnt.textContent = (pending.length ? pending.length + ' pending · ' : '') + items.length + (items.length === 1 ? ' message' : ' messages') + loadingHint;
+  }
   // Date-group headers (Ethan 2026-08-13: "still has no timestamp thing"): the
   // per-worker Messages list never got the review-by-calendar pattern the global
   // Messages tab has. Same helpers, same sticky header, same data-day the picker
@@ -14411,16 +18425,33 @@ function _peekMessagesRender() {
       pbar.style.display = 'flex';
     } else { pbar.innerHTML = ''; pbar.style.display = 'none'; }
   }
-  // Load-older affordance at the BOTTOM (rows are newest-first, so older loads
-  // below). Shown whenever the server has more pages, even when the current
-  // kind/search filter leaves the visible set small — that is exactly when you
-  // need to page back to find more of it.
-  const moreHTML = _peekMsgDone ? '' :
-    '<button class="btn" id="peek-msgs-more-btn" style="align-self:center;margin:8px auto;font-size:0.78rem;min-height:36px;" onclick="_peekMessagesLoad(true)">Load older</button>';
+  // Pager at the BOTTOM (rows are newest-first, so older pages sit below).
+  // Always rendered, not only when older pages exist: the page number and the
+  // size control are how the reader navigates, not a hint that there is more.
+  const moreHTML = _peekMsgPagerHTML();
   const _body = pendingHTML + histHTML;
-  list.innerHTML = (_body
-    || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${_empty}</div>`)
-    + moreHTML;
+  // NOTHING LOADED YET IS NOT NOTHING THERE.
+  //
+  // The count line already says "(loading…)" from _peekMsgLoading, but the body
+  // asserted the empty state regardless — so this tab rendered "0 messages
+  // (loading…)" directly above "No human messages for this worker." on a worker
+  // with a full history (Ethan's screenshot, 2026-09-11). On this host
+  // /api/history takes 12-26s under read-pool contention (AMUX-4348), so that
+  // false statement is what you look at for most of the wait.
+  //
+  // Say which one is true: still measuring, or measured and empty.
+  // Three states, not two: measuring, measured-and-empty, and could-not-measure.
+  const _loaded = _peekMsgRowsFor === peekSession && Array.isArray(_peekMsgRows);
+  const _stillLoading = _peekMsgLoading || (!_loaded && !_peekMsgError);
+  const _note = t => `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${t}</div>`;
+  const _placeholder = _stillLoading ? _note('Loading messages…')
+    : (!_loaded && _peekMsgError)
+      ? _note('Could not load messages — ' + esc(_peekMsgError) +
+              '<br><button class="btn" style="margin-top:10px;min-height:36px;" ' +
+              'onclick="_peekMessagesLoad(false)">Retry</button>')
+      : _note(_empty);
+  list.innerHTML = (_body || _placeholder)
+    + (!_body && !_loaded ? '' : moreHTML);
   _peekMessagesBadge();
 }
 // Jump the per-worker Messages list to a chosen day. Unlike the global timeline
@@ -14428,6 +18459,56 @@ function _peekMessagesRender() {
 // pure scroll: land on the day's header, or the nearest one on/before it, and
 // flash it. If the day predates the loaded window there is nothing to page in, so
 // say so rather than silently scrolling to the oldest row.
+/// Pages for this worker under the active filter, or null when the server did
+/// not report a total (an old build): then only next/previous are offered,
+/// rather than a last page nobody measured.
+function _peekMsgPageCount() {
+  if (_peekMsgTotal === null) return null;
+  return Math.max(1, Math.ceil(_peekMsgTotal / (_msgsPageSize || _PEEK_MSG_PAGE)));
+}
+function _peekMsgPagerHTML() {
+  const pages = _peekMsgPageCount();
+  const atFirst = _peekMsgPage <= 1;
+  const atLast = pages === null ? _peekMsgDone : _peekMsgPage >= pages;
+  const btn = (label, page, disabled, title) =>
+    '<button class="btn" style="font-size:0.75rem;padding:3px 9px;min-height:44px;"'
+    + (disabled ? ' disabled' : ' onclick="_peekMsgGoToPage(' + page + ')"')
+    + ' title="' + title + '">' + label + '</button>';
+  const sizes = _MSGS_PAGE_SIZES.map(n =>
+    '<option value="' + n + '"' + (n === (_msgsPageSize || _PEEK_MSG_PAGE) ? ' selected' : '') + '>' + n + '/page</option>').join('');
+  return '<div style="display:flex;gap:5px;justify-content:center;align-items:center;flex-wrap:wrap;margin:10px auto 4px;">'
+    + btn('&laquo;', 1, atFirst, 'First page')
+    + btn('&lsaquo;', _peekMsgPage - 1, atFirst, 'Previous page')
+    + '<span style="font-size:0.72rem;color:var(--dim);display:inline-flex;align-items:center;gap:5px;">page'
+    + '<input class="input" type="number" min="1"' + (pages ? ' max="' + pages + '"' : '')
+    + ' value="' + _peekMsgPage + '" onchange="_peekMsgGoToPage(+this.value)"'
+    + ' onkeydown="if(event.key===\'Enter\')_peekMsgGoToPage(+this.value)"'
+    + ' style="width:60px;text-align:center;" aria-label="Page number">'
+    + (pages ? 'of ' + pages.toLocaleString() : '') + '</span>'
+    + btn('&rsaquo;', _peekMsgPage + 1, atLast, 'Next page')
+    + (pages ? btn('&raquo;', pages, atLast, 'Last page') : '')
+    + '<select class="input" style="max-width:110px;font-size:0.72rem;" aria-label="Messages per page"'
+    + ' onchange="_peekMsgSetPageSize(+this.value)">' + sizes + '</select>'
+    + '</div>';
+}
+function _peekMsgGoToPage(page) {
+  const pages = _peekMsgPageCount();
+  let next = Math.max(1, Math.floor(page) || 1);
+  if (pages !== null) next = Math.min(next, pages);
+  if (next === _peekMsgPage) { _peekMessagesRender(); return; }
+  _peekMsgPage = next;
+  _peekMessagesLoad();                          // refresh THIS (new) page
+  const list = document.getElementById('peek-messages-list');
+  if (list) list.scrollTop = 0;
+}
+function _peekMsgSetPageSize(size) {
+  if (!_MSGS_PAGE_SIZES.includes(size)) return;
+  const anchor = (_peekMsgPage - 1) * (_msgsPageSize || _PEEK_MSG_PAGE);
+  _msgsPageSize = size;                         // one size for both message lists
+  try { localStorage.setItem('amux.msgs.pageSize', String(size)); } catch (e) {}
+  _peekMsgPage = Math.floor(anchor / size) + 1;
+  _peekMessagesLoad();
+}
 async function _peekMsgsJumpToDate(dateStr) {
   if (!dateStr) return;
   const target = new Date(dateStr + 'T00:00:00').getTime();  // local start-of-day, ms
@@ -14435,12 +18516,13 @@ async function _peekMsgsJumpToDate(dateStr) {
   // pages until the target day is in range (or the store is exhausted), then
   // scroll to it — the same behaviour the global timeline's date-jump has.
   let guard = 0;
+  if (_peekMsgPage !== 1) { _peekMsgPage = 1; await _peekMessagesLoad(); }
   while (!_peekMsgDone && guard < 80) {
     const items = _peekMessagesFor();          // newest-first
-    const last = items[items.length - 1];      // oldest loaded row
+    const last = items[items.length - 1];      // oldest row on this page
     const oldest = last ? (last.time || last.ts || Infinity) : Infinity;
-    if (oldest <= target + 86400000) break;    // loaded into (or past) that day
-    await _peekMessagesLoad(true);
+    if (oldest <= target + 86400000) break;    // this page reaches that day
+    await _peekMessagesLoad(true);             // next page
     guard++;
   }
   const list = document.getElementById('peek-messages-list');
@@ -14463,13 +18545,21 @@ async function _peekMsgsJumpToDate(dateStr) {
 // Fetch a SESSION-SCOPED window instead, so each session gets its own 500.
 let _peekMsgRows = null;      // MERGED display rows (server + pending), oldest-first, or null
 let _peekMsgRowsFor = '';     // which session _peekMsgRows belongs to
+let _peekMsgError = '';       // last load failure, '' when the last load succeeded
 // Pagination for the per-worker Messages tab (AMUX: paginate worker like global).
 // The view used to load ONE 500-row session window with no way to reach older
 // messages; it now pages by offset like the global timeline (_messagesLoad).
 let _peekMsgServerRows = [];  // raw server rows accumulated across pages, current session
 let _peekMsgOffset = 0;       // server offset = count of raw server rows fetched so far
 let _peekMsgDone = false;     // no older server page remains
-const _PEEK_MSG_PAGE = 200;   // page size, matching the global _MSGS_PAGE
+// AMUX-4666: pages here too. The size is the same preference the global tab
+// stores, so choosing 100 per page once means 100 in both.
+let _peekMsgPage = 1;         // 1-based
+let _peekMsgTotal = null;     // x-amux-total for this worker; null = not reported
+let _peekMsgCounts = null;    // per-kind totals for the whole worker (?counts=1)
+let _peekMsgCountsFor = '';   // which session those counts belong to
+let _peekMsgLoading = false;  // true while the session-scoped fetch is in flight
+const _PEEK_MSG_PAGE = 60;    // fallback page size only; the reader's choice lives in _msgsPageSize (AMUX-4666). 200 rows was 40-120s under fleet load (AMUX-4476)
 
 // Local entries that the server has not echoed yet (no id) must survive the
 // swap to server-scoped rows, or a message you just sent vanishes until the
@@ -14478,7 +18568,8 @@ function _mergeUnechoed(serverRows, session) {
   const seen = new Set(serverRows.map(r => (r.text || '') + '|' + (r.session || '')));
   const local = _cmdHistory.filter(e => typeof e !== 'string' && !e.id
     && (!session || (e.session || '') === session)
-    && !seen.has((e.text || '') + '|' + (e.session || '')));
+    && ((e.msg_id && offlineQueue.some(q => _outboxMessageId(q) === e.msg_id))
+      || !seen.has((e.text || '') + '|' + (e.session || ''))));
   return serverRows.concat(local).sort((a, b) => (a.time || a.ts || 0) - (b.time || b.ts || 0));
 }
 
@@ -14487,13 +18578,17 @@ function _mergeUnechoed(serverRows, session) {
 // group or global caller exists — the sequencing amux-cloud called the most
 // valuable paragraph on the original card, and the same order that made the
 // Configurations tab's second caller a one-liner instead of a second renderer.
-async function _peekMsgFetch(scope, offset) {
+async function _peekMsgFetch(scope, offset, pageSize) {
   const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
-  const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
+  const page = pageSize || _msgsPageSize || _PEEK_MSG_PAGE;
+  const q = (sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
           : sc.level === 'global' ? ''
-          : '&session=' + encodeURIComponent(sc.name);
-  const r = await fetch(API + '/api/history?limit=' + _PEEK_MSG_PAGE + '&offset=' + (offset || 0) + q, { headers: _authHeaders() });
+          : '&session=' + encodeURIComponent(sc.name))
+          + (_peekMsgFilter && _peekMsgFilter !== 'all' ? '&kind=' + encodeURIComponent(_peekMsgFilter) : '');
+  const r = await fetch(API + '/api/history?limit=' + page + '&offset=' + (offset || 0) + q, { headers: _authHeaders() });
   if (!r.ok) throw new Error('history ' + r.status);
+  const _t = r.headers && r.headers.get('x-amux-total');
+  _peekMsgTotal = _t === null || _t === undefined || _t === '' ? null : +_t;
   // Raw server page (newest-first). The pending-unechoed merge and the time sort
   // happen ONCE in _peekMessagesLoad, on the full accumulated set — merging
   // per-page would prepend the same locally-queued sends to every page.
@@ -14502,24 +18597,61 @@ async function _peekMsgFetch(scope, offset) {
 
 async function _peekMessagesLoad(more) {
   const sess = peekSession;
-  if (_peekMsgRowsFor !== sess) {              // session changed -> full reset, treat as first page
+  if (_peekMsgRowsFor !== sess) {              // session changed -> back to page 1
     _peekMsgRows = null; _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false;
-    _peekMsgRowsFor = sess; more = false;
+    _peekMsgRowsFor = sess; _peekMsgPage = 1; _peekMsgTotal = null; more = false;
   }
-  if (more && _peekMsgDone) return;            // nothing older to load
-  if (!more) { _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false; }
-  _peekMessagesRender();                        // paint what we have instantly
+  if (more === true) {                          // the older-page affordance
+    if (_peekMsgDone) return;
+    _peekMsgPage += 1;
+  } else if (more === false) {                  // an explicit reset (retry, worker switch)
+    _peekMsgPage = 1;
+  }                                             // undefined = refresh THIS page
+  _peekMsgOffset = (_peekMsgPage - 1) * (_msgsPageSize || _PEEK_MSG_PAGE);
+  _peekMsgLoading = true;
+  _peekMsgError = '';
+  _peekMessagesRender();                        // paint what we have instantly (with loading indicator)
   try {
     const rows = await _peekMsgFetch({ level: 'worker', name: sess }, _peekMsgOffset);
-    if (peekSession !== sess) return;           // user moved on mid-flight
-    _peekMsgServerRows = _peekMsgServerRows.concat(rows);
-    _peekMsgOffset += rows.length;
-    _peekMsgDone = rows.length < _PEEK_MSG_PAGE; // a short page is the last page
+    if (peekSession !== sess) { _peekMsgLoading = false; return; }
+    // AMUX-4661 (Ethan's screenshot, mixpeek-cicd: the filter chips read "2"
+    // beside a freshly-loaded list of 3). `_peekMsgCountsFor !== sess` only
+    // catches a SESSION SWITCH. The SSE `messages` invalidation handler
+    // (search this file for `key === 'messages'`) calls this exact function
+    // with `more` undefined to refresh page 1 of the CURRENT session when a
+    // new message lands fleet-wide — same session, so that gate alone never
+    // fires, and `_peekMsgCounts` (the source of every "All N / Human N /
+    // ..." chip) sits at whatever it was when the peek was first opened,
+    // silently behind the row list and tab badge that DID just refresh.
+    // Page 1 is cheap and infrequent enough (user-driven opens/retries, or
+    // this debounced SSE handler) that refetching counts every time this is
+    // page 1 costs nothing worth trading correctness for; a deeper page
+    // (`_peekMsgPage > 1`) skips it, matching that counts do not change what
+    // is already on screen there.
+    if (_peekMsgCountsFor !== sess || _peekMsgPage === 1) {
+      fetch(API + '/api/history?counts=1&session=' + encodeURIComponent(sess), { headers: _authHeaders() })
+        .then(x => x.json())
+        .then(c => { if (peekSession === sess) { _peekMsgCounts = c; _peekMsgCountsFor = sess; _peekMessagesRender(); } })
+        .catch(() => {});
+    }
+    _peekMsgServerRows = rows;                  // a page REPLACES, it does not accumulate
+    const size = _msgsPageSize || _PEEK_MSG_PAGE;
+    _peekMsgDone = _peekMsgTotal === null
+      ? rows.length < size
+      : _peekMsgPage >= Math.max(1, Math.ceil(_peekMsgTotal / size));
     _peekMsgRows = _mergeUnechoed(_peekMsgServerRows, sess); // pending merge + time sort, once, on the full set
   } catch(e) {
+    // A FAILED LOAD IS ITS OWN STATE. Without this the view can only say
+    // "loading" or "empty", and a fetch that died leaves it claiming one of
+    // them forever — the first cut of this fix replaced a false "no messages"
+    // with a false "Loading messages…" that never cleared.
+    _peekMsgError = String((e && e.message) || e || 'request failed');
     if (!more) { try { await _loadCmdHistoryFromServer(); } catch(e2) {} } // fall back to the shared cache on first load only
   }
+  _peekMsgLoading = false;
+  if (peekSession !== sess) return;
   _peekMessagesRender();
+  _peekReclassifyPrompts();
 }
 
 // ── Dictation tab ───────────────────────────────────────────────────────────
@@ -15098,7 +19230,7 @@ function _focusPeekComposer() {
 function _pickCmdHistory(text) {
   const inp = document.getElementById('peek-cmd-input');
   if (inp) {
-    inp.value = _msgStripPrefix(text);
+    inp.value = _msgStripPrefix(text); _draftInputChanged(inp);
     autoGrow(inp);
     _focusPeekComposer();
   }
@@ -15123,7 +19255,7 @@ function _msgOpenInsert(sess, encText) {
   openPeek(sess);
   setTimeout(() => {
     const inp = document.getElementById('peek-cmd-input');
-    if (inp) { inp.value = text; autoGrow(inp); _focusPeekComposer(); }
+    if (inp && peekSession === sess) { inp.value = text; _draftInputChanged(inp); autoGrow(inp); _focusPeekComposer(); }
   }, 500);
 }
 
@@ -15172,6 +19304,7 @@ function cmdHistoryUp(inp, session) {
   if (_cmdHistoryIdx === -1) { _cmdHistoryDraft = inp.value; _cmdHistoryIdx = list.length - 1; }
   else if (_cmdHistoryIdx > 0) { _cmdHistoryIdx--; }
   inp.value = list[_cmdHistoryIdx] || '';
+  _draftInputChanged(inp);
   autoGrow(inp);
   requestAnimationFrame(() => { inp.selectionStart = inp.selectionEnd = inp.value.length; });
 }
@@ -15182,6 +19315,7 @@ function cmdHistoryDown(inp, session) {
   const list = _cmdRecallEnsure(sess);
   if (_cmdHistoryIdx < list.length - 1) { _cmdHistoryIdx++; inp.value = list[_cmdHistoryIdx] || ''; }
   else { _cmdHistoryIdx = -1; inp.value = _cmdHistoryDraft; }
+  _draftInputChanged(inp);
   autoGrow(inp);
   requestAnimationFrame(() => { inp.selectionStart = inp.selectionEnd = inp.value.length; });
 }
@@ -15191,6 +19325,7 @@ function chipToInput(name, text) {
   const inp = document.getElementById('input-' + name);
   if (!inp) return;
   inp.value = text;
+  _draftInputChanged(inp);
   inp.focus({ preventScroll: true });
   autoGrow(inp);
   cardSlashAcUpdate(name);
@@ -15237,7 +19372,7 @@ function cardAtPick(i) {
   // Any text already typed after "@partial" is carried as the drafted message.
   if (inp.value.trimStart().startsWith('@') && target !== name) {
     const after = inp.value.replace(/^\s*@[\w][\w.-]*\s*/, '').trim();
-    inp.value = '';
+    inp.value = ''; _draftInputChanged(inp);
     inp.style.height = 'auto';
     el.classList.remove('open'); el._atItems = null; el._atSel = -1;
     channelOpen(name, target, after);
@@ -15257,7 +19392,7 @@ function cardSlashAcPick(name, i) {
     cardAtPick(i);
     return;
   }
-  inp.value = _cardAcItems[i].cmd;
+  inp.value = _cardAcItems[i].cmd; _draftInputChanged(inp);
   if (el) el.classList.remove('open');
   _cardAcItems = [];
   inp.focus({ preventScroll: true });
@@ -15374,13 +19509,13 @@ function closeFiltersModal() {
 const _PROVIDER_LABELS = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', iterm2: 'iTerm2', ollama: 'Ollama', grok: 'Grok' };
 const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable', gpt: 'GPT', gemini: 'Gemini', 'o-series': 'o-series' };
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
-const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
+const _STATUS_LABELS = { starting: 'Starting', error: 'Error', working: 'Working', blocked: 'Blocked', waiting: 'Waiting', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
-  const live = sessions.filter(s => !s.archived);
+  const live = sessions.filter(s => !s.archived && s.lifecycle !== 'paused');
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
-    const opts = ['working', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
+    const opts = ['working', 'blocked', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
       .filter(k => filterStatuses.has(k) || live.some(x => _sessStatusKey(x) === k));
     sEl.innerHTML = opts.length ? opts.map(k => {
       const on = filterStatuses.has(k);
@@ -16118,7 +20253,8 @@ function _renderFileBody(data, mode) {
     _bindReadPosDiv(body, data.path);
   } else if (data.is_markdown) {
     body.className = 'file-overlay-body markdown md-content';
-    body.innerHTML = renderMarkdown(data.content, data.path);
+    const fm = _parseFrontmatter(data.content);
+    body.innerHTML = _renderFrontmatterBlock(fm.meta) + renderMarkdown(fm.body, data.path);
     _bindMdFileLinks(body);
     _fileBindAnchors(body);
     _bindReadPosDiv(body, data.path);
@@ -16447,10 +20583,38 @@ async function openFilePreview(path) {
     const r = await fetch(url);
     const data = await r.json();
     if (data.error) {
-      document.getElementById('file-body').textContent = 'Error: ' + data.error;
+      // Say WHAT failed and WHERE, not a bare "Error: file not found" dead end
+      // (Ethan, 2026-09-12: a terminal file link opened to that and nothing
+      // else). A missing file is usually one a worker NAMED in its output but
+      // never created — make that legible and show the exact path tried, so it
+      // reads as "this path is not on disk" rather than "the viewer is broken".
+      const bodyEl = document.getElementById('file-body');
+      bodyEl.className = 'file-overlay-body';
+      const notFound = /not found|no such|does not exist|enoent/i.test(data.error);
+      bodyEl.innerHTML = notFound
+        ? '<div style="padding:16px;line-height:1.55;color:var(--dim);">'
+          + '<div style="color:var(--text);font-weight:600;margin-bottom:8px;">This file is not on disk</div>'
+          + '<div style="font-family:ui-monospace,monospace;font-size:0.8rem;word-break:break-all;'
+          + 'background:rgba(127,127,127,0.12);padding:8px 10px;border-radius:6px;margin-bottom:10px;">' + esc(path) + '</div>'
+          + 'It was referenced in the terminal but does not exist here — most often a file a worker '
+          + 'planned or named but has not created yet. Tap the folder path above to see what is around it.'
+          + '</div>'
+        : '<div style="padding:16px;color:var(--dim);word-break:break-all;">Error: ' + esc(data.error)
+          + '<div style="font-family:ui-monospace,monospace;font-size:0.8rem;margin-top:8px;">' + esc(path) + '</div></div>';
       return;
     }
     _fileData = data;
+    // Preview is the default for every file type, markdown included (Ethan,
+    // 2026-09-15, reversing the 2026-09-14 markdown-opens-to-Raw decision
+    // below this comment's old text). _fileViewMode is already 'preview'
+    // from the general default set synchronously above; nothing to override
+    // here now. Left the history rather than deleting it silently: the
+    // prior reasoning was "rendered Preview hides exact formatting/links/
+    // frontmatter, which is what you want first when opening a note to read
+    // or edit" — if that resurfaces as a complaint, Raw is one tap away via
+    // file-tab-raw either way.
+    document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
+    document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
     // Show tabs only for text files
     const isTextFile = !data.is_image && !data.is_pdf && !data.is_video && !data.is_audio && !data.is_binary && !data.is_ebook;
     if (isTextFile) {
@@ -16470,6 +20634,13 @@ async function openFilePreview(path) {
     dlBtn.dataset.filename = data.path.split('/').pop();
     dlBtn.style.display = '';
     _renderFileBody(data, _fileViewMode);
+    if (data.source === 'git') {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'padding:6px 12px;font-size:0.78rem;color:var(--dim);background:rgba(127,127,127,0.08);border-radius:6px;margin:8px 12px 0';
+      banner.textContent = 'Showing version from origin/main (file is not on the local working tree)';
+      const body = document.getElementById('file-body');
+      body.insertBefore(banner, body.firstChild);
+    }
     // Save EVERY opened previewable file for offline viewing (text, images, PDF,
     // ebooks, HTML, CSV) up to a per-file cap. setFile stamps ts=now, so ts is
     // the last-opened time — the 30-day pruner (_idb.pruneFiles, run at startup)
@@ -16496,6 +20667,10 @@ async function openFilePreview(path) {
       if (cachedIsText) {
         document.getElementById('file-view-tabs').style.display = '';
       }
+      // Same preview-by-default rule as the online path above — no markdown
+      // override here either.
+      document.getElementById('file-tab-preview').classList.toggle('active', _fileViewMode === 'preview');
+      document.getElementById('file-tab-raw').classList.toggle('active', _fileViewMode === 'raw');
       _renderFileBody(cached.data, _fileViewMode);
       return;
     }
@@ -16521,12 +20696,8 @@ function closeFilePreview() {
   _fileViewMode = 'preview';
 }
 
-async function _fileDownload() {
-  const dlBtn = document.getElementById('file-download-btn');
-  const url = dlBtn.dataset.url;
-  const filename = dlBtn.dataset.filename || 'download';
+async function _downloadFileBytes(url, filename) {
   try {
-    dlBtn.textContent = '⏳ …';
     const r = await fetch(url);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const blob = await r.blob();
@@ -16536,6 +20707,19 @@ async function _fileDownload() {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  } catch (e) {
+    fetch(API + '/api/client-debug', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: 'file-download', verdict: 'failed', measured: true,
+        n_considered: 1, ver: APP_VER})}).catch(() => {});
+    throw e;
+  }
+}
+
+async function _fileDownload() {
+  const dlBtn = document.getElementById('file-download-btn');
+  try {
+    dlBtn.textContent = '⏳ …';
+    await _downloadFileBytes(dlBtn.dataset.url, dlBtn.dataset.filename || 'download');
     dlBtn.textContent = '✓ Done';
     setTimeout(() => { dlBtn.textContent = '⬇ Download'; }, 2000);
   } catch(e) {
@@ -17057,6 +21241,27 @@ async function _autoCacheDirFiles(path, entries) {
     } catch(_) { break; }   // offline / error — stop quietly
   }
 }
+let _filesToolbarFault = '';
+function _filesToolbarCheck() {
+  requestAnimationFrame(() => {
+    const toolbar = document.querySelector('#files-view > .fe-toolbar');
+    const menu = document.getElementById('files-overflow-btn');
+    if (!toolbar?.getClientRects().length || !menu) return;
+    const bounds = toolbar.getBoundingClientRect(), more = menu.getBoundingClientRect();
+    const first = [...toolbar.querySelectorAll('button')].find(el => el.getClientRects().length);
+    const wrapped = first && Math.abs(first.getBoundingClientRect().top - more.top) > 4;
+    const overflow = more.right > bounds.right + 1 || toolbar.scrollWidth > toolbar.clientWidth + 1;
+    const fault = wrapped || overflow ? [innerWidth, wrapped, overflow].join(':') : '';
+    if (fault && fault !== _filesToolbarFault) {
+      fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({kind:'files-toolbar-layout',verdict:'wrapped-or-overflowing',
+          measured:true,n_considered:toolbar.querySelectorAll('button').length,
+          viewport:innerWidth,wrapped,overflow,ver:APP_VER})}).catch(() => {});
+    }
+    _filesToolbarFault = fault;
+  });
+}
+window.addEventListener('resize', _filesToolbarCheck);
 async function loadFiles(path) {
   const body = document.getElementById('files-body');
   body.innerHTML = '<div style="padding:16px;color:var(--dim)">Loading...</div>';
@@ -17077,6 +21282,7 @@ async function loadFiles(path) {
     crumbHtml += '<span class="fe-crumb-sep">›</span><span class="fe-crumb" onclick="loadFiles(\'' + cp.replace(/'/g, "\\'") + '\')">' + esc(part) + '</span>';
   }
   document.getElementById('files-breadcrumb').innerHTML = crumbHtml;
+  _filesToolbarCheck();
   try {
     const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(path) + (_filesShowHidden ? '&hidden=1' : ''));
     const data = await r.json();
@@ -17446,8 +21652,13 @@ let _mdaiLastRun = null;  // last successful RunResult (for the upstream-node ch
 function _mdaiAbs(p) {
   if (!p) return p;
   if (p.charAt(0) === '/') return p;
-  const h = (window._AMUX_HOME || '').replace(/\/+$/, '');
-  return (h || '') + '/' + p.replace(/^\/+/, '');
+  // List paths are relative to the .mdai SCAN ROOT (_AMUX_MDAI_ROOT), which is
+  // $HOME unless a `mdai_root` pref points into a sub-vault (e.g. ~/.amux/local).
+  // Joining onto $HOME there produced /Users/x/Foo.mdai for a file that actually
+  // lives at /Users/x/.amux/local/Foo.mdai, so every open hit "no such path"
+  // (AMUX-4477). Prefer the real scan root; fall back to $HOME when unset.
+  const root = ((window._AMUX_MDAI_ROOT || window._AMUX_HOME || '')).replace(/\/+$/, '');
+  return (root || '') + '/' + p.replace(/^\/+/, '');
 }
 // Root-relative path (under the files root, $HOME) for the upload endpoint, which
 // is how a .mdai file is WRITTEN: PUT /api/file refuses the .mdai extension (its
@@ -18204,7 +22415,7 @@ async function _connLoadFleet() {
   try {
     const arr = await (await fetch('/api/sessions')).json();
     const list = Array.isArray(arr) ? arr : [];
-    const workers = list.filter(s => !s.archived).map(s => s.name).filter(Boolean).sort();
+    const workers = list.filter(s => !s.archived && s.lifecycle !== 'paused').map(s => s.name).filter(Boolean).sort();
     const gs = new Set();
     list.forEach(s => (s.groups || []).forEach(g => g && gs.add(g)));
     _connFleet = { workers, groups: [...gs].sort() };
@@ -18845,7 +23056,7 @@ async function handleFilesUpload(files) {
   if (statusEl) statusEl.textContent = '';
   const inp = document.getElementById('files-upload-input');
   if (inp) inp.value = '';
-  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' queued \u2014 will upload when back online');
+  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' saved locally — uploading when reachable');
   if (uploaded) { showToast('Uploaded ' + uploaded + ' file' + (uploaded === 1 ? '' : 's')); loadFiles(_filesPath); }
   _upqRenderBadge();
 }
@@ -19007,7 +23218,7 @@ async function handleExploreUpload(files) {
   const { uploaded, queued } = await _uploadOrQueue(files, _explorePath, 'file');
   const inp = document.getElementById('explore-upload-input');
   if (inp) inp.value = '';
-  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' queued \u2014 will upload when back online');
+  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' saved locally — uploading when reachable');
   if (uploaded) { showToast('Uploaded ' + uploaded + ' file' + (uploaded !== 1 ? 's' : '')); loadExplore(_explorePath); }
   _upqRenderBadge();
 }
@@ -19138,14 +23349,13 @@ function _showFilesMenu(path, btn, type) {
     const dlItem = document.createElement('button');
     dlItem.className = 'explore-menu-item';
     dlItem.textContent = 'Download';
-    dlItem.onclick = () => {
+    dlItem.onclick = async () => {
       popup.remove();
-      const a = document.createElement('a');
-      a.href = API + '/api/file?path=' + encodeURIComponent(path);
-      a.download = path.split('/').pop();
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      try {
+        // The viewer endpoint returns JSON, and a direct anchor omits bearer
+        // auth. Use the same authenticated byte download as the preview toolbar.
+        await _downloadFileBytes(API + '/api/file/raw?path=' + encodeURIComponent(path), path.split('/').pop());
+      } catch (e) { showToast('Download failed: ' + e.message); }
     };
     popup.appendChild(dlItem);
   }
@@ -19544,45 +23754,35 @@ function _selectProvider(p) {
   if (_grokBtn) _grokBtn.classList.toggle('selected', p === 'grok');
   const _ollamaBtn = document.getElementById('create-provider-ollama');
   if (_ollamaBtn) _ollamaBtn.classList.toggle('selected', p === 'ollama');
+  const _museBtn = document.getElementById('create-provider-muse');
+  if (_museBtn) _museBtn.classList.toggle('selected', p === 'muse');
   // Hide branch/template/session-name options for non-Claude providers since they use different mechanics
   const isClaude = p === 'claude';
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = isClaude ? '' : 'none';
   document.getElementById('create-worktree-field').style.display = isClaude && _createDirIsGit ? '' : 'none';
   document.getElementById('create-template-field').style.display = isClaude ? '' : 'none';
-  // Ollama runs `codex --oss --local-provider ollama --model <model>` — the ONLY
-  // provider that needs a model chosen at create time (the others default), so
-  // surface the installed-model picker here rather than making the user create
-  // then edit. Missing this option was why an ollama worker could not be made
-  // from the create modal at all (AMUX-3182).
-  const _omField = document.getElementById('create-ollama-model-field');
-  if (_omField) {
-    _omField.style.display = p === 'ollama' ? '' : 'none';
-    if (p === 'ollama') _loadOllamaModelsForCreate();
+  // Every provider uses the same model surface. Blank delegates to that CLI's
+  // own default; custom keeps tomorrow's model usable before this catalog is
+  // refreshed.
+  _loadModelsForCreate(p);
+}
+function _createModelChanged() {
+  const sel = document.getElementById('create-model');
+  const custom = document.getElementById('create-model-custom');
+  if (custom) {
+    custom.style.display = sel && sel.value === '__custom__' ? '' : 'none';
+    if (sel && sel.value === '__custom__') custom.focus({ preventScroll: true });
   }
 }
-// Populate the create modal's local-model picker from the same endpoint the
-// edit-provider menu uses. Re-fetched on each select so a freshly `ollama pull`ed
-// model appears without a page reload; prefers a qwen build (the box default).
-function _loadOllamaModelsForCreate() {
-  const sel = document.getElementById('create-ollama-model');
+// Re-fetched for Ollama so a freshly pulled local model appears immediately;
+// hosted providers share the server's one typed fallback.
+function _loadModelsForCreate(provider) {
+  const sel = document.getElementById('create-model');
   if (!sel) return;
-  sel.innerHTML = '<option value="">Loading local models…</option>';
-  fetch(API + '/api/ollama/models', { headers: _authHeaders() })
-    .then(r => r.json())
-    .then(d => {
-      const mlist = d.models || [];
-      sel.innerHTML = '';
-      if (!mlist.length) {
-        const o = document.createElement('option');
-        o.value = ''; o.textContent = 'No local models — run: ollama pull qwen3.8:27b';
-        sel.appendChild(o);
-        return;
-      }
-      mlist.forEach(name => { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); });
-      const qwen = mlist.find(m => m.toLowerCase().includes('qwen'));
-      sel.value = qwen || mlist[0];
-    })
-    .catch(() => { sel.innerHTML = '<option value="">Could not reach Ollama</option>'; });
+  const custom = document.getElementById('create-model-custom');
+  if (custom) { custom.value = ''; custom.style.display = 'none'; }
+  _fillWorkerModelSelect(sel, provider, '', 'Default (provider decides)', true)
+    .then(_createModelChanged);
 }
 function openCreate() {
   _createProvider = 'claude';
@@ -19595,8 +23795,9 @@ function openCreate() {
   if (_iso0) { _iso0.checked = false; _toggleIsolated(false); }
   const _ollamaBtn0 = document.getElementById('create-provider-ollama');
   if (_ollamaBtn0) _ollamaBtn0.classList.remove('selected');
-  const _omField0 = document.getElementById('create-ollama-model-field');
-  if (_omField0) _omField0.style.display = 'none';
+  const _museBtn0 = document.getElementById('create-provider-muse');
+  if (_museBtn0) _museBtn0.classList.remove('selected');
+  _loadModelsForCreate('claude');
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = '';
   document.getElementById('create-template-field').style.display = '';
   document.getElementById('create-name').value = '';
@@ -19628,7 +23829,15 @@ function openCreate() {
   // Check git for default dir
   const defaultDir = document.getElementById('create-dir').value;
   if (defaultDir) _checkDirGit(defaultDir);
-  setTimeout(() => document.getElementById('create-name').focus({ preventScroll: true }), 100);
+  setTimeout(() => {
+    const overlay = document.getElementById('create-overlay');
+    if (!overlay.classList.contains('active')) return;
+    if (overlay.contains(document.activeElement)) {
+      amuxTrack('create_focus_preserved', {field:document.activeElement.id, measured:true, n_considered:1});
+      return;
+    }
+    document.getElementById('create-name').focus({ preventScroll: true });
+  }, 100);
 }
 function closeCreate() {
   document.getElementById('create-overlay').classList.remove('active');
@@ -19857,14 +24066,12 @@ async function submitCreate() {
   // open to fix — apiCall would pop a generic "Error: 409" with the form gone.
   const createBody = { name, dir, creator: _getDeviceName() };
   if (_createProvider !== 'claude') createBody.provider = _createProvider;
-  // Ollama needs its model chosen now — the server routes it to CC_MODEL and
-  // builds `--model` at launch. Without it the create path defaulted to the
-  // CLAUDE default model, mislabelling the worker (AMUX-3182).
-  if (_createProvider === 'ollama') {
-    const _om = document.getElementById('create-ollama-model');
-    const _m = _om && _om.value ? _om.value.trim() : '';
-    if (_m) createBody.model = _m;
-  }
+  const _modelSel = document.getElementById('create-model');
+  const _modelCustom = document.getElementById('create-model-custom');
+  const _model = _modelSel && _modelSel.value === '__custom__'
+    ? ((_modelCustom && _modelCustom.value) || '').trim()
+    : ((_modelSel && _modelSel.value) || '').trim();
+  if (_model) createBody.model = _model;
   if (worktreeEnabled) createBody.worktree = true;
   // ISOLATED (Ethan, 2026-08-27). Sent only when true: the server writes
   // CC_ISOLATED=1 and absence already means "not isolated" to every reader, so
@@ -20108,30 +24315,68 @@ document.addEventListener('click', e => {
 // ═══════ EVENT HANDLERS ═══════
 // Pause peek refresh while selecting text (keep paused until selection is cleared or copied)
 let peekSelectTimer = null;
-function peekCheckSelection() {
+function _peekHasSelection() {
+  const sel = window.getSelection(), body = document.getElementById('peek-body');
+  if (!body || !sel || !sel.toString()) return false;
+  for (let i = 0; i < sel.rangeCount; i++) {
+    if (sel.getRangeAt(i).intersectsNode(body)) return true;
+  }
+  return false;
+}
+function peekCheckSelection(event) {
   clearTimeout(peekSelectTimer);
-  const sel = window.getSelection();
-  if (sel && sel.toString().length > 0) {
+  if (_peekHasSelection()) {
+    _peekStopFollowing();
     peekSelecting = true;
     peekSelectTimer = setTimeout(peekCheckSelection, 500);
   } else {
+    if (peekSelecting && ['touchcancel', 'pointercancel', 'blur', 'resume'].includes(event?.type)) {
+      _peekPollBeacon('selection-recovered', peekSession, { reason: event.type,
+        verdict: 'no_terminal_selection', measured: true, n_considered: 1 });
+    }
     peekSelecting = false;
   }
 }
-document.getElementById('peek-body').addEventListener('mousedown', () => { peekSelecting = true; clearTimeout(peekSelectTimer); });
+document.getElementById('peek-body').addEventListener('mousedown', () => { _peekStopFollowing(); peekSelecting = true; clearTimeout(peekSelectTimer); });
 document.getElementById('peek-body').addEventListener('touchstart', () => { peekSelecting = true; clearTimeout(peekSelectTimer); }, {passive: true});
+const _peekScrollBody = document.getElementById('peek-body');
+// ONLY A GESTURE TOWARD EARLIER OUTPUT relinquishes following (AMUX-4601).
+// A resting trackpad sends zero-distance and sideways wheel events, and a
+// wheel or key moving down at the bottom asks for exactly what following
+// already shows. Treating those as "reading history" left the view parked
+// while new output grew under it, then locked it and flashed "New output"
+// (Ethan's recording, 2026-09-14, tubescience). bottom-follow-paused still
+// reports every real pause with its input and gap.
+_peekScrollBody.addEventListener('wheel', e => { if (e.deltaY < 0) _peekStopFollowing(e); }, {passive: true});
+_peekScrollBody.addEventListener('touchmove', _peekStopFollowing, {passive: true});
+_peekScrollBody.addEventListener('keydown', e => {
+  if (['ArrowUp','PageUp','Home'].includes(e.key)) _peekStopFollowing(e);
+});
+_peekScrollBody.addEventListener('pointerdown', e => {
+  const bounds = _peekScrollBody.getBoundingClientRect();
+  if (e.clientX >= bounds.right - 18) _peekStopFollowing();
+});
 document.getElementById('peek-body').addEventListener('scroll', function() {
-  if (_isScrolledToBottom(this)) {
+  const movedDown = this.scrollTop > _peekLastScrollTop + 0.5;
+  _peekLastScrollTop = this.scrollTop;
+  // A layout-generated scroll is not a request to read history. User gestures
+  // and explicit navigation relinquish following before their scroll occurs.
+  if (_peekFollowBottom) { _peekKeepBottom(); return; }
+  // Programmatic message/search jumps can land at the finite scroll boundary.
+  // That scroll event is still navigation, not a request to resume live output.
+  // The first few pixels of an upward gesture are still near the bottom.
+  // Re-arming there traps slow swipes in the follow/restore loop. Resume only
+  // when the reader moves down to the actual end (allow subpixel rounding).
+  if (movedDown && _isScrolledToBottom(this, 2) && !this.querySelector('.peek-msg-current, .peek-highlight.current')) {
     _peekScrollLocked = false;
+    _peekFollowBottom = true;
+    _peekBufferedOutput = false;
     _hideScrollLockBadge(this);
   } else {
     _peekScrollLocked = true;
-    _showScrollLockBadge(this, () => {
-      _peekScrollLocked = false;
-      applyPeekSearch(false, false);
-      this.scrollTop = this.scrollHeight;
-      _hideScrollLockBadge(this);
-    });
+    // Scrolling up is not itself news. The bottom affordance says "Jump to
+    // bottom" until a later frame is actually buffered, then changes to
+    // "New output". Keep those facts separate so the control never lies.
   }
 }, {passive: true});
 // Force URLs in peek output to open in the system browser (PWA desktop + mobile).
@@ -20151,6 +24396,13 @@ document.getElementById('peek-body').addEventListener('click', _peekOpenLink);
 document.getElementById('peek-body').addEventListener('touchend', _peekOpenLink, {passive: false});
 document.addEventListener('mouseup', () => { peekCheckSelection(); _peekShowSelPopover(); });
 document.addEventListener('touchend', () => { peekCheckSelection(); setTimeout(_peekShowSelPopover, 50); });
+// OS gestures, focus changes and cancelled touches need not emit mouseup or
+// touchend. Reconcile from the actual selection instead of retaining a latch
+// that suppresses every subsequent terminal request until the page reloads.
+document.addEventListener('touchcancel', peekCheckSelection);
+document.addEventListener('pointercancel', peekCheckSelection);
+document.addEventListener('selectionchange', peekCheckSelection);
+window.addEventListener('blur', peekCheckSelection);
 
 // ── Peek selection popover (Look up / Copy) ──
 function _peekShowSelPopover() {
@@ -20536,10 +24788,10 @@ document.addEventListener('keydown', (e) => {
 
 // ═══════ LAYOUT MODES (list / grid) ═══════
 let layoutMode = localStorage.getItem('amux_layout') || 'grid';
-let sortMode = localStorage.getItem('amux_sort_mode') || 'natural';
+let sortMode = localStorage.getItem('amux_sort_mode') || 'status';
 // A mode persisted by an older build (or hand-edited) must not leave the
 // list sorting by a comparator that no longer exists.
-if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'natural';
+if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'status';
 if (document.body) setTimeout(() => _sortBtnSync(), 0);
 else document.addEventListener('DOMContentLoaded', () => _sortBtnSync());
 let cardOrder = JSON.parse(localStorage.getItem('amux_card_order') || '[]');
@@ -20551,6 +24803,21 @@ let _tileJustDragged = false; // keep for toggle() guard
 // Sort that matches the server's list_sessions() order:
 // pinned > running > status priority (active/waiting=0, idle/none=1) > last_activity desc
 const _STATUS_PRI = {active: 0, waiting: 0, idle: 1, '': 1};
+// Status sorting and grouping share the same keys as the displayed filters.
+// Pins cannot move an idle worker into the working group (AMUX-4237).
+const _WORKER_STATUS_GROUPS = [
+  { key: 'working', label: 'Working', defaultOpen: true },
+  { key: 'waiting', label: 'Waiting', defaultOpen: true },
+  { key: 'blocked', label: 'Blocked', defaultOpen: true },
+  { key: 'error', label: 'Error', defaultOpen: true },
+  { key: 'starting', label: 'Starting', defaultOpen: true },
+  { key: 'api_error', label: 'API Error', defaultOpen: true },
+  { key: 'rate_limited', label: 'Rate Limited', defaultOpen: true },
+  { key: 'idle', label: 'Idle', defaultOpen: true },
+  { key: 'stopped', label: 'Stopped', defaultOpen: false },
+];
+const _WORKER_STATUS_PRI = Object.fromEntries(_WORKER_STATUS_GROUPS.map((g, i) => [g.key, i]));
+let _workerStatusOrderVerdict = '';
 function _naturalSortSessions(a, b) {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   if (a.running !== b.running) return a.running ? -1 : 1;
@@ -20581,11 +24848,41 @@ function _humanSortSessions(a, b) {
 
 // Status order, then recency within each bucket.
 function _statusSortSessions(a, b) {
-  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-  if (a.running !== b.running) return a.running ? -1 : 1;
-  const ap = _STATUS_PRI[a.status] ?? 1, bp = _STATUS_PRI[b.status] ?? 1;
+  // PINNED OUTRANKS STATUS (Ethan, 2026-09-09: "pinned workers should be
+  // pinned to the top"). This was the only one of the four sorts that ranked
+  // status FIRST and pinned second, so a pinned idle worker sat below every
+  // working one — and status is the default sort, so it is the ordering most
+  // people actually see. The menu item says "Pin to top"; ranking it below
+  // anything makes that label false.
+  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+  const ap = _WORKER_STATUS_PRI[_sessStatusKey(a)], bp = _WORKER_STATUS_PRI[_sessStatusKey(b)];
   if (ap !== bp) return ap - bp;
-  return (b.last_activity || 0) - (a.last_activity || 0);
+  return (b.last_activity || 0) - (a.last_activity || 0)
+    || (a.name || '').localeCompare(b.name || '');
+}
+
+function _checkWorkerStatusOrder() {
+  if (sortMode !== 'status' || _frozen) return;
+  // Read the rendered snapshot, not a newer SSE payload while a menu/input
+  // intentionally holds the previous cards on screen.
+  // Pinned cards are hoisted above the status ordering ON PURPOSE, so they are
+  // not evidence of a violation. Excluding them keeps this probe able to fail
+  // for the reason it exists: a genuine mis-ordering among the rest.
+  const cards = [...document.querySelectorAll('#cards .card[data-worker-status]')]
+    .filter(c => c.dataset.pinned !== '1');
+  if (!cards.length) return;
+  const keys = cards.map(c => c.dataset.workerStatus);
+  const at = keys.findIndex((key, i) => i > 0 && _WORKER_STATUS_PRI[key] < _WORKER_STATUS_PRI[keys[i - 1]]);
+  const verdict = at < 0 ? 'status-order-ok' : 'status-order-violation';
+  const signature = verdict + ':' + layoutMode + ':' + (at < 0 ? '' : keys[at - 1] + '>' + keys[at]);
+  if (_workerStatusOrderVerdict === signature) return;
+  _workerStatusOrderVerdict = signature;
+  const violation = at < 0 ? null : { before: cards[at - 1].dataset.session, after: cards[at].dataset.session };
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ kind: 'worker-status-order', verdict, measured: true, n_considered: cards.length,
+        layout: layoutMode, mode: sortMode, violation, ver: APP_VER }) }).catch(() => {});
+  } catch (e) {}
 }
 
 function _sortFnFor(mode) {
@@ -20613,24 +24910,16 @@ function toggleFreeze() {
     cardOrder = [];
     localStorage.removeItem('amux_card_order');
   } else {
-    // Compute order using the SAME logic as render() — works even for collapsed groups
-    const visible = sessions.filter(s => !s.archived);
-    let ordered;
-    if (layoutMode === 'group') {
-      const buckets = {active: [], waiting: [], idle: [], stopped: []};
-      visible.forEach(s => {
-        if (!s.running) buckets.stopped.push(s);
-        else if (s.status === 'active') buckets.active.push(s);
-        else if (s.status === 'waiting') buckets.waiting.push(s);
-        else buckets.idle.push(s);
-      });
-      const sortFn = _sortFnFor(sortMode);
-      for (const k of Object.keys(buckets)) buckets[k].sort(sortFn);
-      ordered = [...buckets.active, ...buckets.waiting, ...buckets.idle, ...buckets.stopped];
-    } else {
-      ordered = [...visible].sort(_sortFnFor(sortMode));
-    }
-    cardOrder = ordered.map(s => s.name);
+    // Freeze what the user actually sees. Rebuilding status buckets here put
+    // pinned workers back below active workers in group view on the same tap.
+    const rendered = [...document.querySelectorAll('#cards .card[data-session]')]
+      .map(card => card.dataset.session);
+    const remaining = sessions.filter(s => !s.archived && s.lifecycle !== 'paused' && !rendered.includes(s.name))
+      .sort(_sortFnFor(sortMode)).map(s => s.name);
+    cardOrder = [...new Set([...rendered, ...remaining])];
+    fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ kind: 'worker-freeze-order', verdict: 'captured-rendered-order',
+        measured: true, n_considered: rendered.length, layout: layoutMode, ver: APP_VER }) }).catch(() => {});
     localStorage.setItem('amux_card_order', JSON.stringify(cardOrder));
     _frozen = true;
     localStorage.setItem('amux_frozen', '1');
@@ -20664,7 +24953,7 @@ const _SORT_OPTS = [
   { id: 'natural', label: 'Recent activity',     hint: 'Any traffic, including schedules and other workers' },
   { id: 'human',   label: 'Last message from me', hint: 'Ignores schedulers and session-to-session' },
   { id: 'alpha',   label: 'Name (A–Z)',      hint: 'Stable — the order stops shifting under you' },
-  { id: 'status',  label: 'Status',               hint: 'Active, then waiting, then idle, then stopped' },
+  { id: 'status',  label: 'Status',               hint: 'Working, needs input, errors, rate limited, idle, stopped' },
 ];
 const _SORT_GLYPH = { natural: '⇅', human: '●', alpha: 'A↓', status: '☷' };
 
@@ -20700,7 +24989,7 @@ function closeSortMenu() {
   if (m) m.style.display = 'none';
 }
 function setSortMode(mode) {
-  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'natural';
+  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'status';
   localStorage.setItem('amux_sort_mode', sortMode);
   closeSortMenu();
   _sortBtnSync();
@@ -21046,6 +25335,7 @@ function _fmtRelTime(ts) {
 // ═══════ BOARD ═══════
 let activeView = 'sessions';
 let boardItems = [];
+let _boardSnapshotEpoch = 0;
 // The exact set the last renderBoard() painted, after every filter. Export uses
 // it so "export" always means "what I am looking at". See renderBoard().
 let _boardLastVisible = [];
@@ -21404,7 +25694,11 @@ let _boardDragId = null;
 let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
 if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
+// Smart Board: derived display-status data, fetched from /api/board/derived.
+let _smartBoardData = null;
+let _smartBoardFetching = false;
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
+let _boardWorkerDensityBeaconSent = false;
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
 // First visit collapses the archive columns. backlog + todo are 1082 of 1553
 // items — they are the reason the ~64 in-flight cards are invisible. Collapsed
@@ -21460,6 +25754,38 @@ const _CUSTOM_STATUS_PALETTE_LIGHT = [
   {bg:'rgba(5,80,174,0.1)',color:'#0550ae',border:'rgba(5,80,174,0.3)',dot:'#0550ae'},
   {bg:'rgba(180,30,120,0.1)',color:'#99286e',border:'rgba(180,30,120,0.3)',dot:'#99286e'},
 ];
+// Derived display-status styles (Smart Board view). These augment the
+// built-in statuses for the computed categories the /api/board/derived
+// endpoint produces.
+const _DERIVED_STATUS_STYLE = {
+  'aged-needsyou':      {bg:'rgba(248,81,73,0.18)',color:'var(--red)',border:'rgba(248,81,73,0.5)',dot:'var(--red)'},
+  'stalled':            {bg:'rgba(210,153,34,0.22)',color:'var(--yellow)',border:'rgba(210,153,34,0.55)',dot:'var(--yellow)'},
+  'stale':              {bg:'rgba(139,148,158,0.15)',color:'rgba(139,148,158,0.7)',border:'rgba(139,148,158,0.35)',dot:'rgba(139,148,158,0.5)'},
+  'verified-candidate': {bg:'rgba(45,212,191,0.12)',color:'#2dd4bf',border:'rgba(45,212,191,0.35)',dot:'#2dd4bf'},
+  'unblocked':          {bg:'rgba(88,166,255,0.18)',color:'var(--accent)',border:'rgba(88,166,255,0.45)',dot:'var(--accent)'},
+};
+const _DERIVED_STATUS_STYLE_LIGHT = {
+  'aged-needsyou':      {bg:'rgba(207,34,46,0.12)',color:'#cf222e',border:'rgba(207,34,46,0.4)',dot:'#cf222e'},
+  'stalled':            {bg:'rgba(154,103,0,0.15)',color:'#7d4e00',border:'rgba(154,103,0,0.4)',dot:'#7d4e00'},
+  'stale':              {bg:'rgba(101,109,118,0.12)',color:'#57606a',border:'rgba(101,109,118,0.3)',dot:'#57606a'},
+  'verified-candidate': {bg:'rgba(13,148,136,0.12)',color:'#0d9488',border:'rgba(13,148,136,0.35)',dot:'#0d9488'},
+  'unblocked':          {bg:'rgba(9,105,218,0.12)',color:'#0550ae',border:'rgba(9,105,218,0.35)',dot:'#0550ae'},
+};
+const _DERIVED_STATUS_LABELS = {
+  'aged-needsyou': 'Aged Needs-You (>14d)',
+  'stalled': 'Stalled (session idle)',
+  'stale': 'Stale (auto, no activity >72h)',
+  'verified-candidate': 'Verified Candidate (has evidence)',
+  'unblocked': 'Unblocked (deps resolved)',
+};
+
+function derivedStatusStyle(id) {
+  const light = document.body.classList.contains('light');
+  const derived = light ? _DERIVED_STATUS_STYLE_LIGHT[id] : _DERIVED_STATUS_STYLE[id];
+  if (derived) return derived;
+  return statusStyle(id);
+}
+
 function statusStyle(id) {
   const light = document.body.classList.contains('light');
   const builtIn = light ? _BUILT_IN_STATUS_STYLE_LIGHT[id] : _BUILT_IN_STATUS_STYLE[id];
@@ -21592,6 +25918,8 @@ function _chromeSave() {
 }
 
 function switchView(view) {
+  // Explicit navigation supersedes a pending restore of an older worker.
+  if (typeof _peekOpenGeneration !== 'undefined' && !peekSession) _peekOpenGeneration++;
   if (document.getElementById('grid-view').classList.contains('active')) exitGridMode();
   activeView = view;
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
@@ -21610,12 +25938,13 @@ function switchView(view) {
   const _svViews = [
     ['session', 'sessions', ''], ['board', 'board', ''], ['groups', 'groups', ''],
     ['calendar', 'calendar', 'flex'], ['scheduler', 'scheduler', ''],
-    ['files', 'files', 'flex'], ['mdai', 'mdai', 'flex'], ['proxies', 'proxies', 'flex'],
+    ['files', 'files', 'flex'], ['record', 'record', 'flex'], ['mdai', 'mdai', 'flex'], ['proxies', 'proxies', 'flex'],
     ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
     ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
-    ['cost', 'cost', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
+    ['cost', 'cost', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
     ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'],
+    ['orchestrations', 'orchestrations', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
     const ve = document.getElementById(domId + '-view');
@@ -21631,6 +25960,7 @@ function switchView(view) {
   if (view === 'map') { _mapLoad(); _mapInit(); }
   if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); } // always refresh on tab switch
   if (view === 'cost') _costLoad();
+  if (view === 'disk') _reclaimLoad(); else if (typeof _reclaimStopPolling === 'function') _reclaimStopPolling();
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
   if (view === 'journal') _journalInit();
   if (view === 'habits') _habitsLoad();
@@ -21642,11 +25972,14 @@ function switchView(view) {
   // you happened to open last, with no indication that a filter was applied.
   // Per-session scoping lives on the peek's own Messages tab and on the
   // "Message history" modal reached from inside a peek.
+  if (view === 'sessions') { fetchSessions(); _dbgLog('Workers refreshed on navigation'); }
   if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
+  if (view === 'record') _recorderInit();
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'email') _emailLoad();
   if (view === 'connectors') _connectorsTabLoad();
+  if (view === 'orchestrations') _orchLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
     try { if (location.hash.startsWith('#path=')) history.replaceState({}, '', location.pathname); } catch(e) {}
@@ -23948,10 +28281,14 @@ async function toggleSchedEnabled(id, enabled) {
 
 let _boardViewsLoaded = false;
 let _boardEtag = null;
+let _boardReadGeneration = 0;
+let _boardReadAppliedGeneration = 0;
 async function fetchBoard() {
+  const readGeneration = ++_boardReadGeneration;
   // Saved views sync via /api/prefs so a view made on the desktop is on the
   // phone. Fetched once, not on every board poll.
   if (!_boardViewsLoaded) { _boardViewsLoaded = true; await _boardViewsLoad(); }
+  const snapshotEpoch = _boardSnapshotEpoch;
   try {
     const boardHeaders = {};
     if (_boardEtag) boardHeaders['If-None-Match'] = _boardEtag;
@@ -23971,17 +28308,34 @@ async function fetchBoard() {
       // save guard. The edit modal is the one that mattered: it filled its
       // textarea from the list item and saved that back, so flipping this line
       // first would have blanked the description of every card anyone opened.
-      fetch(API + '/api/board?archived=0&slim=1&quota=1', _boardEtag ? { headers: boardHeaders } : undefined),
+      _stateQuery.response(['board', 'response', {archived:0, slim:1, quota:1}], () => fetch(API + '/api/board?archived=0&slim=1&quota=1', _boardEtag ? { headers: boardHeaders } : undefined)),
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
+    for (const response of [r, rs, rsg]) {
+      if (!response.ok && response.status !== 304) throw new Error(await _apiErrText(response));
+    }
     const statusData = await rs.json();
-    // r.ok FIRST: a 404 body {"error":"not found"} IS an object, so the typeof
-    // guard below happily assigned it and sessionGates became {error:"not found"} —
+    if (!Array.isArray(statusData)) throw new Error('Board statuses response is invalid');
+    const sgData = await rsg.json();
+    if (!sgData || typeof sgData !== 'object' || Array.isArray(sgData)) throw new Error('Board gates response is invalid');
+    const data = r.status === 304 ? null : await r.json();
+    if (r.status !== 304 && !Array.isArray(data)) throw new Error('Board response is invalid');
+    // An older successful read cannot erase a newer failure, nor may an old
+    // failure replace recovered state. Publish the validated batch together.
+    if (readGeneration < _boardReadAppliedGeneration) {
+      amuxTrack('board_read_superseded', {read_generation:readGeneration, current_generation:_boardReadAppliedGeneration, outcome:'success', measured:true, n_considered:1});
+      return;
+    }
+    _boardReadAppliedGeneration = readGeneration;
+    _boardReadError = '';
+    updateConnectionStatus();
+    // HTTP status is validated first: a 404 body {"error":"not found"} IS an
+    // object, so the old typeof guard assigned it to sessionGates —
     // not merely empty, POISONED with a bogus scope key, while this endpoint 404'd
     // 27 times/day after the cutover with nothing shown. Same class as the git-fetch
     // guard: an HTTP error that parses into plausible data (AF-29/AF-30).
-    try { if (rsg.ok) { const sgData = await rsg.json(); if (sgData && typeof sgData === 'object') sessionGates = sgData; } } catch(e) {}
+    sessionGates = sgData;
     consecutiveFailures = 0;
     if (!online) setOnline(true);
     const sj = JSON.stringify(statusData);
@@ -24001,21 +28355,14 @@ async function fetchBoard() {
       if (statusesChanged) renderBoard();
       return;
     }
-    _boardEtag = r.headers.get('ETag') || null;
-    const data = await r.json();
-    // NEVER assign a non-array into boardItems (live crash 2026-08-09: a
-    // remote window holding a stale SW-cached shell sent a stale token, the
-    // 401 body {"error":"unauthorized"} became boardItems, and every
-    // _cardDoingCount/forEach in the worker-list render threw — one bad
-    // fetch bricked the whole page). Keep the previous array; a 401 means
-    // the SHELL (and its injected token) is stale, so refresh it once.
-    if (!Array.isArray(data)) {
-      if (r.status === 401) _staleShellRecover();
-      console.warn('board fetch returned non-array (status ' + r.status + ') — keeping previous set');
+    if (snapshotEpoch !== _boardSnapshotEpoch) {
+      console.info('board poll completed behind a newer stream snapshot; discarded');
       return;
     }
+    _boardEtag = r.headers.get('ETag') || null;
     const j = JSON.stringify(data);
     const itemsChanged = j !== lastBoardJSON;
+    _stateQuery.set(['board'], data);
     if (itemsChanged || statusesChanged) {
       lastBoardJSON = j;
       // While a full-corpus text search is live, the default page must not
@@ -24042,11 +28389,24 @@ async function fetchBoard() {
       } else {
         boardItems = _mergeArchived(data);
       }
+      _boardSnapshotEpoch++;
       _cacheBoardJSON(j);
       renderBoard();
       _nudgeWorkersOnBoardChange();
     }
+    // Seed CDC cursor so subsequent invalidations can use granular updates
+    try {
+      const cr = await fetch(API + '/api/board/changes?since_seq=0&limit=1');
+      if (cr.ok) { const cd = await cr.json(); if (cd.cursor && readGeneration === _boardReadAppliedGeneration) _cdcSeq = cd.cursor; }
+    } catch (e2) {}
   } catch(e) {
+    if (readGeneration < _boardReadAppliedGeneration) {
+      amuxTrack('board_read_superseded', {read_generation:readGeneration, current_generation:_boardReadAppliedGeneration, outcome:'error', measured:true, n_considered:1});
+      return;
+    }
+    _boardReadAppliedGeneration = readGeneration;
+    _boardReadError = String(e.message || e);
+    updateConnectionStatus();
     console.error('fetch board:', e);
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
@@ -24120,6 +28480,30 @@ function _bindMdFileLinks(container) {
       openFilePreview(a.dataset.file);
     }
   });
+}
+
+function _parseFrontmatter(raw) {
+  if (!raw || !raw.startsWith('---')) return { meta: null, body: raw };
+  const end = raw.indexOf('\n---', 3);
+  if (end < 0) return { meta: null, body: raw };
+  const yaml = raw.substring(4, end).trim();
+  const body = raw.substring(end + 4).replace(/^\n/, '');
+  const entries = [];
+  for (const line of yaml.split('\n')) {
+    const m = line.match(/^(\s*)([^:#\n]+?)\s*:\s*(.*)/);
+    if (m && m[1].length === 0) entries.push([m[2].trim(), m[3].trim()]);
+  }
+  return { meta: entries.length ? entries : null, body };
+}
+
+function _renderFrontmatterBlock(entries) {
+  if (!entries || !entries.length) return '';
+  const rows = entries.map(([k, v]) =>
+    '<tr><td style="padding:3px 10px 3px 0;color:var(--dim);font-size:0.72rem;white-space:nowrap;vertical-align:top;">' + esc(k) + '</td>'
+    + '<td style="padding:3px 0;font-size:0.78rem;word-break:break-word;">' + esc(v) + '</td></tr>'
+  ).join('');
+  return '<details class="file-frontmatter" open><summary style="font-size:0.72rem;color:var(--dim);cursor:pointer;padding:4px 0;user-select:none;">Metadata</summary>'
+    + '<table style="border-collapse:collapse;margin:4px 0 12px;">' + rows + '</table></details>';
 }
 
 function renderMarkdown(raw, basePath) {
@@ -24551,7 +28935,7 @@ function _statusCanon(s) {
   return _STATUS_ALIAS[k] || k;
 }
 
-const _BQ_CLOSED = new Set(['done', 'verified', 'discarded']);
+const _BQ_CLOSED = _CLOSED_STATUSES;
 // Dormant item types: armed and waiting, never dispatchable work. Kept in sync
 // with the server-side exclusion in the auto-pickup queries (`type NOT IN
 // ('tripwire','watch')`) — if a type is added there, add it here or armed cards
@@ -24618,7 +29002,7 @@ function _bqIs(item, val, ix) {
       if (_bqIs(item, 'needsyou', ix) || _bqIs(item, 'rotting', ix)) return true;
       const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
       return deps.some(d => { const dc = (boardItems||[]).find(x => x.id === d);
-        return dc && !['done','verified','discarded'].includes(_statusCanon(dc.status)); });
+        return dc && !_isClosedStatus(dc.status); });
     }
     // Derived card whose producer hasn't re-checked its source in 24h+
     // (AMUX-2204): it may be ASSERTING a state (breach, blocker) its source
@@ -25224,9 +29608,10 @@ async function _focusPatch(id, body) {
   catch (e) { return null; }
 }
 async function _focusSend(name, text) {
-  try { const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send',
+  try { const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send',
     { method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
-      body: JSON.stringify({ text, record_history: true }) }); return r.ok; }
+      body: JSON.stringify({ text, record_history: true }),
+      signal: AbortSignal.timeout(10000) }); return r.ok; }
   catch (e) { return false; }
 }
 async function _focusResolveTag(item) {
@@ -25331,7 +29716,7 @@ function renderBoardFilters() {
   // open cards (machine/namespaced tags — anything with ':' or '@', like
   // hrsla:someone@x.com — stay reachable via + Filter and typed queries, but
   // do not earn toolbar real estate), ranked by open-card count, capped.
-  const openItems = boardItems.filter(i => !i.archived && !['done','verified','discarded'].includes(_statusCanon(i.status)));
+  const openItems = boardItems.filter(i => !i.archived && !_isClosedStatus(i.status));
   const tagCount = {};
   openItems.forEach(i => (i.tags || []).forEach(t => {
     if (t.includes(':') || t.includes('@')) return;
@@ -25446,8 +29831,16 @@ async function _colMigrateAll(from, to, lane) {
     // REPORT THE REFUSALS, not just the successes. "moved 480" over a column of
     // 489 leaves nine cards unexplained, and the caller cannot tell which.
     const ref = (d.refused || []).length;
+    // SAY WHEN THE SWEEP WENT UNATTRIBUTED (AMUX-4755). This window is the only
+    // place a human can notice; the server records the actor it resolved and
+    // echoes it back, and an anonymous one means this browser presented no
+    // owner credential, so the cards it just discarded carry no author.
+    const anon = d.actor === 'api-anonymous';
     showToast('Moved ' + d.moved + ' of ' + d.considered + ' to "' + tl + '"'
-      + (ref ? ' — ' + ref + ' refused (see console)' : ''));
+      + (ref ? ', ' + ref + ' refused (see console)' : '')
+      + (anon ? '. Recorded with NO actor.' : ''));
+    if (anon) console.warn('[bulk-migrate] recorded as api-anonymous: this window holds no '
+      + 'owner token, so nobody can tell afterwards who cleared "' + fl + '"');
     if (ref) console.warn('[bulk-migrate] refused:', d.refused);
     await fetchBoard();
     renderBoard();
@@ -25570,7 +29963,85 @@ let _prevCardRects = {};
 function setBoardView(mode) {
   boardViewMode = mode;
   localStorage.setItem('amux_board_view', mode);
+  if (mode === 'smart') _smartBoardData = null;
   renderBoard();
+}
+
+async function _fetchSmartBoard() {
+  try {
+    const resp = await fetch('/api/board/derived');
+    if (!resp.ok) throw new Error('derived endpoint returned ' + resp.status);
+    const data = await resp.json();
+    _smartBoardData = data;
+  } catch (e) {
+    console.error('Smart board fetch failed:', e);
+    _smartBoardData = null;
+  }
+}
+
+function _renderSmartBoard(container, visibleStored) {
+  if (!_smartBoardData || !_smartBoardData.items) {
+    container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">No derived data available.</div>';
+    return;
+  }
+  const visibleIds = new Set(visibleStored.map(i => i.id));
+  const items = _smartBoardData.items.filter(i => visibleIds.has(i.id));
+
+  // Derived status groups in priority display order: attention-needing first
+  const derivedOrder = [
+    'aged-needsyou', 'stalled', 'stale', 'unblocked', 'verified-candidate',
+    'doing', 'review', 'needsyou', 'todo', 'backlog', 'done', 'verified', 'discarded'
+  ];
+  const groups = {};
+  items.forEach(i => {
+    const ds = i.display_status || i.status || 'todo';
+    (groups[ds] = groups[ds] || []).push(i);
+  });
+
+  let html = '';
+  // Show derived-only statuses with a highlight header
+  const derivedSpecial = new Set(['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked']);
+  derivedOrder.concat(Object.keys(groups).filter(k => !derivedOrder.includes(k))).forEach(ds => {
+    const g = groups[ds];
+    if (!g || !g.length) return;
+    const isSpecial = derivedSpecial.has(ds);
+    const sty = derivedStatusStyle(ds);
+    const label = _DERIVED_STATUS_LABELS[ds] || ds;
+    const headStyle = isSpecial
+      ? 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.76rem;font-weight:700;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;border-left:3px solid ' + sty.dot + ';padding-left:10px;margin-top:6px;'
+      : 'display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.74rem;font-weight:600;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;';
+    html += '<div class="board-list-group-head" style="' + headStyle + '">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + '"></span>' + esc(label)
+      + '<span style="color:var(--dim);font-weight:400;">' + g.length + '</span></div>';
+    html += g.map(i => {
+      let row = _issueRowHTML(i, { showOwner: true });
+      if (isSpecial && i.display_status !== i.status) {
+        const badge = '<span style="font-size:0.65rem;padding:1px 5px;border-radius:3px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';margin-left:6px;vertical-align:middle;font-weight:600;">' + esc(i.display_status) + '</span>';
+        row = row.replace('</div>', badge + '</div>');
+      }
+      return row;
+    }).join('');
+  });
+  container.dataset.component = 'board-smart';
+  container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing to show.</div>';
+}
+
+function _smartBoardStatsHTML() {
+  if (!_smartBoardData || !_smartBoardData.counts) return '';
+  const c = _smartBoardData.counts;
+  const special = ['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked'];
+  let pills = '';
+  for (const key of special) {
+    const n = c[key] || 0;
+    if (n === 0) continue;
+    const sty = derivedStatusStyle(key);
+    const label = _DERIVED_STATUS_LABELS[key] || key;
+    pills += '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.72rem;font-weight:600;">'
+      + '<span class="board-status-dot" style="background:' + sty.dot + ';width:6px;height:6px;"></span>'
+      + esc(label) + ' <b>' + n + '</b></span>';
+  }
+  if (!pills) return '<div style="padding:6px 8px;font-size:0.75rem;color:var(--dim);">All cards are in their expected status.</div>';
+  return '<div style="display:flex;flex-wrap:wrap;gap:6px;padding:8px 8px 4px;">' + pills + '</div>';
 }
 
 function setBoardOwner(type) {
@@ -25579,10 +30050,26 @@ function setBoardOwner(type) {
   renderBoard();
 }
 
-function toggleSessionGroup(name) {
-  _sessionGroupCollapsed[name] = !_sessionGroupCollapsed[name];
+function toggleSessionGroup(name, currentlyCollapsed) {
+  // `undefined` no longer means open for every historical worker: idle groups
+  // default closed below. Toggle the state the user ACTUALLY saw, or the first
+  // click on a default-closed group writes `true` and appears to do nothing.
+  _sessionGroupCollapsed[name] = !currentlyCollapsed;
   localStorage.setItem('amux_board_collapsed', JSON.stringify(_sessionGroupCollapsed));
   renderBoard();
+}
+
+function _boardWorkerGroupCollapsed(name, items) {
+  // A saved human choice always wins. For a worker never seen on this device,
+  // open only real in-flight work; the 1,595-card live board otherwise expands
+  // every historical lane and turns the Workers view into hundreds of cards.
+  if (Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, name)) {
+    return !!_sessionGroupCollapsed[name];
+  }
+  return !items.some(function(item) {
+    const status = _statusCanon(item.status || 'todo');
+    return status === 'doing' || status === 'review';
+  });
 }
 
 // Shared Linear-dense issue row (AMUX-2152): status dot · id · one-line
@@ -25591,6 +30078,7 @@ function toggleSessionGroup(name) {
 // drift (Ethan 07:17: same UX on both).
 function _issueRowHTML(item, opts) {
   opts = opts || {};
+  const activity = _boardActivityForCard(item);
   const sty = statusStyle(item.status || 'todo');
   const due = item.due ? '<span class="peek-issue-due">' + esc(item.due) + '</span>' : '';
   const owner = (opts.showOwner && item.session)
@@ -25601,7 +30089,7 @@ function _issueRowHTML(item, opts) {
   const _rq = (typeof _peekIssuesQuery !== 'undefined' && _peekIssuesQuery)
     ? _peekIssuesQuery
     : (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '');
-  return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">' +
+  return '<div class="peek-issue-item' + (activity ? (activity.linked ? ' board-card-live' : ' board-card-observed') : '') + '" data-id="' + esc(item.id) + '" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">' +
     dot +
     '<span class="peek-issue-key">' + _hlSearch(esc(item.id), _rq) + '</span>' +
     // The PEEK query, not the global board query. This read boardSearchQuery,
@@ -25609,7 +30097,7 @@ function _issueRowHTML(item, opts) {
     // filtered correctly and looked broken, which is the failure Ethan
     // reported for messages, sitting one tab over.
     '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title), _rq) + '</span>' +
-    '<span class="peek-issue-meta">' + badge + due + '</span>' +
+    '<span class="peek-issue-meta">' + (activity ? '<span class="board-card-live-label">' + (activity.linked ? 'Working now' : 'Last linked') + '</span>' : '') + badge + due + '</span>' +
     '</div>';
 }
 
@@ -25622,25 +30110,20 @@ function _renderBoardCard(item) {
   const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
                       .split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
-  // LIVE emphasis: this card is what its owning session explicitly claims it is
-  // working on right now. `active + doing` is not enough: a lane can contain
-  // several doing cards, but only one is the current parent task.
-  // `sessions`, not the pre-rename `workers` (b009f6e's FOURTH casualty —
-  // the typeof guard made the dead global read as false instead of throwing,
-  // so the LIVE emphasis just silently never lit).
-  const _liveSession = item.session && (typeof sessions !== 'undefined')
-    ? (sessions || []).find(s => s.name === item.session && s.status === 'active')
-    : null;
-  const _liveCard = _liveSession ? _cardDoingItem(item.session) : null;
-  const _liveNow = !!(_liveCard && _liveCard.id === item.id);
+  // The server's exact runtime link drives live emphasis. A stale observed
+  // claim is shown separately in amber, including cards outside Doing.
+  const _activity = _boardActivityForCard(item);
+  const _liveNow = !!(_activity && _activity.linked);
+  const _observedNow = !!(_activity && !_activity.linked);
   // item.session, not the pre-rename item.worker — the dead field rendered
   // 'undefined is working on this right now' in the LIVE tooltip.
-  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
+  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : _observedNow ? ' board-card-observed' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')" oncontextmenu="return _boardCtxMenu(event,\'' + escJs(item.id) + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
   const _bq = typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '';
   h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq)
     + (_liveNow ? '<span class="board-card-live-label"><span class="board-live-dot"></span>Working now</span>' : '')
+    + (_observedNow ? '<span class="board-card-live-label">Last linked · out of date</span>' : '')
     + '</div>';
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
@@ -25657,6 +30140,26 @@ function _renderBoardCard(item) {
   // for and re-wording it here would be the second spelling the comment warns
   // against.
   if (item.owner_isolated) h += '<div class="board-card-isolated" title="' + esc(item.owner_reach || 'The owning session is an isolated raw agent.') + '">&#x1F512; isolated owner</div>';
+  // ARCHIVED WITH A LIVE STATUS (AF-460/AF-461). `archived` is a boolean flag,
+  // not a status, so a card can be archived AND still show `backlog`/`doing`/
+  // `needsyou` with no visible difference from an ordinary actionable card —
+  // until you try to close it and every closing verb refuses with
+  // `archived_task_immutable`. AF-461 marked this in `amux board ls`; it never
+  // reached the dashboard's own kanban card, which is the surface GE-564 and
+  // AF-224 actually hit it on. Same class as `owner_isolated` above: the
+  // standard advice this card would otherwise imply ("drain it") is
+  // unfollowable, and the card should say so where it is listed.
+  //
+  // Only the PATHOLOGICAL subset, matching `amux board ls`'s own distinction
+  // (amux:4345): an archived card already at done/verified/discarded is
+  // archived correctly and nobody wants to close it — flagging those too
+  // would put the marker on every archived row instead of the ~15% that are
+  // actually stuck, which reads as decoration (ethos rule 5).
+  if (item.archived && !_isClosedStatus(item.status)) {
+    h += '<div class="board-card-archived-live" title="Archived, but still shows status \'' + esc(item.status || '') + '\'. Every closing verb refuses with archived_task_immutable until you unarchive it first (amux board unarchive ' + esc(item.id) + ', then done/discard as usual).">&#x1F4E6; archived, cannot close</div>';
+  }
+  h += _leaseChip(item);
+  h += _blockedByChip(item);
   h += '<div class="board-card-title">';
   if (boardViewMode === 'worker') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
   h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
@@ -25672,8 +30175,71 @@ function _renderBoardCard(item) {
   if (item.due) { const today = new Date().toISOString().slice(0,10); const overdue = item.due < today && item.status !== 'done'; h += '<span class="board-card-time" style="' + (overdue ? 'color:var(--red)' : 'color:var(--accent)') + '">&#x1F4C5; ' + item.due + '</span>'; }
   h += '<span class="board-card-time">' + timeAgo(item.updated || item.created) + '</span>';
   if (item.creator) h += '<span class="board-card-time">' + _hlSearch(esc(item.creator), _bq) + '</span>';
-  h += '</div></div>';
+  h += '</div>';
+  // Only an authoritative detail carries the complete child set. A capped
+  // board list cannot supply a truthful progress denominator.
+  const children = Array.isArray(item.children) ? item.children : [];
+  if (children.length) {
+    const complete = children.filter(child => ['done', 'verified'].includes(child.status)).length;
+    h += '<div class="board-card-progress" aria-label="' + complete + ' of ' + children.length + ' linked tasks complete"><progress max="' + children.length + '" value="' + complete + '"></progress><span>' + complete + '/' + children.length + '</span></div>';
+  }
+  if (item.epic) h += '<div class="board-card-epic">↗ Epic ' + esc(item.epic) + '</div>';
+  h += '</div>';
   return h;
+}
+
+// RR-0052 / AMUX-4529. The lease has been on every board row since 4970f038
+// and nothing rendered it, so "who is actually holding this card, and is that
+// hold still alive" was answerable only by reading the API by hand.
+//
+// Heartbeat age is the useful number, not the lease's existence: a held card
+// whose holder stopped beating looks identical to a healthy one in the column.
+function _leaseChip(item) {
+  const lease = item && item.lease;
+  if (!lease || !lease.holder) return '';
+  const now = Date.now() / 1000;
+  const beat = Number(lease.heartbeat_at || 0);
+  const expires = Number(lease.expires_at || 0);
+  const expired = expires > 0 && expires < now;
+  const attempt = Number(lease.attempt || 0);
+  const label = esc(lease.holder)
+    + (attempt > 1 ? ' &middot; attempt ' + attempt : '')
+    + (beat ? ' &middot; \u2665 ' + timeAgo(beat) : ' &middot; no heartbeat recorded');
+  const why = expired
+    ? 'Lease EXPIRED ' + timeAgo(expires) + '. ' + lease.holder + ' still holds the card on the board, but the hold is no longer alive, so another worker may claim it.'
+    : 'Held by ' + lease.holder + ' (attempt ' + (attempt || 1) + ', generation ' + (lease.generation || 1) + ')'
+      + (beat ? ', last heartbeat ' + timeAgo(beat) : ', no heartbeat recorded yet')
+      // timeAgo() has no future branch: a negative age falls into its `< 60`
+      // arm and a lease with half an hour left reads "expires just now". Live
+      // leases are ALWAYS in the future, so that arm is the common case here.
+      + (expires ? ', lease expires in ' + fmtDuration(Math.round(expires - now)) : '');
+  return '<div class="board-card-lease' + (expired ? ' board-card-lease-stale' : '') + '" title="' + esc(why) + '">'
+    + (expired ? '&#x23F1; expired &middot; ' : '&#x1F517; ') + label + '</div>';
+}
+
+// Which of this card's dependencies are not finished yet.
+//
+// Resolved against the LOADED board, which is a working set, so a dependency
+// that is not loaded is reported as unknown rather than counted as blocking:
+// asserting "blocked by X" from a row this client never saw would be a claim
+// about a card it cannot see (the same trap the capped board list already has).
+function _blockedByChip(item) {
+  const deps = Array.isArray(item && item.depends_on) ? item.depends_on : [];
+  if (!deps.length || _isClosedStatus(item.status)) return '';
+  const known = new Map((Array.isArray(boardItems) ? boardItems : []).map(i => [i.id, i.status]));
+  const blocking = [], unknown = [];
+  deps.forEach(id => {
+    const st = known.get(id);
+    if (st === undefined) unknown.push(id);
+    else if (!_isClosedStatus(st)) blocking.push(id);
+  });
+  if (!blocking.length && !unknown.length) return '';
+  const shown = blocking.slice(0, 3).join(', ') + (blocking.length > 3 ? ' +' + (blocking.length - 3) : '');
+  const why = (blocking.length ? 'Waiting on ' + blocking.join(', ') + '. ' : '')
+    + (unknown.length ? unknown.length + ' dependency(ies) not in the loaded board, so their status is unknown here: ' + unknown.join(', ') + '. ' : '')
+    + 'This card cannot finish until they resolve.';
+  const label = blocking.length ? shown : unknown.length + ' unknown';
+  return '<div class="board-card-blocked" title="' + esc(why) + '">&#x26D4; blocked by ' + esc(label) + '</div>';
 }
 
 async function _togglePin(id) {
@@ -25831,11 +30397,11 @@ function _renderBoardColumnsInto(host, items, scope) {
     const collapsed = isGlobal && _collapsedCols.has(st);
     html += '<div class="board-col' + (collapsed ? ' col-collapsed' : '') + '" data-col="' + st + '">';
     html += '<div class="board-col-header"' + (isGlobal ? '' : ' style="cursor:default;"') + '>';
-    html += '<span style="display:flex;align-items:center;gap:5px;">';
+    html += '<span class="board-col-identity" style="display:flex;align-items:center;gap:5px;">';
     if (isGlobal) {
       html += '<button class="board-col-collapse" onclick="toggleColCollapse(\'' + st + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' + (collapsed ? '&#x25B8;' : '&#x25BE;') + '</button>';
     }
-    html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
+    html += '<span class="board-col-label" style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
     if (stObj.terminal) {
       html += '<span class="col-terminal-chip" title="Terminal state — cards here are finished">terminal</span>';
     }
@@ -25983,12 +30549,14 @@ function _renderBoardBySession(visible, container) {
   }
 
   let html = '';
+  let defaultCollapsedGroups = 0;
+  let defaultOpenGroups = 0;
 
   // ── Yours (human tasks) at the top ──
   if (humanItems.length) {
     const collapsed = _sessionGroupCollapsed['__human__'];
     html += '<div class="board-session-group board-human-group">';
-    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'__human__\')">';
+    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'__human__\',' + (!!collapsed) + ')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">&#x1F464; Yours</span>';
     html += '<div class="board-session-counts">' + _sessionCountsHtml(humanItems) + '</div></div>';
@@ -26007,10 +30575,15 @@ function _renderBoardBySession(visible, container) {
   // ── Agent tasks grouped by session ──
   sessionNames.forEach(function(name) {
     const items = name ? groups[name] : noSession;
-    const collapsed = _sessionGroupCollapsed[name || '__none__'];
     const groupKey = name || '__none__';
+    const saved = Object.prototype.hasOwnProperty.call(_sessionGroupCollapsed, groupKey);
+    const collapsed = _boardWorkerGroupCollapsed(groupKey, items);
+    if (!saved) {
+      if (collapsed) defaultCollapsedGroups++;
+      else defaultOpenGroups++;
+    }
     html += '<div class="board-session-group">';
-    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\')">';
+    html += '<div class="board-session-header" onclick="toggleSessionGroup(\'' + esc(groupKey) + '\',' + collapsed + ')">';
     html += '<span class="board-session-chevron' + (collapsed ? '' : ' open') + '">\u25B6</span>';
     html += '<span class="board-session-name">' + (name ? esc(name) : '<span style="color:var(--dim)">Unassigned</span>') + '</span>';
     html += '<div class="board-session-counts">' + _sessionCountsHtml(items) + '</div></div>';
@@ -26025,6 +30598,26 @@ function _renderBoardBySession(visible, container) {
     }
     html += '</div>';
   });
+
+  if (defaultCollapsedGroups > 0) {
+    html = '<div class="board-session-summary">In-progress work is open · '
+      + defaultCollapsedGroups + ' idle worker group' + (defaultCollapsedGroups === 1 ? '' : 's')
+      + ' collapsed</div>' + html;
+  }
+  // Two-fix signal: a sweep can now see the population that made this surface
+  // unusable, and how much the default collapse removed, without screen video.
+  if (!_boardWorkerDensityBeaconSent && sessionNames.length) {
+    _boardWorkerDensityBeaconSent = true;
+    try {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ kind: 'board-worker-density', verdict: 'idle-history-collapsed',
+          measured: true, n_considered: sessionNames.length, cards: agentVisible.length,
+          default_collapsed: defaultCollapsedGroups, default_open: defaultOpenGroups,
+          ver: APP_VER })
+      }).catch(() => {});
+    } catch (e) {}
+  }
 
   if (!visible.length) {
     html = '<div class="board-session-empty">No board items yet</div>';
@@ -26203,13 +30796,19 @@ function renderBoard() {
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
   const container = document.getElementById('board-columns');
+  // Global columns scroll horizontally. Keep activity above them, outside the
+  // host whose contents every board view replaces. Worker detail instead keeps
+  // its strip inside its vertical scrolling list and mounts it after rendering.
+  _renderBoardActivity(container, '', false);
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
   var bvL = document.getElementById('bv-list');
+  var bvSm = document.getElementById('bv-smart');
   if (bvS) bvS.classList.toggle('active', boardViewMode === 'worker');
   if (bvC) bvC.classList.toggle('active', boardViewMode === 'status');
   if (bvL) bvL.classList.toggle('active', boardViewMode === 'list');
+  if (bvSm) bvSm.classList.toggle('active', boardViewMode === 'smart');
   var boH = document.getElementById('bo-human');
   var boA = document.getElementById('bo-agent');
   if (boH) boH.classList.toggle('active', boardOwnerFilter === 'human');
@@ -26221,7 +30820,7 @@ function renderBoard() {
   // is computed over the same unfiltered set, so a chip that says 5 must show
   // 5. The toggle is the browse default; the query is the filter.
   const _qActive = !!(boardSearchQuery || '').trim();
-  let visible = _qActive ? boardItems.slice()
+  let visible = (_qActive || boardOwnerFilter === 'all') ? boardItems.slice()
     : boardItems.filter(i => boardOwnerFilter === 'agent' ? i.owner_type === 'agent' : i.owner_type !== 'agent');
 
   // Structured query: key:value facets, -negation, quoted phrases, and is:
@@ -26263,6 +30862,26 @@ function renderBoard() {
     container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
     return;
   }
+
+  if (boardViewMode === 'smart') {
+    container.classList.remove('board-columns');
+    container.classList.add('board-list-mode');
+    if (!_smartBoardData && !_smartBoardFetching) {
+      _smartBoardFetching = true;
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      _fetchSmartBoard().then(() => { _smartBoardFetching = false; renderBoard(); }).catch(() => { _smartBoardFetching = false; });
+      return;
+    }
+    if (!_smartBoardData) {
+      container.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Loading derived statuses...</div>';
+      return;
+    }
+    _renderSmartBoard(container, visible);
+    const _sElSm = document.getElementById('board-stats-mount');
+    if (_sElSm) _sElSm.innerHTML = _smartBoardStatsHTML();
+    return;
+  }
+
   // Mount the progress strip above the columns, over the SAME `visible` set the
   // columns are about to render (AMUX-2506). Fed from `visible` and not from
   // boardItems so it can never describe a different population than the board.
@@ -26528,6 +31147,10 @@ function updateSchedKindUI() {
   document.getElementById('sched-command').placeholder = shell
     ? 'e.g. /bin/bash /path/to/script.sh' : 'e.g. /status or npm run build';
 }
+function updateSchedFanOutUI() {
+  const on = document.getElementById('sched-fan-out').checked;
+  document.getElementById('sched-fan-out-model-group').style.display = on ? '' : 'none';
+}
 // Determine which mode an existing schedule maps to
 function schedModeOf(s) {
   if (s.sched_type === 'once' && !s.schedule_expr) return 'once';
@@ -26552,6 +31175,10 @@ function openSchedModal(editId) {
   setVal('sched-loop-every', '30m');
   setVal('sched-expr', '');
   setVal('sched-run-at', new Date(Date.now() + 3600000).toISOString().slice(0,16));
+  setChk('sched-fan-out', false);
+  setVal('sched-fan-out-model', 'haiku');
+  setChk('sched-worktree', false);
+  updateSchedFanOutUI();
 
   let mode = 'loop';
   if (editId) {
@@ -26562,6 +31189,10 @@ function openSchedModal(editId) {
       sel.value = s.session;
       setVal('sched-command', s.command);
       setVal('sched-run-at', s.run_at && s.run_at.includes('T') ? s.run_at : '');
+      setChk('sched-fan-out', !!s.fan_out);
+      setVal('sched-fan-out-model', s.fan_out_model || 'haiku');
+      setChk('sched-worktree', !!s.worktree);
+      updateSchedFanOutUI();
       mode = schedModeOf(s);
       const expr = s.schedule_expr || '';
       if (mode === 'loop') {
@@ -26635,8 +31266,12 @@ async function saveSchedModal() {
   // REFUSES to arm them (400, AMUX-2680), so sending them would turn every
   // save into an error; they are gone from the payload for the same reason
   // they are gone from the form.
+  const fanOut = document.getElementById('sched-fan-out').checked ? 1 : 0;
+  const fanOutModel = fanOut ? (document.getElementById('sched-fan-out-model').value || 'haiku') : null;
+  const worktree = document.getElementById('sched-worktree').checked ? 1 : 0;
   const payload = { title, worker, kind, command, sched_type: stype, recurrence: null, run_at,
                     schedule_expr: schedExpr || null,
+                    fan_out: fanOut, fan_out_model: fanOutModel, worktree,
                     by: 'dashboard' };
   const url = _schedEditId ? API + '/api/schedules/' + _schedEditId : API + '/api/schedules';
   const method = _schedEditId ? 'PATCH' : 'POST';
@@ -26731,6 +31366,44 @@ async function saveBoardEdit() {
 // ── Board detail (full-screen) ──
 let boardDetailId = null;
 let boardDetailStatus = 'todo';
+let _boardDetailOpenGeneration = 0;
+// A readonly title still wraps when the device rotates or its pane narrows.
+// The input handler only sizes edits; observe width so saved titles cannot
+// retain a desktop-height textarea and hide their distinguishing final words.
+const _bdTitleForResize = document.getElementById('bd-title');
+if (_bdTitleForResize && window.ResizeObserver) {
+  let width = 0;
+  new ResizeObserver(entries => {
+    const nextWidth = entries[0].contentRect.width;
+    if (!nextWidth || nextWidth === width || !document.getElementById('board-detail-overlay').classList.contains('active')) return;
+    width = nextWidth;
+    // Writing an observed box inside this callback can trigger the browser's
+    // ResizeObserver-loop error even when the next callback ignores height.
+    requestAnimationFrame(() => {
+      if (!document.getElementById('board-detail-overlay').classList.contains('active')) return;
+      const clipped = _bdTitleForResize.scrollHeight > _bdTitleForResize.clientHeight + 1;
+      _bdTitleForResize.style.height = 'auto';
+      _bdTitleForResize.style.height = _bdTitleForResize.scrollHeight + 'px';
+      if (clipped) {
+        fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: 'board-detail-layout', verdict: 'title-resized-after-wrap',
+            measured: true, n_considered: 1, card: boardDetailId, width: Math.round(width), ver: APP_VER }) }).catch(() => {});
+      }
+    });
+  }).observe(_bdTitleForResize);
+}
+function _boardDetailIdentityDiscard(requestedId, generation, responseId) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ kind: 'board-detail-identity-discard', requested_card: requestedId,
+        response_card: responseId || null, current_card: boardDetailId,
+        request_generation: generation, current_generation: _boardDetailOpenGeneration,
+        verdict: 'stale_or_cross_card_response_refused', measured: true, n_considered: 1,
+        ver: APP_VER })
+    }).catch(() => {});
+  } catch (e) {}
+}
 // Persisted to localStorage (AMUX-2209): board-detail edits typed OFFLINE
 // used to live only in memory — a reload or iOS killing the backgrounded PWA
 // destroyed them. Hydrated at boot, saved on every draft write.
@@ -26742,10 +31415,56 @@ function _boardDraftsPersist() {
   try { localStorage.setItem('amux_board_drafts', JSON.stringify(_boardDrafts)); } catch (e) {}
 }
 
+// A status-only draft is not an edit to the card's content. It can be left
+// behind by a long-lived tab after another client closes the card, and must
+// not make an authoritative terminal GET reopen the card as `doing`. Content
+// drafts remain local: only fields that the draft actually carries participate
+// in this comparison so old/partial drafts are not treated as edits merely
+// because the server now has fields they never knew about.
+function _bdDraftHasActiveEdits(draft, full) {
+  if (!draft || !full) return false;
+  const own = Object.prototype.hasOwnProperty;
+  const same = (a, b) => JSON.stringify(a == null ? '' : a) === JSON.stringify(b == null ? '' : b);
+  const fields = [
+    ['title', 'title'], ['desc', 'desc'], ['session', 'session'],
+    ['worker', 'session'], ['due', 'due'], ['due_time', 'due_time'],
+    ['tags', 'tags'], ['gate', 'gate'],
+  ];
+  const compared = new Set();
+  return fields.some(([draftKey, serverKey]) => {
+    if (compared.has(serverKey) || !own.call(draft, draftKey)) return false;
+    compared.add(serverKey);
+    return !same(draft[draftKey], full[serverKey]);
+  });
+}
+function _bdDraftField(draft, key, fallback) {
+  return draft && Object.prototype.hasOwnProperty.call(draft, key) ? draft[key] : fallback;
+}
+function _bdDraftSession(draft, fallback) {
+  if (!draft) return fallback;
+  if (Object.prototype.hasOwnProperty.call(draft, 'session')) return draft.session;
+  if (Object.prototype.hasOwnProperty.call(draft, 'worker')) return draft.worker;
+  return fallback;
+}
+
+// This is deliberately client-edit state, not a guess based on draft age or
+// provider prose. Programmatic hydration does not dispatch these events;
+// actual typing/selection does, so a Refresh can preserve an edit in progress.
+let _bdActiveDirty = false;
+document.addEventListener('input', e => {
+  if (!boardDetailId || !e.target || !/^bd-(title|desc|session|due|due-time|gate)$/.test(e.target.id || '')) return;
+  _bdActiveDirty = true;
+}, true);
+document.addEventListener('change', e => {
+  if (!boardDetailId || !e.target || !/^bd-(title|desc|session|due|due-time|gate)$/.test(e.target.id || '')) return;
+  _bdActiveDirty = true;
+}, true);
+
 // Set false on every open, true once GET /api/board/<id> has filled desc/log.
 // The SAVE path refuses to write a desc while this is false and the card is
 // known to have one — see the guard in the save handler (AMUX-2840).
 let _bdHydrated = false;
+let _bdLoadedIdentity = null;
 
 function _bdConfigureGo(item) {
   const goBtn = document.getElementById('bd-goto-session');
@@ -26759,11 +31478,85 @@ function _bdConfigureGo(item) {
   };
 }
 
-function _bdArtifactRef(a) {
+function _bdAudit(kind, detail) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ kind, ver: APP_VER }, detail || {})),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// Detect the Safari failure where a stationary touch reveals hover controls
+// but never becomes a click. Swipes, child controls, and successful clicks do
+// not report failures; this observes input without synthesizing another action.
+(function() {
+  let touch = null;
+  document.addEventListener('touchstart', e => {
+    const card = e.target.closest('.board-card[data-id]');
+    touch = card && e.touches.length === 1 && !e.target.closest('button,a,input,.board-drag-handle')
+      ? { id: card.dataset.id, x: e.touches[0].clientX, y: e.touches[0].clientY, clicked: false } : null;
+  }, { passive: true });
+  document.addEventListener('touchmove', e => {
+    if (touch && (Math.abs(e.touches[0].clientX - touch.x) > 10 || Math.abs(e.touches[0].clientY - touch.y) > 10)) touch = null;
+  }, { passive: true });
+  document.addEventListener('touchcancel', () => { touch = null; }, { passive: true });
+  document.addEventListener('click', e => {
+    if (touch && e.target.closest('.board-card')?.dataset.id === touch.id) touch.clicked = true;
+  }, true);
+  document.addEventListener('touchend', () => {
+    const ended = touch;
+    if (!ended) return;
+    setTimeout(() => {
+      if (!ended.clicked && boardDetailId !== ended.id && document.visibilityState === 'visible') {
+        _bdAudit('board-tap', { verdict: 'board_tap_unopened', id: ended.id, measured: true, n_considered: 1 });
+      }
+      if (touch === ended) touch = null;
+    }, 750);
+  }, { passive: true });
+})();
+
+const _bdArtifactAuditSeen = new Set();
+function _bdArtifactHref(target) {
+  try {
+    const parsed = new URL(String(target), window.location.href);
+    const loopback = parsed.hostname === 'localhost'
+      || parsed.hostname === '127.0.0.1'
+      || parsed.hostname === '[::1]';
+    if (loopback && parsed.port === '8824') {
+      const normalized = window.location.origin + parsed.pathname + parsed.search + parsed.hash;
+      if (!_bdArtifactAuditSeen.has(target)) {
+        _bdArtifactAuditSeen.add(target);
+        _bdAudit('artifact-link-normalized', {
+          verdict: 'same-server-origin-rewritten', measured: true, n_considered: 1,
+          original: String(target), normalized,
+        });
+      }
+      return normalized;
+    }
+  } catch (e) {}
+  return String(target);
+}
+
+function _bdArtifactRef(a, item) {
   const ref = String((a && a.ref) || '');
   const target = String((a && a.resolved_ref) || ref);
+  if (/^file:\/\//i.test(target)) {
+    try {
+      const url = new URL(target);
+      if (url.hostname && url.hostname !== 'localhost') throw new Error('remote file host');
+      return '<button type="button" class="file-link board-artifact-file" onclick="event.stopPropagation();openFilePreview(\''
+        + escJs(decodeURIComponent(url.pathname)) + '\')">' + esc(ref) + '</button>';
+    } catch (error) { _bdAudit('board-artifact-navigation', { verdict: 'invalid-file-url', ref }); return '<code>' + esc(ref) + '</code>'; }
+  }
+  if (/^[a-f0-9]{7,40}$/i.test(target)) {
+    return '<button type="button" class="board-artifact-commit" onclick="_bdOpenCommit(\'' + escJs(target)
+      + '\',\'' + escJs(item && item.session || '') + '\')" title="Open commit ' + esc(target) + '">' + esc(ref) + '</button>';
+  }
   if (/^https?:\/\//i.test(target)) {
-    return '<a href="' + esc(target) + '" target="_blank" rel="noopener noreferrer">' + esc(ref) + '</a>';
+    const href = _bdArtifactHref(target);
+    return '<a href="' + esc(href) + '" data-original-ref="' + esc(ref)
+      + '" target="_blank" rel="noopener noreferrer">' + esc(href === target ? ref : href) + '</a>';
   }
   const refPath = ref.replace(/#.*$/, '');
   const targetPath = target.replace(/#.*$/, '');
@@ -26814,6 +31607,31 @@ function _bdRenderMeta(item) {
   }
   let html = parts.length ? '<div class="bd-card-facts">'
     + parts.map(p => '<span>' + p + '</span>').join('') + '</div>' : '';
+
+  // RR-0052: every claim on this card, not just the one holding it now. A
+  // second attempt after a failed first is the thing worth seeing, and the
+  // detail GET has carried `attempts` since 4970f038 with nothing reading it.
+  const attempts = Array.isArray(item.attempts) ? item.attempts : [];
+  if (attempts.length) {
+    const lease = item.lease || {};
+    const rows = attempts.slice().sort((a, b) => (b.attempt || 0) - (a.attempt || 0)).map(a => {
+      const live = !a.ended_at && lease.holder && Number(lease.attempt || 0) === Number(a.attempt || 0);
+      const outcome = a.outcome ? esc(a.outcome) : (live ? 'holding now' : 'ended without a recorded outcome');
+      const ended = a.ended_at ? timeAgo(a.ended_at) : '';
+      return '<div class="board-detail-meta-row">'
+        + '<b>#' + Number(a.attempt || 0) + '</b> '
+        + '<button class="task-id-chip bd-link-chip" onclick="event.stopPropagation();openPeek(\'' + escJs(a.worker || '') + '\')" '
+        + 'title="Open ' + esc(a.worker || 'worker') + '">' + esc(a.worker || 'unknown worker') + '</button> '
+        + '<span>' + (a.started_at ? 'started ' + timeAgo(a.started_at) : 'start not recorded')
+        + (ended ? ' &middot; ended ' + ended : '')
+        + ' &middot; ' + outcome
+        + (a.to_status ? ' &middot; left it in ' + esc(a.to_status) : '')
+        + (a.ended_by ? ' &middot; ended by ' + esc(a.ended_by) : '')
+        + (a.reason ? ' &middot; ' + esc(String(a.reason).slice(0, 160)) : '')
+        + '</span></div>';
+    }).join('');
+    html += '<section class="bd-card-section"><h4>Attempts (' + attempts.length + ')</h4>' + rows + '</section>';
+  }
 
   const messages = Array.isArray(item.messages) ? item.messages : [];
   if (messages.length) {
@@ -26872,17 +31690,7 @@ function _bdRenderMeta(item) {
     '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')">' + esc(d) + '</span>').join(' ') + '</div>';
 
   const children = Array.isArray(item.children) ? item.children : [];
-  if (children.length) {
-    relationHtml += '<div class="board-detail-meta-row"><b>Child tasks (' + children.length + ')</b></div>'
-      + children.map(c => {
-        const sty = statusStyle(c.status || 'todo');
-        const pri = c.priority ? ' · ' + esc(c.priority) : '';
-        return '<div class="board-detail-meta-row" style="display:flex;gap:6px;align-items:center;">'
-          + '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(c.id) + '\')">' + esc(c.id) + '</span>'
-          + '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + '">' + esc(c.status || 'todo') + '</span>'
-          + '<span>' + esc(c.title || '') + pri + '</span></div>';
-      }).join('');
-  }
+  if (children.length) html += _bdRenderFanoutChildren(item);
   if (relationHtml) html += '<section class="bd-card-section"><h4>Task relationships</h4>' + relationHtml + '</section>';
 
   const gates = (Array.isArray(item.gate_requirements) ? item.gate_requirements : [])
@@ -26917,20 +31725,31 @@ function _bdRenderMeta(item) {
       const key = String((a && a.ref) || '');
       if (key && !artifactSeen.has(key)) { artifactSeen.add(key); artifacts.push(a); }
     });
-  if (artifacts.length) {
-    html += '<section class="bd-card-section"><h4>Produced assets (' + artifacts.length + ')</h4>'
-      + artifacts.map(a => {
+  const retiredArtifacts = artifacts.filter(a => ['invalid', 'superseded'].includes(String((a && a.state) || '')));
+  const producedArtifacts = artifacts.filter(a => !['invalid', 'superseded'].includes(String((a && a.state) || '')));
+  if (producedArtifacts.length) {
+    html += '<section class="bd-card-section"><h4>Produced assets (' + producedArtifacts.length + ')</h4>'
+      + producedArtifacts.map(a => {
         const availability = a && a.availability || {};
         const availabilityText = availability.state === 'missing' ? ' · missing'
           : availability.state === 'available' ? ' · available'
           : availability.state === 'external' && availability.measured === false ? ' · reachability not checked'
           : '';
-        return '<div class="board-detail-meta-row">' + _bdArtifactRef(a)
+        return '<div class="board-detail-meta-row">' + _bdArtifactRef(a, item)
         + ' <span style="color:var(--dim)">· ' + esc(a.kind || a.source || 'artifact')
         + (a.state ? ' · ' + esc(a.state) : '') + esc(availabilityText) + '</span>'
         + (a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '') + '</div>';
       }).join('');
     html += '</section>';
+  }
+  if (retiredArtifacts.length) {
+    html += '<section class="bd-card-section bd-retired-artifacts"><h4>Retired artifacts ('
+      + retiredArtifacts.length + ')</h4>'
+      + retiredArtifacts.map(a => '<div class="board-detail-meta-row"><code>'
+        + esc(String((a && a.ref) || '')) + '</code> <span style="color:var(--dim)">· '
+        + esc(String((a && a.state) || 'retired')) + '</span>'
+        + (a && a.description ? '<div style="color:var(--dim)">' + esc(a.description) + '</div>' : '')
+        + '</div>').join('') + '</section>';
   }
 
   const activity = _bdWorkerActivity(item);
@@ -26944,6 +31763,7 @@ function _bdRenderMeta(item) {
         + activity.length + ' worker actions</button>' : '') + '</section>';
   }
   meta.innerHTML = html;
+  _bdEnhanceRecord(item);
 }
 
 /// Fetch the authoritative card and fill desc/log, WITHOUT clobbering anything
@@ -26954,20 +31774,72 @@ function _bdRenderMeta(item) {
 /// 3.5MB -> 554KB) it is absent entirely — so the textarea would open empty and
 /// saving would BLANK the description. This makes the modal read from the one
 /// place that always has it.
+// Only a complete, server-versioned row can authorize an offline edit. The
+// slim board list deliberately omits prose; treating it as a full row erases it.
+function _bdCompleteSnapshot(row, id) {
+  return Boolean(row && row.id === id && !row.deleted && Number.isInteger(row.rev)
+    && ['title', 'desc', 'status'].every(key => typeof row[key] === 'string')
+    && ['session', 'due', 'due_time'].every(key => Object.hasOwn(row, key) && (row[key] === null || typeof row[key] === 'string'))
+    && ['tags', 'gate'].every(key => Array.isArray(row[key]) && row[key].every(value => typeof value === 'string')));
+}
+async function _bdReadSnapshot(id) {
+  if (online && navigator.onLine !== false) {
+    try {
+      const response = await fetch(API + '/api/board/' + id, { headers: _authHeaders() });
+      // An explicit refusal/deletion is authoritative. Never resurrect it from cache.
+      if (!response.ok) { showToast(await _apiErrText(response)); return null; }
+      const full = await response.json();
+      if (!full || full.id !== id) return null;
+      if (_bdCompleteSnapshot(full, id)) {
+        try { await _idb.putIssue(full); }
+        catch (error) { _bdAudit('card-cache-write-failed', { id, verdict: 'offline_copy_unavailable', measured: true, n_considered: 1 }); }
+      }
+      return full;
+    } catch (error) { /* A transport failure may use the versioned offline copy. */ }
+  }
+  const full = await _idb.getIssue(id);
+  const complete = _bdCompleteSnapshot(full, id);
+  _bdAudit('card-offline-hydration', { id, verdict: complete ? 'versioned_copy' : 'complete_copy_missing', measured: true, n_considered: 1 });
+  return complete ? full : null;
+}
+
 async function _bdHydrate(id) {
+  const generation = _boardDetailOpenGeneration;
+  // Compare controls with the snapshot used when hydration began. A board
+  // poll may update the cache during this GET without changing the editor.
+  const cached = { ...(boardItems.find(item => item.id === id) || {}) };
   try {
-    const r = await apiCall(API + '/api/board/' + id);
-    if (!r || !r.ok) return;
-    const full = await r.json();
-    if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
+    const full = await _bdReadSnapshot(id);
+    if (!full || full.id !== id || boardDetailId !== id || generation !== _boardDetailOpenGeneration) return false;  // modal moved on
     const idx = boardItems.findIndex(i => i.id === id);
-    const cached = idx >= 0 ? { ...boardItems[idx] } : {};
     if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
     const merged = idx >= 0 ? boardItems[idx] : full;
+    let draft = _boardDrafts[id];
+    const terminal = /^(done|verified|discarded)$/i.test(String(full.status || ''));
+    const keepLocalDraft = Boolean(_bdActiveDirty || _bdDraftHasActiveEdits(draft, full));
+    if (terminal && draft && !keepLocalDraft) {
+      // The persisted draft only differed by status (or was empty/partial),
+      // so it is stale state from the old client rather than an active edit.
+      // Remove it before painting controls; otherwise every Refresh would
+      // restore the fossil immediately after the GET corrected the cache.
+      delete _boardDrafts[id];
+      _boardDraftsPersist();
+      draft = null;
+    }
+    const preserveLocalStatus = Boolean(_bdActiveDirty || (draft && _bdDraftHasActiveEdits(draft, full)));
+    // The selected status is a rendered copy of the server row, not a second
+    // source of truth. Keep an intentional local content edit, but whenever
+    // the user has not edited this card, apply the authoritative GET before
+    // painting the controls. This also removes the timing window in
+    // openBoardDetail, where hydration used to start before the status was
+    // initialized.
+    if (!preserveLocalStatus && boardDetailId === id) {
+      boardDetailStatus = full.status || 'todo';
+      _renderDetailStatusBtns();
+    }
     _bdRenderHistory(merged);
     if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
     _bdRenderMeta(merged);
-    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
     const title = document.getElementById('bd-title');
     if (title && title.value === (cached.title || '')) {
       title.value = full.title || '';
@@ -26987,10 +31859,6 @@ async function _bdHydrate(id) {
         preview.innerHTML = d.value.trim() ? renderMarkdown(d.value) : '';
       }
     }
-    if (boardDetailStatus === (cached.status || 'todo')) {
-      boardDetailStatus = full.status || 'todo';
-      _renderDetailStatusBtns();
-    }
     const sess = document.getElementById('bd-session');
     if (sess && sess.value === (cached.session || '')) _populateSessionSelect('bd-session', full.session || '');
     _bdConfigureGo(full);
@@ -27005,10 +31873,16 @@ async function _bdHydrate(id) {
       _tagState['bd'] = [...(full.tags || [])]; _beTagRenderChips('bd'); _beTagInputUpdate('bd');
     }
     _bdHydrated = true;
-  } catch (e) { /* leave unhydrated; the save guard covers it */ }
+    _bdLoadedIdentity = { id, generation, rev: keepLocalDraft ? (draft?.expect_rev ?? cached.rev) : full.rev };
+    return true;
+  } catch (e) { /* leave unhydrated; the save guard covers it */ return false; }
 }
 
 async function openBoardDetail(id) {
+  const detailGeneration = ++_boardDetailOpenGeneration;
+  const detailIdentityCurrent = () => detailGeneration === _boardDetailOpenGeneration;
+  _bdHydrated = false;
+  _bdLoadedIdentity = null;
   let item = boardItems.find(i => i.id === id);
   if (!item) {
     // Message history, lineage, and deep links can point at an older terminal
@@ -27017,27 +31891,42 @@ async function openBoardDetail(id) {
     // link into a silent navigation to an unrelated board overview.
     try {
       const fetched = await apiCall(API + '/api/board/' + encodeURIComponent(id));
-      if (!fetched || !fetched.id) throw new Error('Task not found');
-      item = fetched;
-      boardItems.push(fetched);
+      if (!detailIdentityCurrent()) {
+        _boardDetailIdentityDiscard(id, detailGeneration, '');
+        return;
+      }
+      if (!fetched || !fetched.ok) throw new Error('Task not found');
+      const full = await fetched.json();
+      if (!detailIdentityCurrent()) {
+        _boardDetailIdentityDiscard(id, detailGeneration, full && full.id);
+        return;
+      }
+      if (!full || full.id !== id) {
+        _boardDetailIdentityDiscard(id, detailGeneration, full && full.id);
+        throw new Error('Task identity mismatch');
+      }
+      item = full;
+      boardItems.push(full);
     } catch (e) {
       showToast('Could not open ' + id + ': ' + (e.message || e), true);
       return;
     }
   }
+  if (!detailIdentityCurrent()) return;
   boardDetailId = id;
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
   // opens never edit.
-  _bdHydrated = (item.desc !== undefined);
-  _bdHydrate(id);
   const draft = _boardDrafts[id];
+  _bdActiveDirty = false;
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
+  _bdHydrated = false;
+  _bdHydrate(id);
   const titleEl = document.getElementById('bd-title');
-  titleEl.value = draft ? draft.title : item.title;
+  titleEl.value = _bdDraftField(draft, 'title', item.title);
   titleEl.style.height = 'auto';
   titleEl.style.height = titleEl.scrollHeight + 'px';
-  document.getElementById('bd-desc').value = draft ? draft.desc : (item.desc || '');
+  document.getElementById('bd-desc').value = _bdDraftField(draft, 'desc', item.desc || '');
   // History is now a TAB (below); the inline strip is retired.
   const logEl = document.getElementById('bd-log');
   if (logEl) { logEl.style.display = 'none'; }
@@ -27049,16 +31938,16 @@ async function openBoardDetail(id) {
   _renderDetailStatusBtns();
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
-  _populateSessionSelect('bd-session', draft ? draft.session : (item.session || ''));
-  _bdConfigureGo({ ...item, session: draft ? draft.session : item.session });
+  _populateSessionSelect('bd-session', _bdDraftSession(draft, item.session || ''));
+  _bdConfigureGo({ ...item, session: _bdDraftSession(draft, item.session) });
   const dueEl = document.getElementById('bd-due');
-  if (dueEl) { dueEl.value = draft ? (draft.due || '') : (item.due || ''); try { _dpSyncLabel(dueEl); } catch (e) {} }
+  if (dueEl) { dueEl.value = _bdDraftField(draft, 'due', item.due || '') || ''; try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl = document.getElementById('bd-due-time');
-  if (dueTimeEl) dueTimeEl.value = draft ? (draft.due_time || '') : (item.due_time || '');
+  if (dueTimeEl) dueTimeEl.value = _bdDraftField(draft, 'due_time', item.due_time || '') || '';
   const gateEl = document.getElementById('bd-gate');
-  if (gateEl) gateEl.value = (Array.isArray(item.gate) ? item.gate : []).join('\n');
+  if (gateEl) gateEl.value = _bdDraftField(draft, 'gate', item.gate || []).join('\n');
   boardDetailTab('preview');
-  _tagState['bd'] = [...(item.tags || [])];
+  _tagState['bd'] = [..._bdDraftField(draft, 'tags', item.tags || [])];
   _beTagRenderChips('bd');
   _beTagInputUpdate('bd');
   _bdRenderMeta(item);
@@ -27132,8 +32021,21 @@ function _bdRenderHistory(item) {
 function _bdRenderStatusBanner(item) {
   const el = document.getElementById('bd-status-banner');
   if (!el) return;
+  const terminal = /^(done|verified|discarded)$/i.test(String(item.status || ''));
   const evs = _bdParseHistory(item.log).filter(e => e.kind === 'status');
+  el.classList.toggle('bd-status-empty', !terminal && !evs.length);
   const sess = item.session || '';
+  if (terminal) {
+    // Terminal cards have one authoritative displayed status: the durable
+    // final outcome. Their audit log may legitimately receive late provider
+    // evidence, but that evidence is not a replacement for this summary.
+    const summary = String(item.last_result || 'No final outcome recorded.');
+    el.style.display = '';
+    el.innerHTML = '<div class="bd-sb-label">\uD83D\uDCCD Final outcome</div>'
+      + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(summary))) + '</div>'
+      + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
+    return;
+  }
   if (evs.length) {
     const last = evs[evs.length - 1];
     el.style.display = '';
@@ -27155,6 +32057,10 @@ function _bdCopyLink() {
 }
 
 function boardDetailTab(tab) {
+  _bdRecordTab = tab;
+  const recordTab = ['subtasks', 'files', 'related'].includes(tab);
+  const descriptionCard = document.getElementById('bd-description-card');
+  if (descriptionCard) descriptionCard.style.display = tab === 'preview' ? '' : 'none';
   const editBtn = document.getElementById('bd-tab-edit');
   const previewBtn = document.getElementById('bd-tab-preview');
   const histBtn = document.getElementById('bd-tab-history');
@@ -27167,13 +32073,20 @@ function boardDetailTab(tab) {
   const deleteBtn = document.getElementById('bd-delete');
   const title = document.getElementById('bd-title');
   if (!editBtn || !previewBtn || !desc || !preview) return;
-  [editBtn, previewBtn, histBtn].forEach(bt => bt && bt.classList.remove('active'));
+  document.querySelectorAll('#board-detail-overlay .board-detail-tab').forEach(bt => bt.classList.remove('active'));
   const editing = tab === 'edit';
   if (editFields) editFields.style.display = editing ? '' : 'none';
   if (editFooter) editFooter.style.display = editing ? '' : 'none';
   if (deleteBtn) deleteBtn.style.display = editing ? '' : 'none';
   if (title) title.readOnly = !editing;
-  if (meta) meta.style.display = tab === 'preview' ? '' : 'none';
+  if (meta) meta.style.display = tab === 'preview' || recordTab ? '' : 'none';
+  _bdFilterSections(tab);
+  if (recordTab) {
+    document.getElementById('bd-tab-' + tab).classList.add('active');
+    desc.style.display = 'none'; preview.style.display = 'none';
+    if (log) log.style.display = 'none';
+    return;
+  }
   if (tab === 'history') {
     if (histBtn) histBtn.classList.add('active');
     desc.style.display = 'none'; preview.style.display = 'none';
@@ -27196,22 +32109,21 @@ function boardDetailTab(tab) {
 }
 
 function _renderDetailStatusBtns() {
-  document.getElementById('bd-status-row').innerHTML = boardStatuses.map(s => {
-    const sty = statusStyle(s.id);
-    const isActive = boardDetailStatus === s.id;
-    const activeStyle = isActive ? 'background:' + sty.bg + ';color:' + sty.color + ';border-color:' + sty.border : '';
-    return '<button class="board-detail-status-btn" style="' + activeStyle + '" onclick="boardDetailSetStatus(\'' + s.id + '\')">' + esc(s.label) + '</button>';
-  }).join('');
+  const sty = statusStyle(boardDetailStatus);
+  document.getElementById('bd-status-row').innerHTML = '<label class="bd-status-control">Status <select id="bd-status-select" aria-label="Task status" style="background:' + sty.bg + ';color:' + sty.color + '" onchange="boardDetailSetStatus(this.value)">'
+    + boardStatuses.map(s => '<option value="' + esc(s.id) + '"' + (boardDetailStatus === s.id ? ' selected' : '') + '>' + esc(s.label) + '</option>').join('')
+    + '</select></label><button type="button" class="btn" onclick="boardDetailSave()">Move</button>';
 }
 
 function boardDetailSetStatus(st) {
+  if (boardDetailId && boardDetailStatus !== st) _bdActiveDirty = true;
   boardDetailStatus = st;
   _renderDetailStatusBtns();
 }
 
 function closeBoardDetail() {
   // Save unsaved edits as draft
-  if (boardDetailId) {
+  if (boardDetailId && _bdLoadedIdentity?.generation === _boardDetailOpenGeneration) {
     const item = boardItems.find(i => i.id === boardDetailId);
     if (item) {
       const t = (document.getElementById('bd-title').value || '').trim();
@@ -27224,8 +32136,8 @@ function closeBoardDetail() {
       const dueTimeEl2 = document.getElementById('bd-due-time');
       const due_time = dueTimeEl2 ? dueTimeEl2.value : (item.due_time || '');
       // Only save draft if something actually differs from saved state
-      if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '')) {
-        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time };
+      if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '') || _bdActiveDirty) {
+        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time, tags: [..._tagState['bd']], gate: (document.getElementById('bd-gate')?.value || '').split('\n').map(v => v.trim()).filter(Boolean), expect_rev: _bdLoadedIdentity.rev };
         _boardDraftsPersist();
       } else {
         delete _boardDrafts[boardDetailId];
@@ -27234,7 +32146,9 @@ function closeBoardDetail() {
     }
   }
   document.getElementById('board-detail-overlay').classList.remove('active');
+  _boardDetailOpenGeneration++;
   boardDetailId = null;
+  _bdActiveDirty = false;
   // Refresh peek issues panel if open
   if (_peekTab === 'issues') renderPeekIssues();
 }
@@ -27272,74 +32186,61 @@ function closeBoardDetail() {
   }, {passive: true});
 })();
 
+const _bdSaveRequests = new Set();
 async function boardDetailSave() {
-  if (!boardDetailId) return;
-  const title = document.getElementById('bd-title').value.trim();
-  if (!title) return;
-  const desc = document.getElementById('bd-desc').value.trim();
-
-  // NEVER WRITE AN EMPTY DESC OVER A CARD THAT HAS ONE (AMUX-2840).
-  //
-  // The modal used to fill this textarea from the LIST item. Once the poll
-  // moves to `slim=1` the list carries no desc, so the box would open empty and
-  // this save would blank the card — silently, irreversibly, and it would look
-  // like the board eating people's notes. _bdHydrate normally beats the user to
-  // it, but a slow or failed fetch must not turn into data loss.
-  //
-  // BOTH TERMS BELOW ARE LOAD-BEARING, one per mode, and neither alone is
-  // enough. Measured 2026-08-11: `desc_len` is served ONLY under slim=1, and
-  // `desc` only WITHOUT it — this comment previously claimed desc_len was in
-  // both, which would invite someone to simplify the test down to desc_len and
-  // silently disarm it in full mode, today's default. The failure that follows
-  // is not a crash, it is a blanked description.
-  //
-  // If either says the card has a description and we are about to send an empty
-  // one without having hydrated, refuse and retry the fetch.
-  {
-    const cur = boardItems.find(i => i.id === boardDetailId);
-    const hadDesc = cur && ((cur.desc_len || 0) > 0 || (cur.desc || '').length > 0);
-    if (!_bdHydrated && !desc && hadDesc) {
-      showToast && showToast('Still loading this card — not saving yet');
-      _bdHydrate(boardDetailId);
-      return;
-    }
+  const id = boardDetailId;
+  const generation = _boardDetailOpenGeneration;
+  const identity = _bdLoadedIdentity;
+  if (!id || !_bdHydrated || !identity || identity.id !== id || identity.generation !== generation || !Number.isInteger(identity.rev)) {
+    try { _bdAudit('card-save-refused', {id, generation, loaded_id:identity?.id, loaded_generation:identity?.generation, hydrated:_bdHydrated, verdict:'card_identity_unloaded', measured:true, n_considered:1}); } catch (_) {}
+    showToast('Still loading this card — not saving yet');
+    return false;
   }
-  const sel = document.getElementById('bd-session');
-  const worker = sel ? sel.value : undefined;
-  const gateEl = document.getElementById('bd-gate');
-  const gate = gateEl ? gateEl.value.split('\n').map(s => s.trim()).filter(Boolean) : [];
-  const _cur = boardItems.find(i => i.id === boardDetailId);
-  // Gate: if the status changed to a different status with an effective gate
-  // (using the possibly-just-edited override), confirm before saving.
-  let _gateAck = null;
-  if (_cur && boardDetailStatus !== (_cur.status || 'todo')) {
-    const ok = await _gateConfirm({ ..._cur, gate }, boardDetailStatus);
-    if (!ok) { const el = document.getElementById('bd-save-status'); if (el) el.textContent = ''; return; }
-    _gateAck = ok;
+  const value = key => (document.getElementById(key)?.value || '').trim();
+  const title = value('bd-title');
+  if (!title) return false;
+  if (_bdSaveRequests.has(id)) { showToast('Save already in progress'); return false; }
+  const readForm = () => ({ title: value('bd-title'), desc: value('bd-desc'), status: boardDetailStatus,
+    due: value('bd-due'), due_time: value('bd-due-time'), session: value('bd-session'),
+    tags: [..._tagState['bd']], gate: value('bd-gate').split('\n').map(v => v.trim()).filter(Boolean),
+    expect_rev: identity.rev });
+  const changes = readForm();
+  const submittedForm = JSON.stringify(changes);
+  const submittedDraft = { ...changes };
+  _boardDrafts[id] = submittedDraft;
+  _boardDraftsPersist();
+  _bdSaveRequests.add(id);
+  try {
+  const current = boardItems.find(i => i.id === id);
+  if (current && changes.status !== current.status) {
+    const ack = await _gateConfirm({ ...current, gate: changes.gate }, changes.status);
+    if (!ack) return false;
+    changes.gate_ack = true;
+    if (Array.isArray(ack)) changes.gate_checked = ack;
+  }
+  if (id !== boardDetailId || generation !== _boardDetailOpenGeneration) {
+    _boardDetailIdentityDiscard(id, generation, boardDetailId);
+    return false;
   }
   document.getElementById('bd-save-status').textContent = 'Saving...';
-  const dueInput = document.getElementById('bd-due');
-  const dueTimeInput = document.getElementById('bd-due-time');
-  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', tags: [..._tagState['bd']], gate };
-  if (worker !== undefined) changes.session = worker;
-  // The server enforces status gates: forward acknowledgement from _gateConfirm.
-  if (_gateAck) { changes.gate_ack = true; if (Array.isArray(_gateAck)) changes.gate_checked = _gateAck; }
-  await updateBoardItem(boardDetailId, changes);
-  delete _boardDrafts[boardDetailId];
-  document.getElementById('bd-save-status').textContent = 'Saved';
-  setTimeout(() => {
-    const el = document.getElementById('bd-save-status');
-    if (el) el.textContent = '';
-  }, 1500);
-  const item = boardItems.find(i => i.id === boardDetailId);
-  if (item) {
-    const meta = document.getElementById('bd-meta');
-    const parts = [];
-    if (item.creator) parts.push('From ' + esc(item.creator));
-    if (item.created) parts.push('Created ' + timeAgo(item.created));
-    if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
-    if (meta) meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  const saved = await updateBoardItem(id, changes);
+  if (saved && _boardDrafts[id] === submittedDraft) { delete _boardDrafts[id]; _boardDraftsPersist(); }
+  if (id !== boardDetailId || generation !== _boardDetailOpenGeneration) return saved;
+  const laterForm = readForm();
+  const newerEdits = JSON.stringify(laterForm) !== submittedForm;
+  document.getElementById('bd-save-status').textContent = saved
+    ? (newerEdits ? 'Earlier edit saved — newer changes not saved' : 'Saved')
+    : 'Not saved — draft retained; check Sync';
+  if (saved) {
+    _bdActiveDirty = newerEdits;
+    _bdLoadedIdentity = { id, generation, rev: saved.rev };
   }
+  if (newerEdits) {
+    _boardDrafts[id] = { ...laterForm, expect_rev: saved ? saved.rev : identity.rev };
+    _boardDraftsPersist();
+  }
+  return saved;
+  } finally { _bdSaveRequests.delete(id); }
 }
 
 async function boardDetailDelete() {
@@ -27369,8 +32270,9 @@ async function addBoardItem(title, desc, status, worker, groups, due, ownerType,
   });
   if (r) {
     const item = await r.json();
-    const idx = boardItems.findIndex(i => i.id === tempId);
-    if (idx >= 0) boardItems[idx] = item;
+    boardItems = boardItems.filter(i => i.id !== tempId && i.id !== item.id);
+    boardItems.push(item);
+    if (item.intake && item.intake.action !== 'create') showToast('Existing task ' + item.id + (item.intake.action === 'update' ? ' updated' : ' received the additional context'));
     saveBoardCache();
     renderBoard();
   }
@@ -27390,16 +32292,19 @@ async function updateBoardItem(id, changes) {
   if (idx >= 0) { boardItems[idx] = { ...boardItems[idx], ...changes, updated: Math.floor(Date.now() / 1000) }; }
   saveBoardCache();
   renderBoard();
+  if (prev && changes.expect_rev === undefined) changes = { ...changes, expect_rev: prev.rev };
   const r = await apiCall(API + '/api/board/' + id, {
     method: 'PATCH', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(changes)
   });
-  if (r) {
+  if (r && !_isLocallyQueued(r)) {
     const updated = await r.json();
+    if (!updated || updated.id !== id) { _writeError = 'Server returned the wrong card'; updateConnectionStatus(); return false; }
     const idx2 = boardItems.findIndex(i => i.id === id);
     if (idx2 >= 0) boardItems[idx2] = updated;
     saveBoardCache();
     renderBoard();
+    return updated;
   } else if (prev) {
     // Refused (apiCall has already shown the server's own words). Undo the
     // optimistic paint NOW rather than leaving a lie on screen until the next
@@ -27409,6 +32314,7 @@ async function updateBoardItem(id, changes) {
     saveBoardCache();
     renderBoard();
   }
+  return false;
 }
 
 async function deleteBoardItem(id) {
@@ -27427,6 +32333,472 @@ async function deleteBoardItem(id) {
     }
     saveBoardCache();
     renderBoard();
+  }
+}
+
+// ── Launch bar: auto fan-out from typed priorities ──
+// Launch configuration is a durable draft. A retry uses the exact accepted
+// request, so a network timeout cannot silently create a second coordinator.
+let _launchRestored = false;
+let _launchPending = null;
+let _launchBusy = false;
+let _launchOverrides = {};
+const _launchProviders = {claude:'Claude',codex:'Codex',gemini:'Gemini',ollama:'Ollama',muse:'Muse'};
+
+function _toggleLaunchBar() {
+  const body = document.getElementById('launch-body');
+  const caret = document.getElementById('launch-caret');
+  if (!body) return;
+  const open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : '';
+  if (caret) caret.classList.toggle('open', !open);
+  if (!open) {
+    _restoreLaunchDraft();
+    _populateLaunchSessions();
+    // Reuse the inventory request already in flight on a cold page load.
+    if (!sessions.length) fetchSessions().then(() => { if (body.style.display !== 'none') _populateLaunchSessions(); });
+    ['orchestrator','worker'].forEach(_launchLoadModels);
+    _renderLaunchOverrides();
+    _launchControlsState();
+  }
+}
+
+function _populateLaunchSessions() {
+  const sel = document.getElementById('launch-session');
+  if (!sel) return;
+  const current = sel.value || sel.dataset.saved || '';
+  const eligible = (typeof sessions !== 'undefined' ? sessions : []).filter(s => !s.ephemeral && !s.orchestrator && !s.archived && !s.isolated && s.lifecycle !== 'paused' && s.lifecycle !== 'archived');
+  sel.innerHTML = '<option value="">Choose a worker workspace…</option>' + eligible.map(s => '<option value="'+esc(s.name)+'">'+esc(s.name)+(s.dir ? ' · '+esc(s.dir) : '')+'</option>').join('');
+  if (_launchPending && current && !eligible.some(s=>s.name===current)) sel.add(new Option(current+' (saved launch workspace)',current));
+  sel.value = eligible.some(s=>s.name===current) || _launchPending ? current : '';
+}
+
+function _parsePriorities(text) {
+  return text.split('\n').map(line => line.replace(/^\s*[\d]+[.):\-]\s*/, '').replace(/^\s*[-*+]\s*/, '').trim()).filter(Boolean);
+}
+
+function _launchLines() {
+  const occurrences = new Map();
+  return _parsePriorities(document.getElementById('launch-input').value).map(text => {
+    const n = occurrences.get(text) || 0; occurrences.set(text,n+1);
+    return {text,key:JSON.stringify([text,n])};
+  });
+}
+
+function _saveLaunchDraft() {
+  const fields = {};
+  ['input','session','orchestrator-provider','orchestrator-model','worker-provider','worker-model'].forEach(id => { fields[id] = document.getElementById('launch-'+id)?.value || ''; });
+  try { localStorage.setItem('amux_launch_roles_v1',JSON.stringify({fields,overrides:_launchOverrides,pending:_launchPending})); } catch (_) {}
+}
+
+function _restoreLaunchDraft() {
+  if (_launchRestored) return;
+  _launchRestored = true;
+  try {
+    const d = JSON.parse(localStorage.getItem('amux_launch_roles_v1') || '{}');
+    for (const id of ['input','session','orchestrator-provider','orchestrator-model','worker-provider','worker-model']) {
+      const el = document.getElementById('launch-'+id);
+      if (el && typeof d.fields?.[id] === 'string') { el.value=d.fields[id]; if (id==='session') el.dataset.saved=d.fields[id]; }
+    }
+    _launchOverrides = d.overrides && typeof d.overrides==='object' ? d.overrides : {};
+    _launchPending = d.pending && Array.isArray(d.pending.priorities) && d.pending.orchestrator ? d.pending : null;
+  } catch (_) {}
+}
+
+async function _launchLoadModels(role) {
+  const provider = document.getElementById('launch-'+role+'-provider').value;
+  const list = document.getElementById('launch-'+role+'-models');
+  try {
+    const models = await _workerModelsFor(provider);
+    if (document.getElementById('launch-'+role+'-provider').value !== provider) return;
+    list.innerHTML = models.map(m=>'<option value="'+esc(m.id)+'"></option>').join('');
+  } catch (_) { list.innerHTML=''; } // An open model ID remains usable if discovery is down.
+}
+function _launchProviderChanged(role) {
+  document.getElementById('launch-'+role+'-model').value='';
+  _launchLoadModels(role); _saveLaunchDraft();
+}
+function _launchInputChanged() { _renderLaunchOverrides(); _saveLaunchDraft(); }
+function _renderLaunchOverrides() {
+  const host=document.getElementById('launch-worker-profiles');
+  if (!host) return;
+  host.innerHTML=_launchLines().slice(0,20).map((line,i)=>{
+    const profile=_launchOverrides[line.key] || {};
+    return '<div class="launch-worker-profile" data-key="'+esc(line.key)+'"><p>'+esc(line.text)+'</p><div class="launch-profile-fields">'
+      +'<label>Provider<select class="input" id="launch-override-provider-'+i+'" onchange="_launchOverrideChanged('+i+',true)"><option value="">Default</option>'
+      +Object.entries(_launchProviders).map(([key,label])=>'<option value="'+key+'"'+(profile.provider===key?' selected':'')+'>'+label+'</option>').join('')+'</select></label>'
+      +'<label>Model<input class="input" id="launch-override-model-'+i+'" value="'+esc(profile.model || '')+'" placeholder="Fan-out / provider default" oninput="_launchOverrideChanged('+i+')" spellcheck="false"></label></div></div>';
+  }).join('') || '<p>Add priorities above to configure individual workers.</p>';
+  _launchControlsState();
+}
+function _launchOverrideChanged(index, providerChanged=false) {
+  const provider=document.getElementById('launch-override-provider-'+index);
+  const model=document.getElementById('launch-override-model-'+index);
+  if (providerChanged) model.value='';
+  const key=provider.closest('.launch-worker-profile').dataset.key;
+  _launchOverrides[key]={...(provider.value ? {provider:provider.value} : {}),...(model.value.trim() ? {model:model.value.trim()} : {})};
+  _saveLaunchDraft();
+}
+function _launchControlsState() {
+  const locked=_launchBusy || !!_launchPending;
+  document.querySelectorAll('#launch-body input,#launch-body select,#launch-body textarea').forEach(el=>{el.disabled=locked;});
+  const btn=document.getElementById('launch-btn');
+  btn.disabled=_launchBusy;
+  btn.textContent=_launchBusy ? 'Launching…' : (_launchPending ? 'Retry launch' : 'Launch orchestration');
+  const reset=document.getElementById('launch-new');
+  reset.hidden=!_launchPending; reset.disabled=_launchBusy;
+}
+function _resetLaunchRequest() {
+  _launchPending=null; _launchOverrides={};
+  document.getElementById('launch-input').value='';
+  _renderLaunchOverrides(); _saveLaunchDraft(); _launchControlsState();
+}
+
+async function _launchFanOut() {
+  if (_launchBusy) return;
+  const statusEl=document.getElementById('launch-status');
+  if (!_launchPending) {
+    const lines=_launchLines();
+    if (!lines.length || lines.length>20) { showToast('Enter 1 to 20 priorities'); return; }
+    const source=document.getElementById('launch-session').value;
+    if (!source) { showToast('Choose the workspace for this orchestration'); return; }
+    const readProfile=role=>({provider:document.getElementById('launch-'+role+'-provider').value,model:document.getElementById('launch-'+role+'-model').value.trim()});
+    const workers=readProfile('worker');
+    _launchPending={launch_id:crypto.randomUUID(),title:lines.length===1 ? lines[0].text : 'Fan-out: '+lines[0].text+' (+'+(lines.length-1)+' more)',
+      priorities:lines.map(line=>Object.keys(_launchOverrides[line.key] || {}).length ? {text:line.text,profile:_launchOverrides[line.key]} : line.text),
+      parent_session:source,orchestrator:readProfile('orchestrator'),...workers};
+    _saveLaunchDraft();
+  }
+  const request=_launchPending;
+  _launchBusy=true; _launchControlsState();
+  statusEl.style.display=''; statusEl.className='launch-status';
+  statusEl.textContent='Creating one orchestrator and '+request.priorities.length+' fan-out workers…';
+  try {
+    const r=await fetch(API+'/api/board/launch',{method:'POST',headers:_authHeaders({'Content-Type':'application/json','X-Amux-Session':request.parent_session}),body:JSON.stringify(request),signal:AbortSignal.timeout(120000)});
+    const result=await r.json();
+    if (!r.ok) {
+      // Validation refusals created no launch; edits can be corrected. Ambiguous
+      // network/server failures retain the exact request for an idempotent retry.
+      if ([400,401,403,404].includes(r.status)) _launchPending=null;
+      throw new Error(result.error || 'Launch request failed');
+    }
+    const started=result.workers_started || 0;
+    const failures=result.failed || [];
+    const ready=result.complete === true || (result.orchestrator?.started === true && failures.length===0);
+    statusEl.className='launch-status'+(ready?'':' error');
+    statusEl.textContent=result.complete ? 'Orchestration already completed. Epic: '+result.epic : (ready?'Orchestrator ready. ':'Orchestrator: '+(result.orchestrator?.error || 'ready')+'. ')+started+'/'+request.priorities.length+' fan-out workers started. Epic: '+result.epic+(failures.length?' · '+failures.map(x=>x.name+': '+x.error).join('; '):'');
+    if (ready) { _launchPending=null; document.getElementById('launch-input').value=''; _launchOverrides={}; }
+    showToast(result.complete?'Orchestration completed: '+result.epic:ready?'Orchestration launched: '+result.epic:'Orchestration created; retry the unfinished starts');
+    fetchBoard(); fetchSessions();
+  } catch (e) {
+    statusEl.className='launch-status error'; statusEl.textContent='Launch needs attention: '+e.message;
+  } finally { _launchBusy=false; _saveLaunchDraft(); _launchControlsState(); }
+}
+
+function _peekFanOut() {
+  const sess = typeof peekSession !== 'undefined' ? peekSession : '';
+  switchView('board');
+  setTimeout(() => {
+    const body = document.getElementById('launch-body');
+    if (body && body.style.display === 'none') _toggleLaunchBar();
+    _populateLaunchSessions();
+    const sel = document.getElementById('launch-session');
+    if (sel && sess && !_launchPending) { sel.value = sess; _saveLaunchDraft(); }
+    const input = document.getElementById('launch-input');
+    if (input) input.focus();
+  }, 200);
+}
+
+// ── Peek fan-out tab: show ephemeral children of peeked session ──
+let _fanoutRefreshTimer = null;
+
+function _peekFanoutLoad() {
+  const list = document.getElementById('peek-fanout-list');
+  const stats = document.getElementById('peek-fanout-stats');
+  if (!list || !peekSession) return;
+
+  const allSess = typeof sessions !== 'undefined' ? sessions : [];
+  const children = allSess.filter(s => s.ephemeral && s.ephemeral_parent === peekSession);
+
+  if (stats) stats.textContent = children.length + ' worker' + (children.length !== 1 ? 's' : '');
+
+  if (!children.length) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:.82rem;padding:8px 0;">No active fan-out workers for this session.</div>';
+    return;
+  }
+
+  let html = '';
+  children.forEach(child => {
+    const statusCls = child.status === 'busy' ? 'running' : (child.status === 'idle' ? 'idle' : 'done');
+    const statusLabel = child.status || 'unknown';
+    const cardId = child.runtime_board && child.runtime_board.card_id ? child.runtime_board.card_id : '';
+    const cardStatus = child.runtime_board && child.runtime_board.runtime_status ? child.runtime_board.runtime_status : '';
+    html += '<div class="fanout-worker-row">'
+      + '<span class="fanout-worker-name" onclick="openPeek(\'' + escJs(child.name) + '\')">' + esc(child.name) + '</span>'
+      + '<span class="bd-fanout-status ' + statusCls + '">' + esc(statusLabel) + '</span>'
+      + _fanoutStartBtn(child.name, !!child.running)
+      + (cardId ? '<span class="fanout-worker-card" onclick="_openIssue(\'' + escJs(cardId) + '\')" style="cursor:pointer;text-decoration:underline;">' + esc(cardId) + (cardStatus ? ' (' + esc(cardStatus) + ')' : '') + '</span>' : '')
+      + '</div>';
+  });
+  list.innerHTML = html;
+}
+
+function _updateFanoutTabVisibility() {
+  const tab = document.getElementById('peek-tab-fanout');
+  const countBadge = document.getElementById('peek-tab-fanout-count');
+  if (!tab) return;
+
+  const allSess2 = typeof sessions !== 'undefined' ? sessions : [];
+  const children = allSess2.filter(s => s.ephemeral && s.ephemeral_parent === peekSession);
+  const hasChildren = children.length > 0;
+
+  tab.style.display = hasChildren ? '' : 'none';
+  if (countBadge) countBadge.textContent = hasChildren ? String(children.length) : '';
+}
+
+// ── Enhanced subtasks in board detail with fan-out worker status ──
+function _bdRenderFanoutChildren(item) {
+  const children = Array.isArray(item.children) ? item.children : [];
+  if (!children.length) return '';
+
+  const allSess3 = typeof sessions !== 'undefined' ? sessions : [];
+  const sessionMap = {};
+  allSess3.forEach(s => { sessionMap[s.name] = s; });
+
+  let html = '<section class="bd-card-section"><h4>Subtasks (' + children.length + ')</h4>';
+  children.forEach(c => {
+    const childSession = c.session || '';
+    const sess = sessionMap[childSession];
+    const isEphemeral = sess && sess.ephemeral;
+    const workerStatus = sess ? (sess.status || 'unknown') : '';
+    const statusCls = workerStatus === 'busy' ? 'running' : (workerStatus === 'idle' ? 'idle' : 'done');
+
+    html += '<div class="bd-fanout-child">';
+    html += _bdTaskLink(c.id, c.title);
+    html += '<span class="status-badge">' + esc(c.status || 'todo') + '</span>';
+    if (isEphemeral && workerStatus) {
+      html += '<span class="bd-fanout-status ' + statusCls + '" title="Worker: ' + esc(childSession) + '">' + esc(workerStatus) + '</span>';
+      html += '<span class="bd-fanout-worker" onclick="openPeek(\'' + escJs(childSession) + '\')">' + esc(childSession) + '</span>';
+      html += _fanoutStartBtn(childSession, !!(sess && sess.running));
+    } else if (childSession) {
+      // The card still names a worker, but it is not in the live sessions
+      // list at all -- a reaped/expired ephemeral worker (AMUX-4682, Ethan
+      // 2026-09-18: "the ephemeral worker was expired again"). Give it the
+      // SAME Start affordance rather than rendering a dead label: doStart's
+      // own /start call re-provisions it from the still-registered env file,
+      // or fails honestly (via showAlert) if that is gone too.
+      html += '<span style="font-size:.72rem;color:var(--dim);">' + esc(childSession) + '</span>';
+      html += _fanoutStartBtn(childSession, false);
+    }
+    html += '</div>';
+  });
+  html += '</section>';
+  return html;
+}
+
+// ── Global Orchestrations: coordinators and their fan-out workers ──
+let _orchTimer = null;
+let _orchFilter = 'all';
+let _orchData = null;
+let _orchLoading = false;
+
+function _orchSetFilter(f) {
+  _orchFilter = f;
+  document.querySelectorAll('.orch-filter-pill').forEach(p => {
+    p.classList.toggle('active', p.dataset.filter === f);
+  });
+  if (_orchData) _orchRender(_orchData);
+}
+
+// A fan-out worker (epic-level or child-level) that is not currently running
+// gets a Start button beside its name, everywhere its name is rendered
+// clickable (Ethan, 2026-09-18: "I should be able to start workers that have
+// been paused, archived or expired... from the accordions"). Reuses doStart,
+// the same function the normal Sessions list's Start button calls -- it polls
+// for the session to come up and surfaces a real error via showAlert rather
+// than silently doing nothing, so a worker that is genuinely gone (no env
+// file left to start from, e.g. a reaped ephemeral worker) fails honestly
+// instead of the button looking broken.
+function _fanoutStartBtn(name, running) {
+  if (running !== false) return '';
+  return '<button class="bd-fanout-start-btn" onclick="event.stopPropagation();doStart(\'' + escJs(name) + '\');" title="Start ' + esc(name) + '">&#x25B6; Start</button>';
+}
+
+async function _orchLoad() {
+  const el = document.getElementById('orch-list');
+  if (!el || _orchLoading) return;
+  _orchLoading = true;
+  if (!_orchData) el.innerHTML = '<div role="status" style="padding:12px">Loading orchestration boards…</div>';
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 15000);
+  // Share the normal inventory request. Its cold runtime probes must never
+  // hold up the board, or create another full-fleet request from this view.
+  const activity = fetchSessions();
+  try {
+    const boardR = await fetch(API + '/api/board/orchestrations', {signal:controller.signal});
+    if (!boardR.ok) throw new Error('Board request failed');
+    const allCards = await boardR.json();
+    _orchBuild(allCards, sessions);
+    activity.then(() => {
+      if (activeView === 'orchestrations' && _orchData?.source === allCards) _orchBuild(allCards, sessions);
+    }).catch(e => console.warn('orchestration_activity_refresh_failed', e));
+  } catch (e) {
+    console.warn('orchestration_load_failed', e);
+    el.innerHTML = '<div role="alert" style="color:var(--error);padding:8px;">Could not load orchestrations: ' + esc(e.name === 'AbortError' ? 'request timed out' : e.message) + ' <button onclick="_orchLoad()">Retry</button></div>';
+  } finally { clearTimeout(deadline); _orchLoading = false; }
+  clearTimeout(_orchTimer);
+  if (activeView === 'orchestrations') _orchTimer = setTimeout(_orchLoad, 10000);
+}
+
+function _orchBuild(allCards, allSess) {
+  if (!allCards.measured || !Array.isArray(allCards.cards)) throw new Error('Orchestration boards were not measured');
+  const sessMap = {};
+  (allCards.workers || []).forEach(s => { sessMap[s.name] = s; });
+  (Array.isArray(allSess) ? allSess : []).forEach(s => { sessMap[s.name] = {...sessMap[s.name],...s}; });
+  (allCards.ephemeral_workers || []).forEach(name => {
+    if (!sessMap[name]) sessMap[name] = {name,ephemeral:true,running:null,lifecycle:'unknown'};
+  });
+  const cards = allCards.cards;
+  const byId = new Map(cards.map(c => [c.id,c]));
+  const byWorker = new Map();
+  cards.forEach(c => { if (!byWorker.has(c.session)) byWorker.set(c.session,[]); byWorker.get(c.session).push(c); });
+  const groups = new Map();
+  const addGroup = (name, orphan = false) => {
+    const id = (orphan ? 'worker:' : 'orchestrator:') + name;
+    if (!groups.has(id)) groups.set(id,{id,session:name,_workerOnly:orphan,workerNames:[],epics:[],cards:[]});
+    return groups.get(id);
+  };
+  // Worker configuration is the membership authority. Ordinary board epics
+  // never create groups, and extra tasks never manufacture extra workers.
+  Object.values(sessMap).filter(s => s.orchestrator || s.role === 'orchestrator').forEach(s => addGroup(s.name));
+  Object.values(sessMap).filter(s => s.ephemeral).forEach(s => {
+    const parent = s.ephemeral_parent && s.ephemeral_parent !== s.name ? s.ephemeral_parent : null;
+    const group = addGroup(parent || s.name, !parent);
+    if (!group.workerNames.includes(s.name)) group.workerNames.push(s.name);
+  });
+  const orchEpics = [...groups.values()];
+  orchEpics.forEach(group => {
+    group.workerNames.sort((a,b) => a.localeCompare(b));
+    const own = sessMap[group.session];
+    const names = new Set(group.workerNames);
+    if (own?.orchestrator) names.add(group.session);
+    const owned = cards.filter(c => names.has(c.session));
+    const epics = new Map();
+    owned.forEach(card => {
+      const visited = new Set();
+      for (let c = card; c && !visited.has(c.id); c = byId.get(c.epic)) {
+        visited.add(c.id);
+        if (c.type === 'epic' && c.session === group.session) epics.set(c.id,c);
+      }
+    });
+    group.epics = [...epics.values()];
+    group.cards = owned.filter(c => c.type !== 'epic');
+    group.title = group.epics.length === 1 ? group.epics[0].title : (group._workerOnly ? 'Fan-out: ' : 'Orchestration: ') + group.session;
+    group.updated = Math.max(0,...owned.map(c => c.updated || 0));
+    const members = [...names].map(n => sessMap[n]).filter(Boolean);
+    if (!group._workerOnly && own && !names.has(group.session)) members.push(own);
+    const inactive = s => s.archived || ['paused','archived','expired'].includes(s.lifecycle);
+    if (members.length && members.every(s => s.archived || s.lifecycle === 'archived')) group._orchGroup = 'archived';
+    else if (members.length && members.every(s => s.lifecycle === 'expired')) group._orchGroup = 'expired';
+    else if (members.length && members.every(inactive) && members.some(s => s.lifecycle === 'paused')) group._orchGroup = 'paused';
+    else group._orchGroup = 'active';
+  });
+  _orchData = {orchEpics,sessMap,byWorker,source:allCards};
+  _orchRenderFilters(orchEpics);
+  _orchRender(_orchData);
+}
+
+function _orchRenderFilters(epics) {
+  const fb = document.getElementById('orch-filters');
+  if (!fb) return;
+  const counts = { all: epics.length, active: 0, paused: 0, archived: 0, expired: 0 };
+  epics.forEach(e => { counts[e._orchGroup] = (counts[e._orchGroup] || 0) + 1; });
+  const pills = [
+    { key: 'all', label: 'All' },
+    { key: 'active', label: 'Active' },
+    { key: 'paused', label: 'Paused' },
+    { key: 'archived', label: 'Archived' },
+    { key: 'expired', label: 'Expired' },
+  ];
+  fb.innerHTML = pills.map(p =>
+    '<button class="orch-filter-pill' + (_orchFilter === p.key ? ' active' : '') + '" data-filter="' + p.key + '" onclick="_orchSetFilter(\'' + p.key + '\')">'
+    + esc(p.label) + ' <span class="orch-filter-count">' + (counts[p.key] || 0) + '</span></button>'
+  ).join('');
+}
+
+const _orchExpanded = new Set();
+let _orchActivitySignature = '';
+function _orchToggle(id) {
+  if (_orchExpanded.has(id)) _orchExpanded.delete(id); else _orchExpanded.add(id);
+  if (_orchData) _orchRender(_orchData);
+}
+
+function _orchModelLabel(worker) {
+  if (!worker) return 'Model unknown';
+  const provider=worker.profile?.provider || worker.provider || '';
+  const model=worker.profile?.model || worker.model || worker.active_model || 'Provider default';
+  return (provider ? provider+' · ' : '')+model;
+}
+
+function _orchRender(data) {
+  const el = document.getElementById('orch-list');
+  if (!el || !data) return;
+  const {orchEpics,sessMap,byWorker} = data;
+  const filtered = orchEpics.filter(g => _orchFilter === 'all' || g._orchGroup === _orchFilter);
+  if (!filtered.length) {
+    el.innerHTML = '<div role="status" class="orch-empty">'+(_orchFilter === 'all' ? 'No orchestrations or fan-out workers yet. Use + Launch to create one.' : 'No '+esc(_orchFilter)+' orchestrations.')+'</div>';
+    return;
+  }
+  const order = {active:0,paused:1,archived:2,expired:3};
+  filtered.sort((a,b) => order[a._orchGroup]-order[b._orchGroup] || b.updated-a.updated || a.id.localeCompare(b.id));
+  const taskLink = c => '<button type="button" class="orch-task-link" onclick="event.stopPropagation();switchView(\'board\');setTimeout(function(){openBoardDetail(\''+escJs(c.id)+'\')},300)">'+esc(c.id)+' · '+esc(c.title)+'</button>';
+  const progress = rows => rows.length ? rows.filter(c => c.execution_terminal === true).length+'/'+rows.length+' terminal' : 'No tasks yet';
+  const activity = [];
+  const workerRow = (name,role,group) => {
+    const worker = sessMap[name];
+    const rows = byWorker.get(name) || [];
+    // Ordinary parent workers may have unrelated board work; only a dedicated
+    // coordinator's whole board belongs to this orchestration.
+    const board = role === 'Orchestrator' && !worker?.orchestrator ? rows.filter(c => group.epics.some(e => e.id === c.id)) : rows;
+    const tasks = board.filter(c => c.type !== 'epic');
+    const linkedId = _runtimeBoardCardId(worker);
+    const current = tasks.find(c => c.id === (linkedId || worker?.task_board_id));
+    const active = !!current && !current.execution_terminal && _workerHasLiveActivity(worker) && linkedId === current.id;
+    activity.push({name,card:current?.id || '',active});
+    const key = 'tasks:'+group.id+':'+name;
+    const expanded = _orchExpanded.has(key);
+    const lifecycle = worker?.lifecycle || 'unknown';
+    const status = ['paused','archived','expired'].includes(lifecycle) ? lifecycle : worker?.status || (worker?.running === false ? 'stopped' : worker?.running ? 'running' : worker ? 'status pending' : 'worker unavailable');
+    let html = '<div class="orch-worker'+(active?' working-now':'')+'" data-orch-worker="'+esc(name)+'">';
+    html += '<div class="orch-worker-heading"><span class="orch-worker-role">'+role+'</span><button type="button" class="orch-worker-name" onclick="openPeek(\''+escJs(name)+'\')">'+esc(name)+'</button><span class="orch-worker-status">'+esc(status)+'</span>'+_fanoutStartBtn(name,worker?.running)+'</div>';
+    html += '<div class="orch-worker-meta"><span class="orch-role-profile">'+esc(_orchModelLabel(worker))+'</span><span>'+progress(tasks)+'</span>';
+    if (worker?.worktree_integration?.status) html += '<span class="orch-integration" title="'+esc(worker.worktree_integration.detail || '')+'">'+esc(worker.worktree_integration.status.replace(/_/g,' '))+'</span>';
+    if (worker?.worktree_active) html += '<span class="orch-worktree" title="'+esc(worker.branch || 'Detached worktree')+'">'+esc(worker.branch || 'Detached worktree')+'</span>';
+    html += '</div>';
+    if (current) html += '<div class="orch-active-task"><strong>'+(active?'Working now':'Current task')+'</strong> '+taskLink(current)+'</div>';
+    if (board.length) {
+      html += '<button type="button" class="orch-tasks-toggle" aria-expanded="'+expanded+'" onclick="_orchToggle(\''+escJs(key)+'\')">'+(expanded?'Hide':'Show')+' board tasks ('+board.length+')</button>';
+      if (expanded) html += '<div class="orch-worker-tasks">'+board.map(c => '<div class="orch-task'+(active && current.id===c.id?' working-now':'')+'">'+taskLink(c)+'<span class="status-badge '+esc(c.status || 'todo')+'">'+esc(c.status || 'todo')+'</span></div>').join('')+'</div>';
+    } else html += '<div class="orch-worker-empty">'+(role==='Orchestrator'?'No coordination tasks yet':'No board tasks yet')+'</div>';
+    return html+'</div>';
+  };
+  el.innerHTML = '<div class="orch-tree">'+filtered.map(group => {
+    const collapsed = _orchExpanded.has('collapsed:'+group.id);
+    let html = '<section class="orch-node '+group._orchGroup+'" data-orch-id="'+esc(group.id)+'">';
+    html += '<button type="button" class="orch-node-header" aria-expanded="'+!collapsed+'" onclick="_orchToggle(\'collapsed:'+escJs(group.id)+'\')"><span class="orch-node-chevron">'+(collapsed?'▸':'▾')+'</span><span class="orch-node-title">'+esc(group.title)+'</span><span class="orch-node-count">'+group.workerNames.length+' fan-out'+(group.workerNames.length===1?'':'s')+' · '+progress(group.cards)+'</span><span class="orch-worker-status">'+esc(group._orchGroup)+'</span></button>';
+    if (!collapsed) {
+      if (group.epics.length) html += '<div class="orch-epic-links">'+group.epics.map(taskLink).join('')+'</div>';
+      if (!group._workerOnly) html += workerRow(group.session,'Orchestrator',group);
+      html += '<div class="orch-workers">'+group.workerNames.map(name => workerRow(name,'Fan-out',group)).join('')+'</div>';
+      if (!group.workerNames.length) html += '<div class="orch-empty">No fan-out workers provisioned yet.</div>';
+    }
+    return html+'</section>';
+  }).join('')+'</div>';
+  const signature = JSON.stringify(activity);
+  if (signature !== _orchActivitySignature) {
+    _orchActivitySignature = signature;
+    amuxTrack('orchestration_activity_projection', {measured:true,n_considered:activity.length,
+      working_now:activity.filter(a=>a.active).length,retained_task_links:activity.filter(a=>a.card && !a.active).length});
   }
 }
 
@@ -27511,6 +32883,7 @@ async function _gateConfirm(item, targetStatusId) {
   return new Promise(resolve => {
     const label = ((typeof boardStatuses !== 'undefined' ? boardStatuses : []).find(x => x.id === targetStatusId) || {}).label || targetStatusId;
     const bg = document.createElement('div');
+    bg.className = 'amux-dialog-backdrop';
     bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
     const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const rows = gate.map((g,i) => '<label style="display:flex;gap:9px;align-items:flex-start;padding:7px 4px;cursor:pointer;font-size:0.9rem;color:var(--text);"><input type="checkbox" class="_gate-chk" data-i="'+i+'" style="width:auto;margin-top:2px;accent-color:var(--accent);"><span>'+esc(g)+'</span></label>').join('');
@@ -27563,6 +32936,7 @@ function editStatusGate(statusId) {
   const cur = (s && Array.isArray(s.gate)) ? s.gate : [];
   const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const bg = document.createElement('div');
+  bg.className = 'amux-dialog-backdrop';
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
   box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
@@ -27604,6 +32978,7 @@ function editSessionGate(worker, statusId) {
   const cur = hasOverride ? sessionGates[worker][statusId] : _statusGateDefault(statusId);
   const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const bg = document.createElement('div');
+  bg.className = 'amux-dialog-backdrop';
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
   box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
@@ -28078,8 +33453,19 @@ async function deleteEvent(id) {
 }
 
 async function _tunnelStatus() {
-  try { const r = await fetch(API + '/api/tunnel/status'); return await r.json(); }
-  catch(e) { return { error: String(e) }; }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const r = await fetch(API + '/api/tunnel/status', {signal:controller.signal});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } catch(e) {
+    const reason = controller.signal.aborted ? 'timeout' : 'request_failed';
+    console.warn('[amux] tunnel status unavailable', reason);
+    fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:'tunnel-status-unavailable',measured:true,n_considered:1,reason,ver:APP_VER})}).catch(() => {});
+    return {error:'Tunnel status unavailable — try again.', why_unmeasured:reason};
+  } finally { clearTimeout(timer); }
 }
 
 // Tunnel panel in the Settings dropdown (the discoverable home for the proxy).
@@ -28142,6 +33528,7 @@ function _proxyOpenForm() {
   document.getElementById('proxy-form-scheme').value = 'http';
   document.getElementById('proxy-form-title').textContent = 'New proxy';
   document.getElementById('proxy-form-overlay').style.display = 'flex';
+  document.getElementById('proxy-form-overlay').classList.add('active');
   setTimeout(() => document.getElementById('proxy-form-name').focus(), 50);
 }
 function _proxyEdit(id, name, port, scheme) {
@@ -28151,8 +33538,9 @@ function _proxyEdit(id, name, port, scheme) {
   document.getElementById('proxy-form-scheme').value = scheme || 'http';
   document.getElementById('proxy-form-title').textContent = 'Edit proxy';
   document.getElementById('proxy-form-overlay').style.display = 'flex';
+  document.getElementById('proxy-form-overlay').classList.add('active');
 }
-function _proxyCloseForm() { document.getElementById('proxy-form-overlay').style.display = 'none'; }
+function _proxyCloseForm() { const overlay = document.getElementById('proxy-form-overlay'); overlay.classList.remove('active'); overlay.style.display = 'none'; }
 async function _proxySaveForm(btn) {
   const id = document.getElementById('proxy-form-id').value;
   const name = document.getElementById('proxy-form-name').value.trim();
@@ -28265,7 +33653,9 @@ async function _renderIcalBody(box) {
 
   // ── Public tunnel (amux cloud) ──
   html += '<div style="border:1px solid var(--border);border-radius:8px;padding:0.7rem 0.8rem;margin-bottom:0.9rem;background:var(--card,rgba(255,255,255,0.02));">';
-  if (tun && tun.running && tun.url) {
+  if (tun?.error) {
+    html += '<p role="status" style="color:var(--dim);font-size:0.82rem;">Tunnel status is unavailable. Download the calendar below, or close and try again.</p>';
+  } else if (tun && tun.running && tun.url) {
     html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:0.45rem;"><span style="width:8px;height:8px;border-radius:50%;background:#3fb950;flex-shrink:0;"></span><strong style="font-size:0.85rem;">Public tunnel active</strong><span style="color:var(--dim);font-size:0.72rem;margin-left:auto;">' + (tun.requests || 0) + ' reqs</span></div>';
     html += '<code style="display:block;background:var(--bg);padding:0.45rem 0.6rem;border-radius:6px;font-size:0.73rem;word-break:break-all;margin-bottom:0.5rem;">' + esc_url(tunUrl) + '</code>';
     html += '<div style="display:flex;gap:0.4rem;">';
@@ -28307,7 +33697,8 @@ function showIcalInfo() {
   box.setAttribute('data-ical-box', '1');
   box.className = 'amux-modal';
   box.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1.4rem;max-width:440px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4);--modal-pad:1.4rem;';
-  box.innerHTML = '<p style="color:var(--dim);font-size:0.85rem;margin:0;">Loading…</p>';
+  box.innerHTML = '<p role="status" style="color:var(--dim);font-size:0.85rem;margin:0;">Loading…</p>'
+    + '<div class="amux-modal-foot"><button class="btn" onclick="this.closest(\'[data-ical-modal]\').remove()">Close</button></div>';
   modal.setAttribute('data-ical-modal', '1');
   modal.appendChild(box);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
@@ -29006,6 +34397,7 @@ function gpChipToInput(name, text) {
   const inp = document.getElementById(_gpSafeId(name) + '-input');
   if (!inp) return;
   inp.value = text;
+  _draftInputChanged(inp);
   inp.focus({ preventScroll: true });
   autoGrow(inp);
 }
@@ -29033,10 +34425,12 @@ async function sendGridCmd(name) {
     _submitSuggestion(name, false, 'Enter');
     return;
   }
-  cmdHistoryAdd(text);
+  const identity = {};
   inp.value = '';
   autoGrow(inp);
-  await doSend(name, text);
+  const result = await doSend(name, text, identity);
+  if (!['sent','queued'].includes(result)) { inp.value = text; autoGrow(inp); return; }
+  cmdHistoryAdd(text, {session:name, msg_id:identity.msg_id});
   inp.style.borderColor = 'var(--green)';
   setTimeout(() => { inp.style.borderColor = ''; }, 400);
   setTimeout(() => _updateGridPane(name), 500);
@@ -29136,10 +34530,12 @@ const _idb = (() => {
   let db = null;
   const open = () => new Promise((resolve, reject) => {
     if (db) return resolve(db);
-    const req = indexedDB.open('amux', 4);
+    const req = indexedDB.open('amux', 5);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
+      if (!d.objectStoreNames.contains('uploads')) d.createObjectStore('uploads', {keyPath:'id'});
+      if (!d.objectStoreNames.contains('uploadChunks')) d.createObjectStore('uploadChunks', {keyPath:['upload', 'index']});
       if (!d.objectStoreNames.contains('issues')) {
         const s = d.createObjectStore('issues', { keyPath: 'id' });
         s.createIndex('by_updated', 'updated');
@@ -29162,11 +34558,71 @@ const _idb = (() => {
     tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
     fn(tx.objectStore(store));
   })).catch(() => {});
+  const transaction = (store, write) => open().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction(store, 'readwrite');
+    tx.oncomplete = () => resolve();
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error('Storage transaction aborted'));
+    try { write(tx.objectStore(store)); }
+    catch (error) { tx.abort(); reject(error); }
+  }));
+  let activeSaves = 0;
+  const waitingSaves = [];
+  const saveSlot = async job => {
+    if (activeSaves < 2) activeSaves++;
+    else await new Promise(resolve => waitingSaves.push(resolve));
+    try { return await job(); }
+    finally { const next = waitingSaves.shift(); if (next) next(); else activeSaves--; }
+  };
+  const removeUpload = id => open().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction(['uploads', 'uploadChunks'], 'readwrite');
+    tx.oncomplete = () => resolve();
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error('File removal aborted'));
+    tx.objectStore('uploads').delete(id);
+    tx.objectStore('uploadChunks').delete(IDBKeyRange.bound([id, 0], [id, Number.MAX_SAFE_INTEGER]));
+  }));
   return {
-    set: (key, val) => open().then(d => {
-      const tx = d.transaction('kv', 'readwrite');
-      tx.objectStore('kv').put(val, key);
-    }).catch(() => {}),
+    // Cache callers are best-effort; pending work uses the strict methods below.
+    set: (key, val) => transaction('kv', os => os.put(val, key)).catch(error => _uploadStorageError('cache-write', error)),
+    update: (key, mutate) => transaction('kv', os => {
+      const request = os.get(key);
+      request.onsuccess = () => {
+        try { os.put(mutate(request.result), key); }
+        catch (error) { os.transaction.abort(); }
+      };
+    }),
+    putUpload: (value, progress) => saveSlot(async () => {
+      const {file, ...metadata} = value;
+      // Never read a whole large File into RAM. Partial saves have no committed
+      // metadata row, so they cannot be mistaken for a recoverable attachment.
+      try {
+        for (let index = 0; index < metadata.totalChunks; index++) {
+          const bytes = await file.slice(index * CHUNK_SIZE, Math.min((index + 1) * CHUNK_SIZE, file.size)).arrayBuffer();
+          await transaction('uploadChunks', os => os.put({upload:value.id, index, bytes}));
+          if (progress) progress(index + 1, metadata.totalChunks);
+        }
+        await transaction('uploads', os => os.put({...metadata, size:file.size, mime:file.type}));
+      } catch (error) {
+        await removeUpload(value.id).catch(() => {});
+        throw error;
+      }
+    }),
+    updateUpload: (id, patch) => transaction('uploads', os => {
+      const request = os.get(id);
+      request.onsuccess = () => { if (request.result) os.put({...request.result, ...patch}); };
+    }),
+    deleteUpload: id => removeUpload(id),
+    uploadChunk: (id, index) => open().then(d => new Promise((resolve, reject) => {
+      const tx = d.transaction('uploadChunks', 'readonly');
+      const request = tx.objectStore('uploadChunks').get([id, index]);
+      tx.oncomplete = () => request.result ? resolve(request.result.bytes) : reject(new Error('Saved file chunk is missing'));
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error('File read aborted'));
+    })),
+    getUploads: () => open().then(d => new Promise((resolve, reject) => {
+      const tx = d.transaction('uploads', 'readonly');
+      const request = tx.objectStore('uploads').getAll();
+      tx.oncomplete = () => resolve(request.result);
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error('Attachment read aborted'));
+    })),
     get: (key) => open().then(d => new Promise((resolve) => {
       const tx = d.transaction('kv', 'readonly');
       const req = tx.objectStore('kv').get(key);
@@ -29177,6 +34633,14 @@ const _idb = (() => {
       const tx = d.transaction('kv', 'readwrite');
       tx.objectStore('kv').delete(key);
     }).catch(() => {}),
+    // Detail snapshots use the existing mirror and wait for the durable commit.
+    putIssue: row => transaction('issues', os => os.put(row)),
+    getIssue: id => open().then(d => new Promise((resolve, reject) => {
+      const tx = d.transaction('issues', 'readonly');
+      const request = tx.objectStore('issues').get(id);
+      tx.oncomplete = () => resolve(request.result || null);
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error('Offline card read aborted'));
+    })).catch(() => null),
     // Apply delta: upsert live items, remove soft-deleted ones from local mirror
     applyIssueDelta: (issues) => _txw('issues', os => {
       issues.forEach(item => { if (item.deleted) os.delete(item.id); else os.put(item); });
@@ -29342,14 +34806,29 @@ if (!boardItems.length) {
   });
 }
 
+// IDB fallback for sessions: if localStorage was purged (iOS, or board cache
+// blew quota and took sessions with it), restore from the IDB mirror.
+if (!sessions.length) {
+  _idb.get('sessions_cache').then(data => {
+    if (Array.isArray(data) && data.length && !sessions.length) {
+      sessions = data;
+      lastSessionsJSON = JSON.stringify(data);
+      render();
+      updateConnectionStatus();
+    }
+  });
+}
+
 // Delta sync: call /api/sync?since=last_sync_ts on startup to catch any missed updates
 // Runs after queue replay so server has our writes before we read
 async function _runDeltaSync() {
   try {
     const since = (await _idb.get('last_sync_ts')) || 0;
     const r = await fetch(API + '/api/sync?since=' + since);
-    if (!r.ok) return;
+    if (!r.ok) throw new Error(await _apiErrText(r));
     const data = await r.json();
+    _syncReadError = '';
+    updateConnectionStatus();
     if (data.issues && data.issues.length) {
       // Apply delta to in-memory boardItems
       data.issues.forEach(item => {
@@ -29379,6 +34858,8 @@ async function _runDeltaSync() {
     else if (activeView === 'calendar') renderCalendar();
     _dbgLog('Delta sync: +' + (data.issues || []).length + ' issue changes');
   } catch(e) {
+    _syncReadError = String(e.message || e);
+    updateConnectionStatus();
     _dbgLog('Delta sync failed: ' + e.message);
   }
 }
@@ -29396,6 +34877,51 @@ let _pollTimer = null;
 let _invBoardTimer = null;
 let _invSessTimer = null;
 let _invMessagesTimer = null;
+let _cdcSeq = 0;
+async function _cdcBoardUpdate() {
+  if (!_cdcSeq) { fetchBoard(); return; }
+  try {
+    const r = await fetch(API + '/api/board/changes?since_seq=' + _cdcSeq + '&limit=500');
+    if (!r.ok) { fetchBoard(); return; }
+    const data = await r.json();
+    const changes = data.changes || [];
+    if (data.cursor) _cdcSeq = data.cursor;
+    if (!changes.length) return;
+    // For each changed row_id, refetch that single card and patch boardItems
+    const ids = [...new Set(changes.map(c => c.row_id))];
+    let needsFullFetch = false;
+    for (const id of ids) {
+      const op = changes.filter(c => c.row_id === id).pop();
+      if (op && op.operation === 'DELETE') {
+        boardItems = boardItems.filter(item => item.id !== id);
+        _boardSnapshotEpoch++;
+        continue;
+      }
+      try {
+        const cr = await fetch(API + '/api/board/' + encodeURIComponent(id));
+        if (cr.status === 404) {
+          boardItems = boardItems.filter(item => item.id !== id);
+          _boardSnapshotEpoch++;
+          continue;
+        }
+        if (!cr.ok) { needsFullFetch = true; continue; }
+        const card = await cr.json();
+        if (!card || !card.id) { needsFullFetch = true; continue; }
+        const idx = boardItems.findIndex(item => item.id === card.id);
+        if (idx >= 0) { boardItems[idx] = card; }
+        else { boardItems.push(card); }
+        _boardSnapshotEpoch++;
+      } catch (e) { needsFullFetch = true; }
+    }
+    if (needsFullFetch) { fetchBoard(); return; }
+    lastBoardJSON = JSON.stringify(boardItems);
+    _cacheBoardJSON(lastBoardJSON);
+    if (activeView === 'board') renderBoard();
+    else if (activeView === 'calendar') renderCalendar();
+    _nudgeWorkersOnBoardChange();
+  } catch (e) { fetchBoard(); }
+}
+
 function connectSSE() {
   if (_sseFallback || _sse) return;
   _sse = new EventSource(_authUrl(API + '/api/events'));
@@ -29411,6 +34937,7 @@ function connectSSE() {
     // Note: _sseRetries is reset above, so we key off wasOffline alone.
     if (wasOffline) {
       setTimeout(_runDeltaSync, 200);
+      _stateSync.catchUp().catch(error => _interactionDiagnostic({verdict:'sync_catchup_failed', error:String(error), measured:true, n_considered:1}));
       setTimeout(() => { fetchSessions(); fetchBoard(); }, 250);
     }
     try {
@@ -29430,6 +34957,7 @@ function connectSSE() {
           // list. The class test now forbids any bare `workers =` assignment in
           // client code.
           sessions = msg.payload;
+          _sessionsSnapshotEpoch++;
           // Quota-full store: drop the cache rather than let the throw break SSE handling
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -29441,13 +34969,9 @@ function connectSSE() {
           // than wait for the next poll tick. The refetch is a cheap 304 when the
           // peeked frame is unchanged; the while-open poll still carries the
           // continuous mid-turn stream that SSE-on-change alone would miss.
-          try {
-            const _pov = document.getElementById('peek-overlay');
-            if (typeof peekSession !== 'undefined' && peekSession && _pov && _pov.classList.contains('active')) {
-              if (typeof updatePeekStatus === 'function') updatePeekStatus();
-              if (!document.hidden && typeof refreshPeek === 'function') refreshPeek();
-            }
-          } catch (ePk) {}
+          _refreshOpenPeekOnSessions();
+          _refreshBoardActivityOnSessions();
+          _updateFanoutTabVisibility();
           // If workspace is open but no panes were restored yet (e.g. sessions
           // cache was empty on startup), retry restoration now that we have data.
           if (firstLoad && _grid && Object.keys(_gridPanes).length === 0) {
@@ -29462,6 +34986,7 @@ function connectSSE() {
           // archived cards were lazily loaded, or an SSE push would wipe them
           // out from under an is:archived query.
           boardItems = _mergeArchived(msg.payload);
+          _boardSnapshotEpoch++;
           _cacheBoardJSON(j);
           // Mirror to IDB for full offline durability (iOS-safe)
           _idb.applyIssueDelta(msg.payload);
@@ -29487,6 +35012,7 @@ function connectSSE() {
           if (a.type === 'steering_delivered' && a.session === peekSession) _steeringUpdateBadge();
         }
       } else if (msg.type === 'invalidate') {
+        _stateSync.invalidate(msg).catch(error => _interactionDiagnostic({verdict:'query_invalidation_failed', error:String(error), measured:true, n_considered:1}));
         for (const key of (msg.keys || [])) {
           // 'notes' was handled here until the notes view was removed, and
           // 'crm' until the People/CRM view followed it (AMUX-2590); the
@@ -29504,7 +35030,7 @@ function connectSSE() {
           // Coalesced per key so an event burst is one fetch.
           if (key === 'board') {
             clearTimeout(_invBoardTimer);
-            _invBoardTimer = setTimeout(fetchBoard, 400);
+            _invBoardTimer = setTimeout(_cdcBoardUpdate, 400);
           }
           if (key === 'sessions') {
             clearTimeout(_invSessTimer);
@@ -29528,6 +35054,8 @@ function connectSSE() {
             }, 400);
           }
         }
+      } else if (msg.type === 'lagged') {
+        _stateSync.catchUp().catch(error => _interactionDiagnostic({verdict:'sync_catchup_failed', error:String(error), measured:true, n_considered:1}));
       } else if (msg.type === 'ping') {
         // Liveness signal — _lastDataTime already updated above. Also carries the
         // served app version: if the server moved on, this window is running stale
@@ -29588,6 +35116,10 @@ function enablePollingFallback() {
 //      if we look stale, otherwise just kick a fetch.
 const _SSE_STALE_MS = 18000;     // declared zombie if no data this long
 const _SSE_REFRESH_MS = 4000;    // visibility-resume refresh threshold
+// Nothing at all from the server for this long means offline, however healthy
+// every other signal looks. Above _SSE_STALE_MS plus a reconnect and a poll
+// cycle, so only real silence reaches it.
+const _NO_CONTACT_MS = 35000;
 
 function _sseLooksStale() {
   // Fall back to page load when nothing has arrived yet (AC-275). Without this the
@@ -29644,7 +35176,9 @@ function _resyncEverything() {
   _runDeltaSync();
 }
 function _onClientResume(reason) {
-  if (document.hidden) { _peekPollStop('hidden'); return; }   // tab backgrounded → pause the open-view poller (beaconed)
+  peekCheckSelection({ type: 'resume' });
+  if (document.hidden) { _peekPollStop('hidden'); return; }
+  _resumePendingUploads();
   // Resume the open-view poller if we're on a peek and it was paused while
   // hidden; also refetch the log and repaint the status badge so a tab that
   // comes back to the foreground is instantly current (visibility/pageshow/focus/online).
@@ -29659,6 +35193,8 @@ function _onClientResume(reason) {
     _forceSseReconnect(reason);
   }
 }
+setTimeout(_resumePendingUploads, 1000);
+setInterval(_resumePendingUploads, 30000);
 document.addEventListener('visibilitychange', () => _onClientResume('visibility'));
 window.addEventListener('pageshow',  e => _onClientResume(e.persisted ? 'bfcache' : 'pageshow'));
 window.addEventListener('focus',     () => _onClientResume('focus'));
@@ -29669,6 +35205,32 @@ setInterval(() => {
   if (_sseFallback) return;
   if (window._peekEmbed) return;
   if (_sseLooksStale()) _forceSseReconnect('watchdog stale ' + Math.round((Date.now() - _lastDataTime)/1000) + 's');
+  // A HANG MUST EVENTUALLY COUNT AS A FAILURE.
+  //
+  // `consecutiveFailures` only moves when a fetch RETURNS a failure, and the
+  // offline latch needs 2 of them. A dead tunnel returns nothing at all: the
+  // request is accepted by the local stack and never answered, `navigator
+  // .onLine` stays true because the DEVICE still has a network, and the SSE
+  // reconnect above quietly fails the same way. So every input that could say
+  // "stale" reads healthy, and the badge sits on `Polling` — claiming a
+  // fallback that is fetching — while the last render stays on screen.
+  //
+  // Reported by Ethan 2026-09-08 over Tailscale: the client "just stores
+  // everything that's been cached and presents it as if it's new". Measured in
+  // e2e/tunnel-blackhole.spec.ts: with every /api/ request accepted and never
+  // answered and the open stream severed, the indicator read `Polling` for the
+  // full 48s window and never changed.
+  //
+  // Silence is the only evidence a hang produces, so latch on silence. This is
+  // deliberately generous — well past the 18s zombie threshold and a poll cycle
+  // behind it — so an ordinary slow response can never trip it.
+  if (online && (Date.now() - (_lastDataTime || _pageLoadTime)) > _NO_CONTACT_MS) {
+    setOnline(false);
+  }
+  // Repaint every tick. updateConnectionStatus ran on events, and a hung tunnel
+  // produces none of them, so a badge could go stale and keep saying whatever
+  // it last said.
+  updateConnectionStatus();
 }, 5000);
 
 if (window._peekEmbed) {
@@ -29690,6 +35252,8 @@ if (window._peekEmbed) {
   fetchBoard();
   connectSSE();
   fetchSchedules().then(() => render());
+  // Resume confirmation for retained uncertain sends after a reload.
+  _scheduleSyncRetry();
 }
 _notifUpdateBadge();
 loadBranding();
@@ -29859,9 +35423,8 @@ if ('serviceWorker' in navigator) {
 // Dual-write drafts and queue to both localStorage and IndexedDB
 function persistOfflineData() {
   localStorage.setItem('amux_drafts', JSON.stringify(drafts));
-  saveQueue();
   _idb.set('drafts', drafts);
-  _idb.set('offline_queue', offlineQueue);
+  _idb.set('offline_queue', _readQueue());
 }
 
 // On startup, restore from IndexedDB if localStorage is empty (iOS purge recovery)
@@ -29881,17 +35444,18 @@ _peekIndexLoad().then(() => {
 setInterval(() => { try { _offlinePrefetch(false); } catch(e) {} }, 10 * 60 * 1000);
 window.addEventListener('online', () => setTimeout(() => { try { _offlinePrefetch(false); } catch(e) {} }, 4000));
 
-_idb.get('offline_queue').then(val => {
-  if (val && !offlineQueue.length && val.length) {
-    offlineQueue = val;
-    saveQueue();
+_idb.get('offline_queue').then(async val => {
+  if (val && localStorage.getItem('amux_offline_queue') === null && val.length) {
+    await _mutateQueue(current => {
+      if (localStorage.getItem('amux_offline_queue') === null) current.push(...val);
+    });
     updateConnectionStatus();
   }
   // Auto-retry queued ops on startup if online (single replayer: page-side only)
   if (offlineQueue.length || (val && val.length)) {
     setTimeout(() => {
       if (online && navigator.onLine !== false && (offlineQueue.length || drafts.length)) {
-        runSyncBanner();
+        runSyncBanner(true);
       }
     }, 4000);
   }
@@ -30711,6 +36275,8 @@ function _settingsTab(name) {
 }
 function toggleSettings() {
   const menu = document.getElementById('settings-menu');
+  const header = document.querySelector('.header-row');
+  if (header) document.documentElement.style.setProperty('--mobile-header-bottom', (header.getBoundingClientRect().bottom + 6) + 'px');
   const open = menu.classList.toggle('open');
   if (open) {
     // Restore the last-used settings tab (default: account) before painting.
@@ -30732,7 +36298,7 @@ function toggleSettings() {
     if (zd) zd.textContent = _zoomLevel + '%';
     // Apply cloud identity (email) or device name
     _applyIdentityToSettings();
-    if (!_cloudEmail) {
+    if (!_cloudEmail && !_localMemberEmail) {
       // Show effective device name and populate override input
       const effective = _getDeviceName();
       const custom = localStorage.getItem('amux_device_name') || '';
@@ -30752,6 +36318,17 @@ function toggleSettings() {
     }
     // Render connections
     _renderInstanceSwitcher();
+    // Owner access link — only shown to the owner (who has _authToken)
+    const ownerLinkWrap = document.getElementById('settings-owner-link');
+    if (ownerLinkWrap) {
+      if (_authToken) {
+        ownerLinkWrap.style.display = '';
+        const inp = document.getElementById('settings-owner-link-url');
+        if (inp) inp.value = location.origin + '/?_token=' + _authToken;
+      } else {
+        ownerLinkWrap.style.display = 'none';
+      }
+    }
     // Populate the notes-folder row
     loadCommitGuard();
     loadTaskGuard();
@@ -30759,70 +36336,181 @@ function toggleSettings() {
     loadUsage();
   }
 }
-// Subscription usage — model-agnostic. The server proxies Claude's OAuth usage
-// endpoint and returns limits[]: session (5h), weekly_all, and per-model
-// weekly_scoped entries (scope.model.display_name). We render remaining =
-// 100 − percent for each, colouring by how close to the cap it is.
+// Subscription usage across every provider amux ships. Keep the four provider
+// summaries visible, then put the provider API's detailed windows one tap
+// away. That makes "what can still run?" scannable in the tiny Settings menu
+// without hiding model-specific limits, exact reset clocks, credits, or auth
+// states when somebody needs the full answer (AMUX-4154).
+function usageResetText(raw) {
+  if (raw === null || raw === undefined || raw === '') return '';
+  const dt = new Date(typeof raw === 'number' && raw < 1e12 ? raw * 1000 : raw);
+  if (isNaN(dt.getTime())) return '';
+  const diff = dt.getTime() - Date.now();
+  const exact = dt.toLocaleString([], {
+    weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+  if (diff <= 0) return 'due now · ' + exact;
+  let seconds = Math.ceil(diff / 1000);
+  const days = Math.floor(seconds / 86400); seconds -= days * 86400;
+  const hours = Math.floor(seconds / 3600); seconds -= hours * 3600;
+  const minutes = Math.floor(seconds / 60); seconds -= minutes * 60;
+  const parts = [];
+  if (days) parts.push(days + 'd');
+  if (hours) parts.push(hours + 'h');
+  if (minutes) parts.push(minutes + 'm');
+  if (!parts.length) parts.push(Math.max(1, seconds) + 's');
+  return 'in ' + parts.slice(0, 2).join(' ') + ' · ' + exact;
+}
+function usagePercent(n) {
+  const value = Math.max(0, Math.min(100, Number(n) || 0));
+  return (Math.round(value * 10) / 10).toLocaleString([], { maximumFractionDigits: 1 });
+}
+function usageProviderMeta(provider) {
+  const bits = [];
+  const resetCredits = provider.reset_credits;
+  if (resetCredits && typeof resetCredits.availableCount === 'number') {
+    bits.push(resetCredits.availableCount + ' reset credit' + (resetCredits.availableCount === 1 ? '' : 's'));
+    const first = Array.isArray(resetCredits.credits) ? resetCredits.credits[0] : null;
+    const expiry = first && usageResetText(first.expiresAt || first.expires_at);
+    if (expiry) bits.push('next reset credit expires ' + expiry);
+  }
+  const buckets = Array.isArray(provider.buckets) ? provider.buckets : [];
+  buckets.forEach(bucket => {
+    const credits = bucket && bucket.credits;
+    if (!credits) return;
+    const name = bucket.name && bucket.name !== 'codex' ? bucket.name + ': ' : '';
+    if (credits.unlimited) bits.push(name + 'unlimited credits');
+    else if (credits.balance !== null && credits.balance !== undefined) bits.push(name + credits.balance + ' credits');
+    if (bucket.individual_limit) bits.push(name + 'individual limit');
+    if (bucket.spend_control_reached) bits.push(name + 'spend control reached');
+    if (bucket.rate_limit_reached_type) bits.push(name + String(bucket.rate_limit_reached_type).replace(/_/g, ' '));
+  });
+  if (provider.extra_usage) {
+    const extra = provider.extra_usage;
+    if (extra.is_enabled) {
+      let label = 'extra usage on';
+      if (extra.used_credits !== null && extra.used_credits !== undefined) label += ' · ' + extra.used_credits + ' used';
+      if (extra.monthly_limit !== null && extra.monthly_limit !== undefined) label += ' / ' + extra.monthly_limit;
+      bits.push(label);
+    } else {
+      bits.push('extra usage off');
+    }
+  }
+  if (provider.spend && provider.spend.enabled) {
+    const spend = provider.spend;
+    const used = spend.used && spend.used.amount_minor;
+    const exponent = spend.used && spend.used.exponent;
+    const currency = spend.used && spend.used.currency;
+    if (typeof used === 'number' && typeof exponent === 'number') {
+      bits.push((currency || '') + ' ' + (used / Math.pow(10, exponent)).toFixed(exponent));
+    }
+    if (spend.cap !== null && spend.cap !== undefined) bits.push('spend cap ' + spend.cap);
+  }
+  if (provider.credits !== null && provider.credits !== undefined) {
+    if (typeof provider.credits === 'number' || typeof provider.credits === 'string') {
+      bits.push(provider.credits + ' credits');
+    } else if (provider.credits.availableCredits !== undefined) {
+      bits.push(provider.credits.availableCredits + ' credits');
+    }
+  }
+  if (provider.auth_type) bits.push(String(provider.auth_type).replace(/-/g, ' '));
+  return [...new Set(bits)];
+}
+function usageWindowRow(window, stale = false) {
+  const used = Math.max(0, Math.min(100, Number(window.used_percent) || 0));
+  const remaining = window.remaining_percent === null || window.remaining_percent === undefined
+    ? 100 - used : Number(window.remaining_percent);
+  const colour = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
+  let amount = usagePercent(remaining) + '% left';
+  if (window.remaining_amount !== null && window.remaining_amount !== undefined) {
+    amount += ' · ' + window.remaining_amount + ' requests';
+  }
+  const ended = stale && window.resets_at && (typeof window.resets_at === 'number'
+    ? window.resets_at * 1000 : Date.parse(window.resets_at)) <= Date.now();
+  const reset = ended ? '' : usageResetText(window.resets_at);
+  if (ended) amount = 'Last reported: ' + amount;
+  return '<div class="usage-window" data-usage-window>'
+    + '<div class="usage-window-line"><span class="usage-window-label" title="' + esc(window.label || 'Limit') + '">' + esc(window.label || 'Limit') + '</span>'
+    + '<span class="usage-window-value">' + esc(amount) + '</span></div>'
+    + '<div class="usage-bar" aria-label="' + esc(amount) + '"><span style="width:' + used + '%;background:' + colour + '"></span></div>'
+    + (ended ? '<div class="usage-reset">Previous window · waiting for updated usage</div>'
+      : reset ? '<div class="usage-reset">Resets ' + esc(reset) + '</div>' : '')
+    + '</div>';
+}
+let _usageRefreshTimer = null;
+let _usageLoading = false;
+function usageRecoveryNote(provider) {
+  const age = provider.observed_at ? Math.max(0, Math.floor(Date.now()/1000 - provider.observed_at)) : provider.cache_age_s;
+  const checked = age == null ? '' : 'Last checked ' + (age < 60 ? 'just now' : age < 3600
+    ? Math.floor(age/60) + ' min ago' : Math.floor(age/3600) + ' hr ago');
+  const delay = provider.retry_at ? Math.max(0, provider.retry_at - Date.now()/1000) : null;
+  const retry = delay == null ? 'Refreshing automatically' : delay > 60
+    ? 'Next check in ' + Math.ceil(delay/60) + ' min' : 'Checking again shortly';
+  return '<div class="usage-reset usage-recovery" role="status">'
+    + esc([checked, provider.stale || !provider.available ? retry : ''].filter(Boolean).join(' · ')) + '</div>';
+}
 async function loadUsage() {
   const el = document.getElementById('settings-usage-body');
-  if (!el) return;
-  el.textContent = 'Loading…';
+  if (!el || _usageLoading) return;
+  _usageLoading = true;
+  clearTimeout(_usageRefreshTimer);
+  const openProviders = [...el.querySelectorAll('.usage-provider[open]')].map(p => p.dataset.provider);
+  if (!el.querySelector('.usage-provider')) el.textContent = 'Checking usage…';
   try {
-    const r = await fetch(API + '/api/usage');
+    const r = await fetch(API + '/api/usage', {signal:AbortSignal.timeout(30000)});
+    if (!r.ok) throw new Error('Usage refresh failed');
     const d = await r.json();
-    if (!d.available) { el.innerHTML = '<span style="color:var(--dim);">' + esc(d.reason || 'Usage unavailable') + '</span>'; return; }
-    const limits = (d.limits || []).filter(l => typeof l.percent === 'number');
-    if (!limits.length) { el.innerHTML = '<span style="color:var(--dim);">No usage limits reported</span>'; return; }
-    // Anthropic renamed this limit's kind from 'worker' to 'session'. Accept
-    // BOTH: a client that hard-codes today's spelling breaks on the next
-    // rename, and an older server still sends the old one. Two call sites key
-    // on this — the label AND the sort order below, whose comment already said
-    // "session first" while its predicate had stopped matching, so the 5-hour
-    // row silently lost its place as well as its name.
-    const isSession = l => l.kind === 'session' || l.kind === 'worker';
-    const label = l => {
-      // "session", not "worker": in amux a worker is a lane, and this limit is
-      // the account's 5-hour window, not any one lane's.
-      if (isSession(l)) return '5-hour session';
-      const m = l.scope && l.scope.model && l.scope.model.display_name;
-      if (m) return m + ' · weekly';
-      if (l.group === 'weekly' || l.kind.indexOf('weekly') === 0) return 'Weekly (all models)';
-      return l.kind;
-    };
-    const resetTxt = iso => {
-      if (!iso) return '';
-      const dt = new Date(iso); if (isNaN(dt)) return '';
-      const now = Date.now(), diff = dt - now;
-      if (diff <= 0) return 'resets soon';
-      const h = Math.floor(diff / 3600000), dys = Math.floor(h / 24);
-      return 'resets ' + (dys >= 1 ? 'in ' + dys + 'd' : (h >= 1 ? 'in ' + h + 'h' : 'in <1h'));
-    };
-    // session first, then weekly-all, then per-model scoped
-    const order = l => isSession(l) ? 0 : (l.scope && l.scope.model ? 2 : 1);
-    limits.sort((a, b) => order(a) - order(b));
-    el.innerHTML = limits.map(l => {
-      const used = Math.max(0, Math.min(100, Math.round(l.percent)));
-      const rem = 100 - used;
-      const col = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
-      return '<div style="margin-bottom:9px;">'
-        + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px;">'
-        // THE LABEL SHRINKS, THE NUMBER DOES NOT. Capping the menu width alone
-        // would clip these rows one layer in: both spans were nowrap by default
-        // in a space-between flex, so the row's intrinsic width was 445px on a
-        // 375px screen and something had to be cut. The reading order decides
-        // WHICH: "78% left · resets in <1h" is the answer, "5-hour session" is
-        // the question and is recoverable from position. So the label gets
-        // min-width:0 + ellipsis (a flex item will not shrink below its content
-        // without min-width:0) and the value gets flex-shrink:0.
-        +   '<span style="font-size:0.8rem;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(label(l)) + '</span>'
-        +   '<span style="font-size:0.74rem;color:var(--dim);flex-shrink:0;white-space:nowrap;">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
-        + '</div>'
-        + '<div style="height:6px;border-radius:4px;background:var(--border);overflow:hidden;">'
-        +   '<div style="height:100%;width:' + used + '%;background:' + col + ';"></div>'
-        + '</div></div>';
+    // Old servers remain usable during a rolling deploy: synthesize their
+    // Claude-only body into the provider collection the new renderer expects.
+    let providers = Array.isArray(d.providers) ? d.providers : [{
+      id: 'claude', label: 'Claude', available: !!d.available,
+      reason: d.reason, metered: true,
+      windows: (d.limits || []).filter(l => typeof l.percent === 'number').map(l => ({
+        label: (l.kind === 'session' || l.kind === 'worker') ? '5-hour session'
+          : (l.scope && l.scope.model ? l.scope.model.display_name + ' · weekly' : 'Weekly · all models'),
+        used_percent: l.percent, remaining_percent: 100 - l.percent, resets_at: l.resets_at,
+      })),
+    }];
+    const constrained = providers
+      .filter(p => p.available && Array.isArray(p.windows) && p.windows.length)
+      .sort((a, b) => Math.min(...a.windows.map(w => Number(w.remaining_percent) || 0))
+        - Math.min(...b.windows.map(w => Number(w.remaining_percent) || 0)))[0];
+    el.innerHTML = providers.map(provider => {
+      const windows = Array.isArray(provider.windows) ? provider.windows : [];
+      const minimum = windows.length ? Math.min(...windows.map(w => Number(w.remaining_percent) || 0)) : null;
+      const pending = !provider.available && (provider.retry_at || ['rate_limited','probe_failed'].includes(provider.cause));
+      // `usage_unknown` is opt-in, so no existing provider's chip changes: a metered
+      // provider with no readable quota (muse) must not borrow ollama's "Unlimited" or
+      // the "No active limits" that means "we looked and there were none". It means we
+      // could not look.
+      const status = !provider.available ? (pending ? 'Checking…' : provider.cause === 'account_quota_not_reported' ? 'Not reported' : 'Connect account')
+        : provider.metered === false ? 'Unlimited'
+        : provider.usage_unknown ? 'Usage unknown'
+        : minimum === null ? 'No active limits' : (provider.stale ? 'Last known · ' : '') + usagePercent(minimum) + '% left';
+      const meta = usageProviderMeta(provider);
+      const detail = !provider.available
+        ? '<div class="usage-unavailable">' + esc(pending ? 'Waiting for the provider’s usage report.' : provider.reason || 'Connect this provider to see usage.') + '</div>'
+        : windows.length ? windows.map(w => usageWindowRow(w, provider.stale === true)).join('')
+        : '<div class="usage-unavailable">' + esc(provider.summary || 'No active limits reported') + '</div>';
+      return '<details class="usage-provider" data-provider="' + esc(provider.id || '') + '"'
+        + ((openProviders.length ? openProviders.includes(provider.id) : constrained && constrained.id === provider.id) ? ' open' : '') + '>'
+        + '<summary><span class="usage-provider-name">' + esc(provider.label || provider.id || 'Provider') + '</span>'
+        + (provider.plan ? '<span class="usage-provider-plan">' + esc(String(provider.plan).replace(/_/g, ' ')) + '</span>' : '')
+        + '<span class="usage-provider-status">' + esc(status) + '</span></summary>'
+        + '<div class="usage-provider-detail">' + detail
+        + (provider.observed_at || provider.stale || pending ? usageRecoveryNote(provider) : '')
+        + (meta.length ? '<div class="usage-provider-meta">' + meta.map(bit => '<span>' + esc(bit) + '</span>').join('') + '</div>' : '')
+        + '</div></details>';
     }).join('');
   } catch (e) {
-    el.innerHTML = '<span style="color:var(--dim);">Could not load usage</span>';
+    if (!el.querySelector('.usage-provider')) el.textContent = 'Reconnecting to usage updates…';
+    else if (!el.querySelector('.usage-connection-note')) el.insertAdjacentHTML('beforeend',
+      '<div class="usage-reset usage-connection-note" role="status">Showing the last reading · reconnecting automatically</div>');
+  } finally {
+    _usageLoading = false;
+    _usageRefreshTimer = setTimeout(() => {
+      if (document.getElementById('settings-menu')?.classList.contains('open')) loadUsage();
+    }, 30000);
   }
   // The bars say HOW MUCH is gone. This says WHAT SPENT IT (AMUX-3544/3550).
   // Appended as its own node and loaded separately on purpose: if attribution
@@ -31035,16 +36723,23 @@ document.addEventListener('click', function(e) {
 });
 
 // ── Default Model ────────────────────────────────────────────────────────────
-function loadDefaultModel() {
-  const sel = document.getElementById('settings-default-model');
-  if (sel && window._AMUX_DEFAULT_MODEL) {
-    if (!Array.from(sel.options).some(o => o.value === window._AMUX_DEFAULT_MODEL)) {
-      const opt = document.createElement('option');
-      opt.value = window._AMUX_DEFAULT_MODEL;
-      opt.textContent = window._AMUX_DEFAULT_MODEL;
-      sel.appendChild(opt);
-    }
-    sel.value = window._AMUX_DEFAULT_MODEL;
+async function loadDefaultModel() {
+  const input = document.getElementById('settings-default-model');
+  const list = document.getElementById('settings-default-model-options');
+  if (!input || !list) return;
+  input.value = window._AMUX_DEFAULT_MODEL || 'sonnet';
+  try {
+    const models = await _workerModelsFor('claude');
+    list.innerHTML = '';
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.label = _modelTypeLabel(model.model_type);
+      list.appendChild(option);
+    });
+  } catch (e) {
+    // The input stays fully usable with an exact custom id. The shared loader
+    // already emitted the server-visible failure signal.
   }
 }
 async function saveDefaultModel(val) {
@@ -31070,6 +36765,19 @@ async function saveDefaultModel(val) {
 async function loadHelperModel() {
   const sel = document.getElementById('settings-helper-model');
   if (!sel) return;
+  try {
+    const models = await _workerModelsFor('claude');
+    const og = document.getElementById('settings-helper-model-claude');
+    if (og) {
+      og.innerHTML = '';
+      models.forEach(model => {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = model.id;
+        og.appendChild(option);
+      });
+    }
+  } catch (e) {}
   try {
     const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
     if (r.ok) {
@@ -31260,10 +36968,40 @@ async function saveTaskGuard(enabled) {
 }
 
 // ── Team / Org / Invites ──────────────────────────────────────────────────────
+let _workspaceTeams = [];
+
+function _workspaceTeamScope(team) {
+  if (!team || team.scope_level === 'global') return 'Global · all workers';
+  return (team.scope_level === 'group' ? 'Group · ' : 'Worker · ') + (team.scope_name || 'not set');
+}
+
+function _workspaceTeamOptions(selected) {
+  return _workspaceTeams.map(team => `<option value="${esc(team.id)}"${team.id === selected ? ' selected' : ''}>${esc(team.name)} — ${esc(_workspaceTeamScope(team))}</option>`).join('');
+}
+
 async function loadTeamSection() {
   try {
     const list = document.getElementById('settings-members-list');
-    if (!list) return;
+    const teamsList = document.getElementById('settings-teams-list');
+    if (!list || !teamsList) return;
+
+    const inviteButton = document.getElementById('settings-team-invite');
+    const createButton = document.getElementById('settings-team-create');
+    const orgWrap = document.getElementById('settings-org-name-wrap');
+    if (_localMemberEmail) {
+      if (inviteButton) inviteButton.style.display = 'none';
+      if (createButton) createButton.style.display = 'none';
+      if (orgWrap) orgWrap.style.display = 'none';
+      const scope = _localMemberScope || {level:'global', name:''};
+      const access = scope.level === 'global' ? 'Global workspace access' :
+        (scope.level === 'group' ? 'Group: ' : 'Worker: ') + (scope.name || '—');
+      teamsList.innerHTML = `<div style="padding:5px 7px;border:1px solid var(--border);border-radius:7px;"><div style="color:var(--text);font-weight:600;">${esc(_localMemberTeam?.name || 'Legacy access')}</div><div style="font-size:0.68rem;color:var(--dim);">${esc(access)}</div></div>`;
+      list.innerHTML = `<div style="padding:4px 0;"><div style="color:var(--text);">${esc(_localMemberEmail)}</div><div style="font-size:0.72rem;color:var(--dim);margin-top:3px;">Membership is managed by the server owner</div></div>`;
+      return;
+    }
+    if (inviteButton) inviteButton.style.display = '';
+    if (createButton) createButton.style.display = '';
+    if (orgWrap) orgWrap.style.display = '';
 
     if (_cloudEmail) {
       // Cloud mode: use gateway-level members
@@ -31293,25 +37031,45 @@ async function loadTeamSection() {
             <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
           </div>`).join('');
       }
+      teamsList.innerHTML = '<span>Cloud workspace roles are managed by the gateway.</span>';
       list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     } else {
       // Local mode: use container-level org
-      const [orgRes, membersRes] = await Promise.all([
-        fetch('/api/org'), fetch('/api/org/members')
+      const [orgRes, teamsRes, membersRes, invitesRes] = await Promise.all([
+        fetch('/api/org'), fetch('/api/org/teams'), fetch('/api/org/members'), fetch('/api/org/invites')
       ]);
       const org = await orgRes.json();
+      _workspaceTeams = teamsRes.ok ? await teamsRes.json() : [];
       const members = await membersRes.json();
+      const invites = invitesRes.ok ? await invitesRes.json() : [];
       const nameEl = document.getElementById('settings-org-name');
       if (nameEl && nameEl !== document.activeElement) nameEl.value = org.name || '';
-      if (!members.length) {
-        list.innerHTML = '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
-      } else {
-        list.innerHTML = members.map(m => `
+      teamsList.innerHTML = _workspaceTeams.length ? _workspaceTeams.map(team => `
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;padding:5px 7px;border:1px solid var(--border);border-radius:7px;">
+          <div style="min-width:0;"><div style="color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(team.name)}</div>
+            <div style="font-size:0.67rem;color:var(--dim);">${esc(_workspaceTeamScope(team))} · ${Number(team.member_count || 0)} member${Number(team.member_count || 0) === 1 ? '' : 's'}</div></div>
+          ${team.id === 'team_global' ? '' : `<button class="btn" data-team-edit="${esc(team.id)}" onclick="openTeamEditor(this.dataset.teamEdit)" style="font-size:0.65rem;padding:2px 7px;">Edit</button>`}
+        </div>`).join('') : '<span>No teams configured.</span>';
+      let html = '';
+      if (members.length) {
+        html += members.map(m => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
             <span>${esc(m.name || m.email)}</span>
-            <span style="color:var(--dim);font-size:0.7rem;">${m.role}</span>
+            <span style="display:flex;align-items:center;gap:7px;color:var(--dim);font-size:0.7rem;">
+              ${esc(m.team_name || 'Legacy access')}
+              <button class="btn" data-member-scope="${esc(m.id)}" data-email="${esc(m.email || '')}" data-team="${esc(m.team_id || '')}" onclick="openMemberScope(this.dataset.memberScope,this.dataset.email,this.dataset.team)" style="font-size:0.64rem;padding:1px 6px;">change</button>
+            </span>
           </div>`).join('');
       }
+      if (invites.length) {
+        html += '<div style="margin-top:4px;font-size:0.68rem;color:var(--dim);">Pending invites:</div>';
+        html += invites.map(inv => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;">
+            <span style="font-size:0.72rem;color:var(--dim);">${esc(inv.email || 'Anyone with link')} → ${esc(inv.team_name || 'Legacy access')} · expires ${new Date(inv.expires_at*1000).toLocaleDateString()}</span>
+            <button onclick="deleteInvite('${esc(inv.token)}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.65rem;">revoke</button>
+          </div>`).join('');
+      }
+      list.innerHTML = html || '<span style="color:var(--dim);font-size:0.75rem;">No members yet — invite someone!</span>';
     }
   } catch(e) {}
 }
@@ -31331,32 +37089,195 @@ async function saveOrgName(val) {
   await fetch('/api/org', {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: val})});
 }
 
+function _copyOwnerLink() {
+  const inp = document.getElementById('settings-owner-link-url');
+  if (!inp) return;
+  navigator.clipboard.writeText(inp.value).then(
+    () => showToast('Owner link copied'),
+    () => { inp.select(); showToast('Select and copy manually'); }
+  );
+}
+
 async function openTeamInvite() {
   closeSettings();
-  const res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
-  const data = await res.json();
-  if (!data.url) { showAlert('Failed to create invite: ' + (data.error || 'unknown error')); return; }
-  // Show modal with copyable link
+  if (!_workspaceTeams.length) {
+    const response = await fetch('/api/org/teams').catch(() => null);
+    _workspaceTeams = response?.ok ? await response.json().catch(() => []) : [];
+  }
+  if (!_workspaceTeams.length) {
+    showToast('Teams are still unavailable — reopen Workspace access and try again');
+    return;
+  }
+  const modal = _workspaceAccessModal(`<h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
+    <p style="color:var(--dim);font-size:0.78rem;margin:0 0 14px;">The invite joins one team. That team’s scope controls access.</p>
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label>
+    <input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team</label>
+    <select id="invite-team-id" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">${_workspaceTeamOptions('team_global')}</select>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;"><button class="btn" data-modal-cancel>Cancel</button><button id="team-scope-submit" class="btn primary">Create invite</button></div>`);
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const email = (modal.querySelector('#team-invite-email')?.value || '').trim();
+    const team_id = modal.querySelector('#invite-team-id').value;
+    submit.disabled = true;
+    submit.textContent = 'Creating…';
+    let res;
+    try {
+      res = await fetch('/api/org/invites', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, team_id})});
+    } catch (e) {
+      _teamScopeError(modal, 'Network error');
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) {
+      _teamScopeError(modal, data.error || 'HTTP ' + res.status);
+      submit.disabled = false;
+      submit.textContent = 'Create invite';
+      return;
+    }
+    _renderInviteLink(modal, data);
+  });
+}
+
+function _workspaceAccessModal(html) {
   const modal = document.createElement('div');
+  modal.className = 'amux-workspace-dialog';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;padding:12px;';
+  modal.innerHTML = `<div style="background:var(--card);border:1px solid var(--border,#333);border-radius:12px;padding:24px;max-width:500px;width:100%;box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;">${html}</div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
+  modal.querySelector('[data-modal-cancel]')?.addEventListener('click', () => modal.remove());
+  return modal;
+}
+
+function openTeamEditor(teamId) {
+  closeSettings();
+  const team = _workspaceTeams.find(value => value.id === teamId) || null;
+  const modal = _teamScopeDialog(team ? 'Edit team' : 'Create team', '', team ? team.scope_level : 'global', team ? team.scope_name : '', 'Save team', true);
+  const heading = modal.querySelector('h3');
+  if (heading) heading.insertAdjacentHTML('afterend', `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team name</label><input id="team-name" value="${esc(team ? team.name : '')}" placeholder="e.g. TubeScience" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`);
+  if (team) {
+    const actions = modal.querySelector('#team-scope-submit').parentElement;
+    actions.insertAdjacentHTML('afterbegin', '<button id="team-delete" class="btn" style="margin-right:auto;color:var(--red,#f66);">Delete</button>');
+    modal.querySelector('#team-delete').onclick = async () => {
+      const response = await fetch('/api/org/teams/' + encodeURIComponent(team.id), {method:'DELETE'}).catch(() => null);
+      const data = response ? await response.json().catch(() => ({})) : {};
+      if (!response || !response.ok) { _teamScopeError(modal, data.error || 'Could not delete team'); return; }
+      modal.remove(); showToast('Team deleted'); toggleSettings(); loadTeamSection();
+    };
+  }
+  modal.querySelector('#team-scope-submit').onclick = async () => {
+    const scope_level = modal.querySelector('#team-scope-level').value;
+    const scope_name = scope_level === 'global' ? '' : modal.querySelector('#team-scope-name').value;
+    const name = modal.querySelector('#team-name').value.trim();
+    const response = await fetch(team ? '/api/org/teams/' + encodeURIComponent(team.id) : '/api/org/teams', {
+      method:team ? 'PATCH' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name,scope_level,scope_name})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) { _teamScopeError(modal, data.error || 'Could not save team'); return; }
+    modal.remove(); showToast(team ? 'Team updated' : 'Team created'); toggleSettings(); loadTeamSection();
+  };
+}
+
+function _teamScopeTargets(level, current) {
+  if (level === 'global') return [];
+  const fleet = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+  let values = level === 'worker'
+    ? fleet.map(s => s.name).filter(Boolean)
+    : fleet.flatMap(s => Array.isArray(s.tags) ? s.tags : []).filter(Boolean);
+  values = [...new Set(values)].sort((a,b) => a.localeCompare(b));
+  if (current && !values.includes(current)) values.unshift(current);
+  return values;
+}
+
+function _teamScopeDialog(title, email, level, name, submitLabel, hideEmail) {
+  const modal = document.createElement('div');
+  modal.id = 'team-scope-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
-  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
-    <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
-    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
-    <div style="display:flex;gap:8px;">
-      <input id="invite-link-input" type="text" value="${data.url}" readonly
-        style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;">
-      <button onclick="(function(){var el=document.getElementById('invite-link-input');el.select();navigator.clipboard.writeText(el.value).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})}).call(this)"
-        style="padding:8px 14px;border-radius:6px;background:var(--accent,#a78bfa);color:#000;border:none;cursor:pointer;font-weight:600;white-space:nowrap;">Copy</button>
-    </div>
-    <div style="margin-top:16px;text-align:right;">
-      <button onclick="this.closest('div[style*=fixed]').remove()"
-        style="padding:6px 18px;border-radius:6px;background:var(--bg3,#222);border:1px solid var(--border,#333);color:#ddd;cursor:pointer;">Done</button>
+  modal.innerHTML = `<div style="background:var(--card);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
+    <h3 style="margin:0 0 8px;font-size:1rem;">${esc(title)}</h3>
+    ${hideEmail ? '' : email ? `<p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>` : `<label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Email (optional)</label><input id="team-invite-email" type="email" placeholder="person@example.com" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;margin-bottom:13px;">`}
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Access level</label>
+    <select id="team-scope-level" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">
+      <option value="global">Global — every worker and card</option><option value="group">Group — workers tagged in one group</option><option value="worker">Worker — one worker only</option>
+    </select>
+    <div id="team-scope-target-wrap" style="margin-top:13px;display:none;"><label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Target</label><select id="team-scope-name" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;"></select></div>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;">
+      <button id="team-scope-cancel" class="btn">Cancel</button>
+      <button id="team-scope-submit" class="btn primary">${esc(submitLabel)}</button>
     </div>
   </div>`;
   document.body.appendChild(modal);
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+  modal.querySelector('#team-scope-cancel').addEventListener('click', () => modal.remove());
+  const levelEl = modal.querySelector('#team-scope-level');
+  const targetWrap = modal.querySelector('#team-scope-target-wrap');
+  const targetEl = modal.querySelector('#team-scope-name');
+  const refresh = () => {
+    const values = _teamScopeTargets(levelEl.value, name);
+    targetWrap.style.display = levelEl.value === 'global' ? 'none' : '';
+    targetEl.innerHTML = values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+    if (name && values.includes(name)) targetEl.value = name;
+    const submit = modal.querySelector('#team-scope-submit');
+    submit.disabled = levelEl.value !== 'global' && values.length === 0;
+    _teamScopeError(modal, values.length || levelEl.value === 'global' ? '' : 'Create or tag a worker before granting this scope.');
+  };
+  levelEl.value = level || 'global';
+  levelEl.addEventListener('change', () => { name = ''; refresh(); });
+  refresh();
+  setTimeout(() => modal.querySelector('#team-invite-email, #team-scope-level')?.focus(), 0);
+  return modal;
+}
+
+function _teamScopeError(modal, message) {
+  const el = modal.querySelector('#team-scope-error');
+  if (el) el.textContent = message || '';
+}
+
+function _renderInviteLink(modal, data) {
+  modal.firstElementChild.innerHTML = `<h3 style="margin:0 0 8px;font-size:1rem;">Invite ready</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(data.team_name || 'Team')} · ${esc(_workspaceTeamScope(data))} · expires in 7 days.</p>
+    <div style="display:flex;gap:8px;"><input id="invite-link-input" type="text" value="${esc(data.url)}" readonly style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg,#111);color:inherit;font-size:0.8rem;min-width:0;"><button id="invite-copy-button" class="btn primary">Copy</button></div>
+    <div style="margin-top:16px;text-align:right;"><button id="invite-done-button" class="btn">Done</button></div>`;
+  modal.querySelector('#invite-copy-button').addEventListener('click', async e => {
+    const input = modal.querySelector('#invite-link-input');
+    input.select();
+    await navigator.clipboard.writeText(input.value).catch(() => {});
+    e.currentTarget.textContent = 'Copied!';
+  });
+  modal.querySelector('#invite-done-button').addEventListener('click', () => modal.remove());
   // Auto-copy
   setTimeout(() => { try { navigator.clipboard.writeText(data.url); } catch(e) {} }, 100);
+}
+
+async function openMemberScope(id, email, teamId) {
+  const modal = _workspaceAccessModal(`<h3 style="margin:0 0 8px;font-size:1rem;">Change member team</h3>
+    <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">${esc(email)}</p>
+    <label style="display:block;color:var(--dim);font-size:0.72rem;margin-bottom:5px;">Team</label>
+    <select id="member-team-id" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;">${_workspaceTeamOptions(teamId)}</select>
+    <div id="team-scope-error" style="color:var(--red,#f66);font-size:0.75rem;margin-top:10px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px;"><button class="btn" data-modal-cancel>Cancel</button><button id="team-scope-submit" class="btn primary">Save team</button></div>`);
+  const submit = modal.querySelector('#team-scope-submit');
+  submit.addEventListener('click', async () => {
+    const team_id = modal.querySelector('#member-team-id').value;
+    submit.disabled = true;
+    const response = await fetch('/api/org/members/' + encodeURIComponent(id), {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({team_id})
+    }).catch(() => null);
+    const data = response ? await response.json().catch(() => ({})) : {};
+    if (!response || !response.ok) {
+      _teamScopeError(modal, data.error || 'Failed to save access');
+      submit.disabled = false;
+      return;
+    }
+    modal.remove();
+    showToast('Member access updated');
+    loadTeamSection();
+  });
 }
 
 // ── Billing ─────────────────────────────────────────────────────────────────
@@ -31474,7 +37395,10 @@ async function _handleDeeplink(hash) {
     // the same half-boot trap _restoreScreen's own comment documents.
     const tryView = (attempt) => {
       if (document.getElementById('grid-view') && document.getElementById('tab-' + v)) {
+        if (document.getElementById('peek-overlay')?.classList.contains('active')) closePeek();
+        if (document.getElementById('board-detail-overlay')?.classList.contains('active')) closeBoardDetail();
         try { switchView(v); } catch(e) {}
+        amuxTrack('deeplink_surface_changed', {to:v, measured:true, n_considered:1});
         return;
       }
       if (attempt < 25) setTimeout(() => tryView(attempt + 1), 200);
@@ -31501,6 +37425,10 @@ async function _handleDeeplink(hash) {
       // silently no-oped — masked until the peekState-restore stand-down
       // removed the fallback that happened to open A peek (the wrong one).
       if (typeof sessions !== 'undefined' && sessions.some(s => s.name === target)) {
+        if (document.getElementById('board-detail-overlay')?.classList.contains('active')) {
+          closeBoardDetail(); // preserves edited fields in the existing board draft
+          amuxTrack('deeplink_surface_changed', {from:'board-detail',to:'worker',session:target,measured:true,n_considered:1});
+        }
         openPeek(target);
         // Let openPeek finish its own async setup before switching tabs.
         if (tab) setTimeout(() => { try { setPeekTab(tab); } catch(e) {} }, 350);
@@ -31551,11 +37479,13 @@ async function _handleDeeplink(hash) {
     const tab = TABS.includes(maybeTab) ? maybeTab : (maybeTab === 'lineage' ? 'preview' : '');
     const id = tab ? raw.slice(0, cut) : raw;
     const tryOpen = (attempt) => {
-      if (typeof boardItems !== 'undefined' && boardItems.some(i => i.id === id)) {
+      if (location.hash !== hash) return;
+      if (typeof boardItems !== 'undefined' && document.getElementById('board-detail-overlay')) {
         switchView('board');
-        setTimeout(() => {
+        setTimeout(async () => {
+          if (location.hash !== hash) return;
           try {
-            openBoardDetail(id);
+            await openBoardDetail(id);
             if (tab) boardDetailTab(tab);
           } catch (e) {}
         }, 250);
@@ -31563,7 +37493,9 @@ async function _handleDeeplink(hash) {
       }
       if (attempt < 20) setTimeout(() => tryOpen(attempt + 1), 400);
     };
-    tryOpen(0);
+    // A newly created or capped-out card may not be in boardItems. The detail
+    // loader resolves its ID directly; waiting for the list can never find it.
+    setTimeout(() => tryOpen(0), 0);
     return;
   }
   // #browser=<session> — land in the Browser view focused on a given session's
@@ -31617,8 +37549,8 @@ async function _handleDeeplink(hash) {
     }
   } catch(e) {}
 }
-// On page load
-_handleDeeplink(location.hash);
+// Initial routing is scheduled with restoration below, after both the DOM and
+// the complete bundle (including late message-selection state) are initialized.
 // Restore the screen you were on — INCLUDING after iOS evicts a backgrounded
 // PWA (which wipes sessionStorage but keeps localStorage): the active tab and
 // any open session peek. Bounded to 24h so a days-later open still lands on a
@@ -31633,9 +37565,7 @@ function _restoreScreen() {
   // (#view= / ?view=, the rig entry). The saved-tab restore silently beat the
   // view deeplink on 2026-08-08 — the rig asked for ?view=groups, got last
   // session's Workers tab, and the deeplink looked broken while working fine.
-  const _hasDeeplink = (location.hash && (location.hash.startsWith('#path=')
-                                          || location.hash.startsWith('#view=')
-                                          || location.hash.startsWith('#browser=')))
+  const _hasDeeplink = /^#(?:peek|issue|menu|view|path|browser|bq)=/.test(location.hash)
                      || /[?&]view=/.test(location.search);
   // 1. Restore the tab.
   if (!_hasDeeplink) {
@@ -31660,7 +37590,7 @@ function _restoreScreen() {
   //    it made the rig land on whichever session was peeked before (verified
   //    2026-08-08: #peek=amux opened amux-frustrations), and a shared link
   //    would misdirect the same way.
-  if (location.hash && location.hash.startsWith('#peek=')) return;
+  if (/^#(?:peek|issue|menu|view|path|browser|bq)=/.test(location.hash)) return;
   let _ps = null;
   try { _ps = JSON.parse(sessionStorage.getItem('peekState') || 'null'); } catch(e) {}
   if (!_ps || !_ps.session) {
@@ -31670,7 +37600,16 @@ function _restoreScreen() {
     } catch(e) {}
   }
   if (_ps && _ps.session) {
+    // A deliberate open/close between boot and this delayed restore is newer
+    // than saved state. Do not let the timer reopen another worker (and its
+    // draft) over what the human just selected.
+    const restoreGeneration = _peekOpenGeneration;
     setTimeout(() => {
+      if (peekSession || _peekOpenGeneration !== restoreGeneration
+          || /^#(?:peek|issue|menu|view|path|browser|bq)=/.test(location.hash)) {
+        amuxTrack('peek_restore_superseded', {session:_ps.session, measured:true, n_considered:1});
+        return;
+      }
       openPeek(_ps.session);
       // Restore the tab WITHIN the peek — guarded on the button still
       // existing, because localStorage outlives removed tabs (the notes-view
@@ -31694,8 +37633,12 @@ function _restoreScreen() {
     }, 200);
   }
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreScreen);
-else _restoreScreen();
+function _restoreAppScreen() {
+  _handleDeeplink(location.hash);
+  _restoreScreen();
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreAppScreen, {once:true});
+else queueMicrotask(_restoreAppScreen);
 // On hash change (e.g. paste URL into address bar while app already open — no page reload)
 window.addEventListener('hashchange', () => _handleDeeplink(location.hash));
 
@@ -32444,11 +38387,177 @@ function _msgSetMode(mode) {
   _msgMode = mode;
   document.getElementById('msgmode-messages')?.classList.toggle('active', mode === 'messages');
   document.getElementById('msgmode-trends')?.classList.toggle('active', mode === 'trends');
+  document.getElementById('msgmode-ask')?.classList.toggle('active', mode === 'ask');
   const isT = mode === 'trends';
-  ['msgs-controls','msgs-kind-filter','msgs-list'].forEach(id => { const e=document.getElementById(id); if(e) e.style.display = isT ? 'none' : ''; });
+  const isA = mode === 'ask';
+  // The list and its controls belong to the Messages mode only; both of the
+  // other modes replace the whole pane rather than sitting under it.
+  ['msgs-controls','msgs-kind-filter','msgs-list'].forEach(id => { const e=document.getElementById(id); if(e) e.style.display = (isT || isA) ? 'none' : ''; });
   const tv = document.getElementById('trends-view'); if (tv) tv.style.display = isT ? '' : 'none';
   const td = document.getElementById('trends-days'); if (td) td.style.display = isT ? '' : 'none';
+  const av = document.getElementById('ask-view'); if (av) av.style.display = isA ? '' : 'none';
+  const pager = document.getElementById('msgs-pager'); if (pager) pager.style.display = (isT || isA) ? 'none' : '';
   if (isT) _trendsLoad();
+  if (isA) { _askSuggestions(false); document.getElementById('ask-q')?.focus(); }
+}
+
+// ---- Ask: open-ended questions about the messages (AMUX-4664) -------------
+// Trends answers the questions its theme list already names. This one sends the
+// question to the model with the messages as data, and shows what it was
+// answered OVER: how many messages of how many, the window, and the ids the
+// answer cited, so a claim can be checked rather than believed.
+// AMUX-4681: the conversation, held here rather than on the server. A thread
+// belongs to ONE population: the global tab and each worker have their own, and
+// switching worker starts a new one, because a follow-up interpreted against a
+// different lane's messages is a wrong answer that reads as a right one.
+const _ASK_MAX_THREAD = 6;
+let _askThread = [];          // [{q, a}] for the global tab
+let _peekAskThread = [];      // [{q, a}] for the worker tab
+let _peekAskThreadFor = '';   // which worker _peekAskThread belongs to
+function _askThreadFor(peek) {
+  if (!peek) return _askThread;
+  if (_peekAskThreadFor !== peekSession) { _peekAskThread = []; _peekAskThreadFor = peekSession; }
+  return _peekAskThread;
+}
+function _askNewThread(peek) {
+  if (peek) { _peekAskThread = []; _peekAskThreadFor = peekSession; } else { _askThread = []; }
+  const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
+  const metaEl = document.getElementById(peek ? 'peek-ask-meta' : 'ask-meta');
+  if (ansEl) ansEl.innerHTML = '';
+  if (metaEl) metaEl.textContent = '';
+  document.getElementById(peek ? 'peek-ask-q' : 'ask-q')?.focus();
+}
+// The thread, oldest first, newest answer last. Earlier turns collapse: the
+// reader needs to see what was asked, not re-read every answer.
+function _askRenderThread(peek, latestHTML) {
+  const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
+  if (!ansEl) return;
+  const thread = _askThreadFor(peek);
+  const earlier = thread.slice(0, -1).map(t =>
+    '<details style="margin-bottom:8px;border-left:2px solid var(--border);padding-left:8px;">'
+    + '<summary style="cursor:pointer;color:var(--dim);font-size:0.8rem;">' + esc(t.q) + '</summary>'
+    + '<div style="margin-top:6px;font-size:0.82rem;">' + _askFormat(t.a) + '</div></details>').join('');
+  const current = thread.length
+    ? '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:4px;">' + esc(thread[thread.length - 1].q) + '</div>'
+    : '';
+  ansEl.innerHTML = earlier + current + latestHTML;
+}
+const _ASK_SUGGESTIONS = [
+  'What themes came up most?',
+  'What did Ethan ask for that is still not done?',
+  'Where did two lanes disagree?',
+  'What keeps getting repeated?',
+];
+function _askSuggestions(peek) {
+  const el = document.getElementById(peek ? 'peek-ask-suggestions' : 'ask-suggestions');
+  if (!el || el.dataset.filled) return;
+  el.dataset.filled = '1';
+  el.innerHTML = _ASK_SUGGESTIONS.map(q =>
+    '<button class="btn" style="font-size:0.72rem;padding:3px 9px;" onclick="_askPick(' + (peek ? 'true' : 'false')
+    + ',this.textContent)">' + esc(q) + '</button>').join('');
+}
+function _askPick(peek, q) {
+  const inp = document.getElementById(peek ? 'peek-ask-q' : 'ask-q');
+  if (inp) inp.value = q;
+  _askRun(peek);
+}
+function _peekAskToggle() {
+  const p = document.getElementById('peek-ask-panel');
+  if (!p) return;
+  const open = p.style.display === 'none';
+  p.style.display = open ? '' : 'none';
+  if (open) { _askSuggestions(true); document.getElementById('peek-ask-q')?.focus(); }
+}
+/// Light markdown, applied AFTER escaping: **bold**, `code`, and leading
+/// bullet markers. The answer is model output about untrusted message text, so
+/// it is never inserted as HTML; only this fixed set of markers becomes tags.
+function _askFormat(answer) {
+  let out = esc(String(answer).replace(/^\s+/, ''));
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/`([^`\n]+)`/g, '<code style="background:var(--bg);padding:1px 4px;border-radius:4px;">$1</code>');
+  out = out.replace(/^[ \t]*[-*][ \t]+/gm, '\u2022 ');
+  return out;
+}
+async function _askRun(peek) {
+  const qEl = document.getElementById(peek ? 'peek-ask-q' : 'ask-q');
+  const metaEl = document.getElementById(peek ? 'peek-ask-meta' : 'ask-meta');
+  const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
+  const question = (qEl?.value || '').trim();
+  if (!question) { if (qEl) qEl.focus(); return; }
+  const days = +(document.getElementById(peek ? 'peek-ask-days' : 'ask-days')?.value || 14);
+  const session = peek ? peekSession : null;
+  if (metaEl) metaEl.textContent = 'Asking' + (session ? ' about ' + session : '') + '\u2026';
+  if (ansEl) ansEl.innerHTML = '';
+  let r, d;
+  try {
+    // _origFetch, NOT the patched window.fetch: this is a READ that takes tens
+    // of seconds (the model call), and the outbox treats a slow /api/ POST as
+    // an unreachable server, queues it for replay and hands back a synthetic
+    // 202 {ok:true,queued:true}. The panel then rendered "0 of 0 messages ...
+    // last undefined days" while the server was answering the question fine
+    // (found in the browser, 2026-09-15). Replaying a question later is also
+    // meaningless: there is nobody to show the answer to.
+    r = await _origFetch(API + '/api/history/ask', {
+      method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
+      // The thread goes with the question so a follow-up ("why?", "which of
+      // those...") is interpreted against what was already asked.
+      body: JSON.stringify({ question, session, days,
+        history: _askThreadFor(peek).slice(-_ASK_MAX_THREAD).map(t => ({ question: t.q, answer: t.a })) }),
+      _skipOutbox: true, signal: AbortSignal.timeout(300000),
+    });
+    d = await r.json();
+  } catch (e) {
+    if (metaEl) metaEl.textContent = 'Could not reach the server: ' + String(e && e.message || e);
+    return;
+  }
+  // A locally queued 202 never left the browser, so it is not an answer.
+  if (_isLocallyQueued(r)) {
+    if (metaEl) metaEl.textContent = 'Not sent: this client queued the request offline. Reconnect and ask again.';
+    return;
+  }
+  // A refusal and an unmeasured answer both say WHY, and neither is rendered
+  // as an empty answer: an empty answer reads as "there is nothing about that".
+  if (!r.ok || d.measured === false) {
+    if (metaEl) metaEl.textContent = d.why_unmeasured || d.error || ('error ' + r.status);
+    if (ansEl) ansEl.innerHTML = '';
+    return;
+  }
+  // measured true with no window means this is not the payload this panel
+  // renders. Saying so beats printing "0 of 0 ... undefined days", which reads
+  // as a measured emptiness.
+  if (d.window_days === undefined || d.n_available === undefined) {
+    if (metaEl) metaEl.textContent = 'The server answered in a shape this view does not recognise (HTTP ' + r.status + ').';
+    if (ansEl) ansEl.innerHTML = '';
+    return;
+  }
+  const scope = d.session ? esc(d.session) : 'all workers';
+  const considered = (d.n_considered || 0).toLocaleString();
+  const available = (d.n_available || 0).toLocaleString();
+  const secs = d.elapsed_ms ? ' \u00b7 ' + (d.elapsed_ms / 1000).toFixed(1) + 's' : '';
+  if (metaEl) metaEl.textContent = 'answered over ' + considered + ' of ' + available
+    + ' message' + (d.n_available === 1 ? '' : 's') + ' from ' + scope
+    + ', last ' + d.window_days + ' day' + (d.window_days === 1 ? '' : 's')
+    + (d.truncated ? ' (oldest dropped to fit)' : '')
+    + (d.history_turns ? ' \u00b7 follow-up with ' + d.history_turns + ' earlier exchange' + (d.history_turns === 1 ? '' : 's') : '')
+    + secs;
+  const thread = _askThreadFor(peek);
+  thread.push({ q: question, a: d.answer || '' });
+  if (qEl) qEl.value = '';   // the box is ready for the follow-up
+  const cites = Array.isArray(d.cited) && d.cited.length
+    ? '<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
+      + '<span style="font-size:0.72rem;color:var(--dim);">cited:</span>'
+      + d.cited.map(id => '<button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_askOpenCitation('
+        + JSON.stringify(id) + ')">MSG-' + esc(id) + '</button>').join('') + '</div>'
+    : '';
+  _askRenderThread(peek, '<div>' + _askFormat(d.answer || '') + '</div>' + cites);
+}
+/// Open the message an answer cited, so a claim can be checked against the row.
+async function _askOpenCitation(id) {
+  try {
+    const m = await (await fetch(API + '/api/history/' + encodeURIComponent(id))).json();
+    if (m && m.text) { _msgLocate(m.session || '', encodeURIComponent(m.text)); return; }
+  } catch (e) {}
+  showToast('Could not open MSG-' + id);
 }
 async function _trendsLoad() {
   const days = document.getElementById('trends-days')?.value || '7';
@@ -32492,7 +38601,7 @@ function _trendsRender() {
     const cards = [...g.cards].map(id => byId[id]).filter(Boolean);
     const verified = cards.filter(c => c.status==='verified').length;
     const done = cards.filter(c => c.status==='done').length;
-    const openC = cards.filter(c => !['done','verified','discarded'].includes(_statusCanon(c.status)));
+    const openC = cards.filter(c => !_isClosedStatus(c.status));
     const blocked = openC.filter(c => (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())));
     const exp = _trendsExpanded[g.key];
     const inProg = openC.length - blocked.length;
@@ -32535,7 +38644,7 @@ function _trendsRender() {
     + '<span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--accent);font-weight:600;">\uD83D\uDCC8 Weekly task-theme summary</span>'
     + '<select id="trends-week" onchange="_trendsLoadSummary(this.value)" style="font-size:0.76rem;padding:3px 6px;margin-left:auto;"></select></div>'
     + '<div id="trends-digest" class="rv-digest md-content"><span style="color:var(--dim);">Loading summary\u2026</span></div></div>';
-  const totalNeed = groups.reduce((a,g)=>a + [...g.cards].map(id=>byId[id]).filter(c=>c && (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) && !['done','verified','discarded'].includes(_statusCanon(c.status))).length, 0);
+  const totalNeed = groups.reduce((a,g)=>a + [...g.cards].map(id=>byId[id]).filter(c=>c && (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) && !_isClosedStatus(c.status)).length, 0);
   const answerBar = '<div class="tr-answer">'
     + (totalNeed ? '<span style="color:var(--red);font-weight:600;">\u26A1 ' + totalNeed + ' item(s) need you</span> <button class="btn" style="font-size:0.74rem;min-height:34px;margin-left:6px;" onclick="_focusStart(\'is:blocked\')">Clear them</button>'
                  : '<span style="color:var(--green);font-weight:600;">\u2713 Nothing needs you — it\'s all moving.</span>')
@@ -32570,7 +38679,7 @@ function _trendsFocusTheme(k) {
 function _costFillGroups(sel) {
   const el = document.getElementById('cost-group');
   if (!el) return;
-  const tags = [...new Set((sessions || []).filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
+  const tags = [...new Set((sessions || []).filter(s => !s.archived && s.lifecycle !== 'paused').flatMap(s => s.tags || []))].sort();
   const cur = sel !== undefined ? sel : el.value;
   el.innerHTML = '<option value="">All workers</option>'
     + tags.map(t => '<option value="' + escJs(t) + '"' + (t === cur ? ' selected' : '') + '>' + esc(t) + '</option>').join('');
@@ -32838,7 +38947,7 @@ function _metricsRender() {
     const cls = _metricsGaugeCls(sys.disk_percent || 0);
     // Free space is the number you act on, so it leads. Clicking through to
     // Disk Cleanup is the point: a red gauge with no next step is just anxiety.
-    html += `<div class="metrics-card reclaim-catcard" onclick="_metricsSetMode('disk')" title="Open Disk Cleanup">
+    html += `<div class="metrics-card reclaim-catcard" onclick="switchView('disk')" title="Open Disk Cleanup">
       <div class="metrics-card-title">Disk</div>
       <div class="metrics-card-value">${sys.disk_free_gb != null ? sys.disk_free_gb : (sys.disk_total_gb - sys.disk_used_gb).toFixed(1)}<span> GB free</span></div>
       <div class="metrics-card-sub">${sys.disk_used_gb} of ${sys.disk_total_gb} GB used &mdash; ${(sys.disk_percent || 0).toFixed(0)}%</div>
@@ -32983,6 +39092,7 @@ let _reclaimCat = null;
 
 const _RECLAIM_CATS = {
   build:     { label: 'Build artifacts', hint: 'Regenerable. Costs a rebuild, not data.', safe: true },
+  'tmp-orphan': { label: 'Orphaned tmp snapshots', hint: 'Single-use gate/build snapshot dirs left behind in /private/tmp or $TMPDIR, untouched for hours. Regenerable — nothing else on the fleet reuses them.', safe: true },
   cache:     { label: 'Caches',          hint: 'Regenerable. Apps refill these on demand.', safe: true },
   devtool:   { label: 'Dev tool stores', hint: 'Models, images, registries. Re-download can be slow.', safe: true },
   large:     { label: 'Large files',     hint: 'Recently touched. Review individually.', safe: false },
@@ -33006,14 +39116,172 @@ const _KIND_COLORS = {
 function _metricsSetMode(mode) {
   _metricsMode = mode;
   document.getElementById('metricsmode-system')?.classList.toggle('active', mode === 'system');
+  document.getElementById('metricsmode-host')?.classList.toggle('active', mode === 'host');
   document.getElementById('metricsmode-disk')?.classList.toggle('active', mode === 'disk');
   const mc = document.getElementById('metrics-content');
-  const rc = document.getElementById('reclaim-content');
+  const hc = document.getElementById('host-content');
   if (mc) mc.style.display = mode === 'system' ? '' : 'none';
-  if (rc) rc.style.display = mode === 'disk' ? '' : 'none';
+  // #reclaim-content is NOT toggled here (AMUX-4634). It lives in #disk-view
+  // since Disk Cleanup became its own tab (1a2963c8), and switchView('disk')
+  // never resets it, so hiding it from the Host or System mode left Disk
+  // Cleanup blank when opened from the Host panel's card.
+  if (hc) hc.style.display = mode === 'host' ? '' : 'none';
+  // The worker sidebar only pairs with the System view; Host and Disk are host-wide.
   const sb = document.getElementById('metrics-sidebar');
-  if (sb) sb.style.display = mode === 'disk' ? 'none' : '';
+  if (sb) sb.style.display = (mode === 'system') ? '' : 'none';
   if (mode === 'disk') _reclaimLoad(); else _reclaimStopPolling();
+  if (mode === 'host') _hostLoad();
+}
+
+// ── Host analysis (Metrics ▸ Host) ──────────────────────────────────────────
+// Renders GET /api/metrics/host, which runs the embedded, re-runnable
+// scripts/host-analysis.sh — one cross-platform source of truth for the host the
+// server runs on (this Mac in dev, the Linux LXC in cloud).
+let _hostData = null;
+
+function _hostLoad() {
+  const el = document.getElementById('host-content');
+  if (el && !_hostData) el.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:40px;text-align:center;">Analyzing host&hellip;</div>';
+  fetch(API + '/api/metrics/host')
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(d => { _hostData = d; _hostRender(); })
+    .catch(e => {
+      if (el) el.innerHTML = '<div style="color:var(--red);padding:20px;font-size:0.85rem;">Failed to load host analysis: ' + esc(String(e)) + '</div>';
+    });
+}
+
+function _hostStateColor(s) {
+  return s === 'ok' ? 'var(--green)' : s === 'warn' ? 'var(--yellow)' : s === 'critical' ? 'var(--red)' : 'var(--dim)';
+}
+
+// Measure the actual theme colors, so a future palette regression is visible
+// in local diagnostics instead of only in a screenshot (AMUX-4362).
+function _hostContrastCheck() {
+  const luminance = color => {
+    const rgb = (color.match(/[\d.]+/g) || []).slice(0, 3).map(Number).map(v => {
+      const c = v / 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+  };
+  const samples = Array.from(document.querySelectorAll('#host-content .host-state-chip')).flatMap(chip => {
+    const background = getComputedStyle(chip).backgroundColor;
+    return [chip, chip.querySelector('b')].filter(Boolean).map(el => {
+      const foreground = getComputedStyle(el).color, a = luminance(foreground), b = luminance(background);
+      return { text:el.textContent.trim(), foreground, background, ratio:(Math.max(a,b)+0.05)/(Math.min(a,b)+0.05) };
+    });
+  });
+  if (!samples.length) return;
+  fetch(API + '/api/client-debug', {method:'POST', headers:_authHeaders({'Content-Type':'application/json'}),
+    body:JSON.stringify({kind:'host-analysis-contrast', verdict:samples.every(s=>s.ratio>=4.5) ? 'readable' : 'low-contrast',
+      measured:true, n_considered:samples.length, light:document.body.classList.contains('light'), samples, ver:APP_VER})}).catch(()=>{});
+}
+
+function _hostRender() {
+  const d = _hostData;
+  const el = document.getElementById('host-content');
+  if (!d || !el) return;
+
+  const num = (val, dp) => (val === null || val === undefined) ? '—' : (dp != null ? Number(val).toFixed(dp) : val);
+  const v = d.verdicts || {};
+  const cpu = d.cpu || {}, mem = d.memory || {}, swap = d.swap || {}, disk = d.disk || {}, pc = d.process_counts || {};
+
+  let html = `<div class="metrics-hdr">
+    <div class="metrics-hdr-left">
+      <span class="metrics-hdr-title">Host Analysis</span>
+      ${d.host ? `<span class="metrics-hostname">${esc(String(d.host))}</span>` : ''}
+      ${(d.os || d.os_version || d.arch) ? `<span class="metrics-uptime">${esc([d.os, d.os_version, d.arch].filter(Boolean).join(' '))}</span>` : ''}
+      ${d.uptime_seconds ? `<span class="metrics-uptime">up ${_metricsFormatUptime(d.uptime_seconds)}</span>` : ''}
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      ${d.analysis_ms != null ? `<span style="font-size:0.7rem;color:var(--dim);">${esc(String(d.generated_at || ''))} · ${d.analysis_ms}ms</span>` : ''}
+      <button class="btn" onclick="_hostLoad()" style="font-size:0.8rem;padding:5px 12px;">↻ Refresh</button>
+    </div>
+  </div>`;
+
+  // The measured contract: if the probe could not run, say so instead of a blank panel.
+  if (d.measured === false) {
+    html += `<div class="metrics-no-psutil">⚠️ Host analysis did not run: ${esc(String(d.why_unmeasured || 'unknown reason'))}</div>`;
+    el.innerHTML = html;
+    return;
+  }
+
+  const chip = (label, state) => `<span class="host-state-chip" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:12px;background:var(--card);color:var(--text);border:1px solid var(--border);font-size:0.75rem;">
+    <span style="width:8px;height:8px;border-radius:50%;background:${_hostStateColor(state)};"></span>${label}: <b style="color:${_hostStateColor(state)};">${esc(String(state || 'unknown'))}</b></span>`;
+  html += `<div style="display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 14px;">
+    ${chip('CPU', v.cpu)} ${chip('Memory', v.memory)} ${chip('Disk', v.disk)}</div>`;
+
+  html += '<div class="metrics-cards">';
+  const lpc = cpu.load_per_core;
+  html += `<div class="metrics-card">
+    <div class="metrics-card-title">CPU load</div>
+    <div class="metrics-card-value">${num(lpc, 2)}<span> /core</span></div>
+    <div class="metrics-card-sub">${num(cpu.count)} logical${cpu.physical ? ' / ' + num(cpu.physical) + ' physical' : ''} cores</div>
+    <div class="metrics-gauge"><div class="metrics-gauge-fill" style="width:${Math.min(100, (lpc || 0) / 4 * 100)}%;background:${_hostStateColor(v.cpu)};"></div></div>
+  </div>`;
+  if (mem.total_mb) {
+    html += `<div class="metrics-card">
+      <div class="metrics-card-title">Memory</div>
+      <div class="metrics-card-value">${num(mem.used_mb / 1024, 1)}<span> GB</span></div>
+      <div class="metrics-card-sub">of ${num(mem.total_mb / 1024, 1)} GB — ${num(mem.percent, 0)}%${mem.pressure ? ' · pressure ' + esc(String(mem.pressure)) : ''}</div>
+      <div class="metrics-gauge"><div class="metrics-gauge-fill" style="width:${Math.min(100, mem.percent || 0)}%;background:${_hostStateColor(v.memory)};"></div></div>
+    </div>`;
+  }
+  if (swap.total_mb != null) {
+    const sp = swap.total_mb > 0 ? swap.used_mb / swap.total_mb * 100 : 0;
+    html += `<div class="metrics-card">
+      <div class="metrics-card-title">Swap</div>
+      <div class="metrics-card-value" style="font-size:1.2rem;">${num(swap.used_mb, 0)}<span> MB</span></div>
+      <div class="metrics-card-sub">of ${num(swap.total_mb, 0)} MB — ${sp.toFixed(0)}%</div>
+      <div class="metrics-gauge"><div class="metrics-gauge-fill ${_metricsGaugeCls(sp)}" style="width:${Math.min(100, sp)}%"></div></div>
+    </div>`;
+  }
+  if (disk.total_gb) {
+    html += `<div class="metrics-card reclaim-catcard" onclick="switchView('disk')" title="Open Disk Cleanup">
+      <div class="metrics-card-title">Disk${disk.path ? ' (' + esc(String(disk.path)) + ')' : ''}</div>
+      <div class="metrics-card-value">${num(disk.free_gb, 1)}<span> GB free</span></div>
+      <div class="metrics-card-sub">${num(disk.used_gb, 1)} of ${num(disk.total_gb, 1)} GB — ${num(disk.percent, 0)}%</div>
+      <div class="metrics-gauge"><div class="metrics-gauge-fill" style="width:${Math.min(100, disk.percent || 0)}%;background:${_hostStateColor(v.disk)};"></div></div>
+      <div style="font-size:0.66rem;color:var(--accent,#58a6ff);margin-top:6px;">Disk Cleanup ›</div>
+    </div>`;
+  }
+  html += '</div>';
+
+  if (cpu.load_avg && cpu.load_avg.length) {
+    html += '<div class="metrics-section-title">Load Average</div><div class="metrics-load-row">';
+    const labels = ['1 min', '5 min', '15 min'];
+    cpu.load_avg.forEach((la, i) => {
+      html += `<div class="metrics-load-item"><div class="metrics-load-val">${num(la, 2)}</div><div class="metrics-load-lbl">${labels[i] || ''}</div></div>`;
+    });
+    html += '</div>';
+  }
+
+  const counts = [['total', 'total'], ['claude', 'claude'], ['rustc', 'rustc'], ['cargo', 'cargo'], ['node', 'node'], ['python3', 'python3']];
+  if (counts.some(([k]) => pc[k] != null)) {
+    html += '<div class="metrics-section-title">Processes</div><div class="metrics-load-row">';
+    counts.forEach(([k, lbl]) => { if (pc[k] != null) html += `<div class="metrics-load-item"><div class="metrics-load-val">${pc[k]}</div><div class="metrics-load-lbl">${lbl}</div></div>`; });
+    html += '</div>';
+  }
+
+  const procTable = (title, rows, primary) => {
+    if (!rows || !rows.length) return '';
+    let t = `<div class="metrics-section-title">${title}</div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:0.8rem;">`;
+    rows.forEach(p => {
+      const cpuCell = `<span style="color:${p.cpu_percent >= 100 ? '#f85149' : 'var(--fg)'};">${num(p.cpu_percent, 1)}%</span>`;
+      const memCell = `${num(p.rss_mb, 1)} MB`;
+      t += `<tr style="border-bottom:1px solid var(--border,#21262d);">
+        <td style="padding:5px 10px 5px 0;font-family:var(--mono,monospace);color:var(--dim);width:64px;">${p.pid}</td>
+        <td style="padding:5px 12px 5px 0;text-align:right;width:90px;">${primary === 'cpu' ? cpuCell : memCell}</td>
+        <td style="padding:5px 12px 5px 0;text-align:right;width:90px;color:var(--dim);">${primary === 'cpu' ? memCell : cpuCell}</td>
+        <td style="padding:5px 0;">${esc(String(p.command || ''))}</td>
+      </tr>`;
+    });
+    return t + '</table></div>';
+  };
+  html += procTable('Top by CPU', d.top_cpu, 'cpu');
+  html += procTable('Top by Memory', d.top_mem, 'mem');
+
+  el.innerHTML = html;
+  requestAnimationFrame(_hostContrastCheck);
 }
 
 function _reclaimStopPolling() {
@@ -33312,14 +39580,22 @@ function _reclaimRender() {
 
   // Snapshot warning: the thing that makes cleanup look broken.
   const snapFinding = findings.find(f => f.category === 'snapshot');
-  if (snapFinding) {
+  if (scan.snapshot_count == null) {
     html += `<div class="reclaim-warn">
-      <div style="font-weight:600;margin-bottom:4px;">⚠ ${scan.snapshot_count} APFS local snapshots are holding deleted space</div>
+      <div style="font-weight:600;margin-bottom:4px;">Local snapshot status unavailable</div>
       <div style="font-size:0.78rem;line-height:1.55;">
-        Until these expire or are thinned, <b>deleting files will not increase your free space</b>.
-        The blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
-        <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
-        <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
+        The scan could not measure local snapshots. This does not mean there are none.
+        Remeasure backup status and free space before deciding on further deletion.
+      </div>
+    </div>`;
+  } else if (snapFinding) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">${scan.snapshot_count} local snapshots observed</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        Snapshots may retain blocks shared with deleted files. Their count does not show
+        how much space they hold or how long a backup disk has been absent.
+        macOS can remove snapshots as they age or storage is needed.
+        Check backup status and remeasure free space before deciding on further deletion.
       </div>
     </div>`;
   }
@@ -33372,7 +39648,7 @@ function _reclaimRender() {
     // the box agree and nothing is letterboxed. Measured from the scroll pane
     // (minus its 16px padding either side) rather than assumed.
     const _mapW = Math.round(Math.max(300, Math.min(1200,
-      (document.getElementById('metrics-main')?.clientWidth || 900) - 32)));
+      (document.getElementById('disk-view')?.clientWidth || document.getElementById('metrics-main')?.clientWidth || 900) - 32)));
     const _mapH = window.innerWidth < 600 ? 300 : 340;
     html += '<div class="reclaim-map">' + _reclaimTreemapSvg(_reclaimTree.children || [], _mapW, _mapH) + '</div>';
     html += '<div class="reclaim-legend">' + Object.entries(_KIND_COLORS).map(([k, c]) =>
@@ -33528,10 +39804,10 @@ function _torrentRender() {
     const isPaused = t.status === 'paused' || t.status === 'waiting';
     const isDone = t.status === 'complete';
     const ctrlBtns = isDone
-      ? `<button onclick="_torrentRemove('${t.gid}')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:0.78rem;" title="Remove">&#x2716;</button>`
-      : `${isActive ? `<button onclick="_torrentAction('${t.gid}','pause')" style="background:none;border:none;color:var(--yellow);cursor:pointer;font-size:0.85rem;" title="Pause">&#x23F8;</button>` : ''}
-         ${isPaused ? `<button onclick="_torrentAction('${t.gid}','resume')" style="background:none;border:none;color:var(--green);cursor:pointer;font-size:0.85rem;" title="Resume">&#x25B6;</button>` : ''}
-         <button onclick="_torrentAction('${t.gid}','remove')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:0.85rem;" title="Stop &amp; remove">&#x23F9;</button>`;
+      ? `<button onclick="_torrentRemove('${t.gid}')" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:1rem;min-width:44px;min-height:44px;padding:0;" title="Remove" aria-label="Remove">&#x2716;</button>`
+      : `${isActive ? `<button onclick="_torrentAction('${t.gid}','pause')" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:1rem;min-width:44px;min-height:44px;padding:0;" title="Pause" aria-label="Pause">&#x23F8;</button>` : ''}
+         ${isPaused ? `<button onclick="_torrentAction('${t.gid}','resume')" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:1rem;min-width:44px;min-height:44px;padding:0;" title="Resume" aria-label="Resume">&#x25B6;</button>` : ''}
+         <button onclick="_torrentAction('${t.gid}','remove')" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-size:1rem;min-width:44px;min-height:44px;padding:0;" title="Stop &amp; remove" aria-label="Stop &amp; remove">&#x23F9;</button>`;
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 14px;">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
         <strong style="flex:1;font-size:0.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(t.name || t.gid)}</strong>
@@ -34148,18 +40424,39 @@ function _msgsRenderGroupChip() {
     : '';
 }
 let _msgsOffset = 0;
-const _MSGS_PAGE = 200;
+const _MSGS_PAGE = 60;   // AMUX-4476: smaller first page for a fast click-to-display; page older on demand
+// AMUX-4666: the reader chooses the page size, and the footer says which page
+// of how many. The size persists because it is a preference about this reader's
+// screen, not about this session.
+const _MSGS_PAGE_SIZES = [25, 50, 100, 200];
+let _msgsPageSize = (() => {
+  const saved = +(localStorage.getItem('amux.msgs.pageSize') || 0);
+  return _MSGS_PAGE_SIZES.includes(saved) ? saved : _MSGS_PAGE;
+})();
+let _msgsPage = 1;        // 1-based, what the footer shows
+let _msgsTotal = null;    // x-amux-total for the ACTIVE filter; null = not reported
 let _msgsDone = false;
+// A reset (tab switch, group/kind change) and the debounced SSE 'messages'
+// refresh can both be in flight at once — nothing cancelled either fetch.
+// Whichever concat lands SECOND used to run against the array left by the
+// other, so a message sent just before a stale fetch resolved could show
+// twice: once as the pre-capture snapshot (no card badge), once as the
+// fresh one. _msgsGen bumps on every reset; a response is only applied if
+// no newer reset has started since its fetch began.
+let _msgsGen = 0;
 
 async function _messagesLoad(reset, presetSession) {
-  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; }
+  if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; _msgsGen++; _msgsPage = 1; }
+  const _gen = _msgsGen;
   try {
     // Kind-scoped at the SERVER. Filtering a mixed page client-side is what
     // showed 48 human messages out of 6547 — the human rows never made it into
     // the window. ?counts=1 supplies true per-kind totals for the chips, which
     // a tally of the fetched page cannot (every unselected chip would read 0).
     const _sf = document.getElementById('msgs-session-filter')?.value || '';
-    let _u = API + '/api/history?limit=' + _MSGS_PAGE + '&offset=' + _msgsOffset;
+    // The page is the unit now: offset is derived from it, never accumulated.
+    _msgsOffset = (_msgsPage - 1) * _msgsPageSize;
+    let _u = API + '/api/history?limit=' + _msgsPageSize + '&offset=' + _msgsOffset;
     if (_msgsKind !== 'all') _u += '&kind=' + encodeURIComponent(_msgsKind);
     if (_sf) _u += '&session=' + encodeURIComponent(_sf);
     // Deep search (Enter in the box): the SERVER scans all history, so hits
@@ -34169,12 +40466,28 @@ async function _messagesLoad(reset, presetSession) {
     if (_msgsGroup) _u += '&group=' + encodeURIComponent(_msgsGroup);
     const r = await fetch(_u);
     const rows = await r.json();
+    // The count for THIS filter, from the same request that served the page.
+    // Guessing it from a short page would misreport the number of pages on
+    // every filter, and a pager that lies about its own last page is worse
+    // than no pager.
+    const _t = r.headers && r.headers.get('x-amux-total');
+    _msgsTotal = _t === null || _t === undefined || _t === '' ? null : +_t;
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
       .then(x => x.json()).then(c => { _msgsCounts = c; _msgsRenderChips(); }).catch(() => {});
     if (!Array.isArray(rows)) return;
-    _msgsData = _msgsData.concat(rows.map(_msgNorm));
-    _msgsOffset += rows.length;
-    _msgsDone = rows.length < _MSGS_PAGE;
+    // A newer reset (_msgsGen bumped) started and already replaced _msgsData
+    // while this fetch was in flight — applying this stale page would append
+    // a pre-capture duplicate of a row the newer load already rendered fresh.
+    if (_gen !== _msgsGen) {
+      if (typeof window._clientDebug === 'function') {
+        window._clientDebug('messages-load-stale-discarded', { gen: _gen, current: _msgsGen, rows: rows.length });
+      }
+      return;
+    }
+    _msgsData = rows.map(_msgNorm);
+    _msgsDone = _msgsTotal === null
+      ? rows.length < _msgsPageSize
+      : _msgsPage >= Math.max(1, Math.ceil(_msgsTotal / _msgsPageSize));
     // Session filter options — FROM THE STORE, not the loaded page (AMUX-2548).
     // Deriving names from _msgsData meant the dropdown listed only workers with
     // a message in the newest 200 rows — ~7 hours of a 46-lane fleet — so 90 of
@@ -34328,9 +40641,10 @@ async function _resendRows(rows) {
   let sent = 0, failed = 0;
   for (const r of rows) {
     try {
-      const resp = await fetch(API + '/api/sessions/' + encodeURIComponent(r.session) + '/send', {
+      const resp = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(r.session) + '/send', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: r.text }),
+        signal: AbortSignal.timeout(10000)
       });
       if (resp.ok) sent++; else failed++;
     } catch (e) { failed++; }
@@ -34404,9 +40718,15 @@ function _messagesRender() {
     }
   }
   const count = document.getElementById('msgs-count');
-  if (count) count.textContent = rows.length + ' message' + (rows.length === 1 ? '' : 's') + (_msgsDone ? '' : ' (more available)');
-  const more = document.getElementById('msgs-more-btn');
-  if (more) more.style.display = _msgsDone ? 'none' : '';
+  if (count) {
+    const from = _msgsData.length ? (_msgsPage - 1) * _msgsPageSize + 1 : 0;
+    const to = (_msgsPage - 1) * _msgsPageSize + _msgsData.length;
+    count.textContent = _msgsTotal === null
+      ? rows.length + ' message' + (rows.length === 1 ? '' : 's') + (_msgsDone ? '' : ' (more available)')
+      : from + '\u2013' + to + ' of ' + _msgsTotal.toLocaleString()
+        + (rows.length !== _msgsData.length ? ' (' + rows.length + ' shown by this filter)' : '');
+  }
+  _msgsRenderPager();
   if (!rows.length) {
     const kl = (_MSG_KIND[_msgsKind] || {}).label;
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">'
@@ -34479,14 +40799,72 @@ function _msgDayLabel(ts) {
 // is older than what's loaded, keep loading older pages until it's in range (or
 // the store is exhausted), then scroll its header into view. The date-review
 // jump (Ethan): easily land on any past day without hand-scrolling.
+/// How many pages the ACTIVE filter has. null total means the server did not
+/// report one (an old build): the pager then offers next/previous only, rather
+/// than inventing a last page.
+function _msgsPageCount() {
+  if (_msgsTotal === null) return null;
+  return Math.max(1, Math.ceil(_msgsTotal / _msgsPageSize));
+}
+function _msgsRenderPager() {
+  const el = document.getElementById('msgs-pager');
+  if (!el) return;
+  const pages = _msgsPageCount();
+  const atFirst = _msgsPage <= 1;
+  const atLast = pages === null ? _msgsDone : _msgsPage >= pages;
+  const btn = (label, page, disabled, title) =>
+    '<button class="btn" style="font-size:0.78rem;padding:4px 10px;min-height:44px;"'
+    + (disabled ? ' disabled' : ' onclick="_msgsGoToPage(' + page + ')"')
+    + ' title="' + title + '">' + label + '</button>';
+  const sizes = _MSGS_PAGE_SIZES.map(n =>
+    '<option value="' + n + '"' + (n === _msgsPageSize ? ' selected' : '') + '>' + n + ' per page</option>').join('');
+  el.innerHTML =
+      btn('&laquo;', 1, atFirst, 'First page')
+    + btn('&lsaquo;', _msgsPage - 1, atFirst, 'Previous page')
+    + '<span style="font-size:0.78rem;color:var(--dim);display:inline-flex;align-items:center;gap:6px;">page'
+    + '<input class="input" id="msgs-page-input" type="number" min="1"' + (pages ? ' max="' + pages + '"' : '')
+    + ' value="' + _msgsPage + '" onchange="_msgsGoToPage(+this.value)"'
+    + ' onkeydown="if(event.key===\'Enter\')_msgsGoToPage(+this.value)"'
+    + ' style="width:68px;text-align:center;" aria-label="Page number">'
+    + (pages ? 'of ' + pages.toLocaleString() : '') + '</span>'
+    + btn('&rsaquo;', _msgsPage + 1, atLast, 'Next page')
+    + (pages ? btn('&raquo;', pages, atLast, 'Last page') : '')
+    + '<select class="input" style="max-width:130px;font-size:0.78rem;" aria-label="Messages per page"'
+    + ' onchange="_msgsSetPageSize(+this.value)">' + sizes + '</select>';
+}
+function _msgsGoToPage(page) {
+  const pages = _msgsPageCount();
+  let next = Math.max(1, Math.floor(page) || 1);
+  if (pages !== null) next = Math.min(next, pages);
+  if (next === _msgsPage) { _msgsRenderPager(); return; }
+  _msgsPage = next;
+  _messagesLoad(false);
+  const list = document.getElementById('msgs-list');
+  if (list) list.scrollTop = 0;   // a new page starts at its own top
+}
+function _msgsSetPageSize(size) {
+  if (!_MSGS_PAGE_SIZES.includes(size) || size === _msgsPageSize) return;
+  // Keep the reader near the same messages rather than at the same page
+  // number: page 7 of 25-per-page and page 7 of 200-per-page are different
+  // places, and only the position in the list is what they were looking at.
+  const anchor = (_msgsPage - 1) * _msgsPageSize;
+  _msgsPageSize = size;
+  try { localStorage.setItem('amux.msgs.pageSize', String(size)); } catch (e) {}
+  _msgsPage = Math.floor(anchor / size) + 1;
+  _messagesLoad(false);
+}
 async function _msgsJumpToDate(dateStr) {
   if (!dateStr) return;
   const target = new Date(dateStr + 'T00:00:00').getTime();  // local start-of-day, ms
   let guard = 0;
+  // Walk pages from the current one until the page holding that day is on
+  // screen. Rows are newest-first, so the oldest row of a page is its floor.
+  if (_msgsPage !== 1) { _msgsPage = 1; await _messagesLoad(false); }
   while (!_msgsDone && guard < 80) {
     const last = _msgsData[_msgsData.length - 1];
     const oldest = last ? (last.time || last.ts) : Infinity;
-    if (oldest <= target + 86400000) break;   // loaded into (or past) that day
+    if (oldest <= target + 86400000) break;   // this page reaches that day
+    _msgsPage += 1;
     await _messagesLoad(false);
     guard++;
   }
@@ -34517,17 +40895,33 @@ let _sqlSchemaLoaded = false;
 
 function _sqlInit() { if (!_sqlSchemaLoaded) { _sqlSchemaLoaded = true; _dbLoadSchema(); } }
 
+async function _sqlFetchJson(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch (e) {
+    throw new Error('HTTP ' + response.status + ': ' + (text.trim().slice(0, 240) || 'non-JSON response'));
+  }
+  if (!response.ok || data.error) {
+    throw new Error((data && data.error) || ('HTTP ' + response.status));
+  }
+  return data;
+}
+
 async function _dbLoadSchema() {
   const side = document.getElementById('db-tables');
   if (side) side.innerHTML = '<div style="color:var(--dim);font-size:0.74rem;padding:6px;">Loading…</div>';
   try {
-    const d = await fetch(API + '/api/sql/schema').then(r => r.json());
-    if (d.error) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/schema');
     _dbTables = d.tables || [];
     const f = document.getElementById('db-filter');
     _dbRenderSidebar(f ? f.value : '');
     if (_dbTable) _dbRenderStructure();
-  } catch (e) { if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">schema failed</div>'; }
+  } catch (e) {
+    _sqlSchemaLoaded = false;
+    if (side) side.innerHTML = '<div style="color:#f85149;font-size:0.74rem;padding:6px;">Schema failed: ' + esc(e.message) + '<br><button class="btn" style="margin-top:6px;" onclick="_sqlInit()">Retry</button></div>';
+  }
 }
 
 function _dbFilter(q) { _dbRenderSidebar(q); }
@@ -34577,13 +40971,15 @@ async function _dbLoadData() {
   try {
     const q = '?table=' + encodeURIComponent(_dbTable) + '&limit=' + _dbLimit + '&offset=' + _dbOffset +
       (_dbSort ? '&sort=' + encodeURIComponent(_dbSort) + '&dir=' + _dbDir : '');
-    const d = await fetch(API + '/api/sql/rows' + q).then(r => r.json());
-    if (d.error) { status.classList.add('err'); status.textContent = d.error; grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(d.error) + '</div>'; return; }
+    const d = await _sqlFetchJson(API + '/api/sql/rows' + q);
     _dbRenderGrid(grid, d.columns, d.rows, true);
     _dbRenderPager(d);
     const t = _dbTables.find(x => x.name === _dbTable);
     status.textContent = t && t.writable ? 'Read/write · wb_*' : 'Read-only';
-  } catch (e) { status.classList.add('err'); status.textContent = 'load failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Load failed: ' + e.message;
+    grid.innerHTML = '<div style="padding:16px;color:#f85149;">' + esc(e.message) + '</div>';
+  }
 }
 
 function _dbRenderPager(d) {
@@ -34641,18 +41037,16 @@ async function _sqlRun() {
   const results = document.getElementById('sql-results');
   status.classList.remove('err'); status.textContent = 'Running…';
   try {
-    const d = await fetch(API + '/api/sql', {
+    const d = await _sqlFetchJson(API + '/api/sql', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql, write }),
-    }).then(r => r.json());
-    if (d.error) {
-      status.classList.add('err'); status.textContent = d.error;
-      results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(d.error) + '</div>';
-      return;
-    }
+    });
     if (d.write) { status.textContent = d.message + ' · ' + d.ms + 'ms'; _dbLoadSchema(); return; }
     _dbRenderGrid(results, d.columns, d.rows, false);
     status.textContent = d.rowcount + (d.truncated ? '+ (capped)' : '') + ' row' + (d.rowcount === 1 ? '' : 's') + ' · ' + d.ms + 'ms';
-  } catch (e) { status.classList.add('err'); status.textContent = 'request failed'; }
+  } catch (e) {
+    status.classList.add('err'); status.textContent = 'Request failed: ' + e.message;
+    results.innerHTML = '<div style="padding:16px;color:#f85149;font-size:0.82rem;font-family:var(--mono);white-space:pre-wrap;">' + esc(e.message) + '</div>';
+  }
 }
 
 // ── Notes tab ─────────────────────────────────────────────────────────────────
@@ -35992,6 +42386,7 @@ async function _bwInit() {
   _bwInited = true;
   _bwSessionLabelSync();
   await _bwLoadProfiles();
+  await _bwLoadTargets();
 }
 
 // Show WHICH session's browser is on screen. The view defaults to 'amux' and
@@ -36072,7 +42467,7 @@ async function _bwLoadProfiles() {
     // container has no Chrome of the user's to drive, so CDP is not offered
     // there rather than offered and always failing.
     const bs = document.getElementById('bw-backend');
-    if (bs) bs.style.display = (d.backends || []).includes('live') ? '' : 'none';
+    if (bs) bs.style.display = '';
   } catch(e) {}
 }
 
@@ -36081,15 +42476,70 @@ function _bwBackend() {
   return (el && el.style.display !== 'none') ? el.value : '';
 }
 
+// A target is explicit on EVERY request. Changing the picker cannot silently
+// route a simulator action to an existing Chrome session with the same owner.
+let _bwTargetGeneration = 0;
+async function _bwFetch(path, options) {
+  const generation = _bwTargetGeneration;
+  if (_bwBackend().startsWith('ios:')) {
+    path = path.replace('/api/browser/', '/api/browser/ios/');
+    options = { ...options, headers: { ...(options && options.headers), 'X-Amux-Simulator': _bwBackend().slice(4) } };
+  }
+  const response = await fetch(path, options);
+  const data = await response.json();
+  if (generation !== _bwTargetGeneration) throw new Error('Browser target changed; retry on the selected target');
+  if (!response.ok || data.error) throw new Error(data.error || ('HTTP ' + response.status));
+  return { ok: true, json: async () => data };
+}
+async function _bwLoadTargets() {
+  const sel = document.getElementById('bw-backend');
+  if (!sel) return;
+  const current = sel.value;
+  try {
+    const response = await fetch('/api/browser/ios/targets');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+    sel.querySelectorAll('option[data-ios]').forEach(o => o.remove());
+    (data.targets || []).forEach(target => {
+      const option = document.createElement('option');
+      option.value = 'ios:' + target.udid;
+      option.dataset.ios = 'true';
+      option.textContent = target.label + (target.state === 'Booted' ? '' : ' (open in Simulator first)');
+      option.disabled = target.state !== 'Booted';
+      sel.appendChild(option);
+    });
+    if (current && Array.from(sel.options).some(o => o.value === current && !o.disabled)) sel.value = current;
+    else if (current.startsWith('ios:')) { sel.value = ''; _bwOnBackend(); }
+    sel.title = data.measured ? 'Browser on the server machine; iOS uses real Simulator Safari' : 'Desktop Chrome. iOS unavailable: ' + data.why_unmeasured;
+  } catch (e) { _bwStatus('Simulator discovery unavailable: ' + e.message); }
+}
 function _bwOnBackend() {
-  // Live Chrome drives the user's own browser, which brings its own logins —
-  // a profile would be meaningless, so grey it out instead of silently
-  // ignoring whatever is selected.
-  const live = _bwBackend() === 'live';
+  ++_bwTargetGeneration;
+  _bwStopLive();
+  _bwViewport = null;
+  _bwWantFrame = false; _bwHasFrame = false;
+  const img = document.getElementById('bw-img');
+  if (img) { img.removeAttribute('src'); img.style.display = 'none'; }
+  const ph = document.getElementById('bw-placeholder');
+  if (ph) { ph.style.display = 'flex'; ph.textContent = 'Enter a URL and press Go to open the selected browser.'; }
+  const ios = _bwBackend().startsWith('ios:');
+  const ownProfile = ios || _bwBackend() === 'live';
   const p = document.getElementById('bw-profile');
-  if (p) { p.disabled = live; p.style.opacity = live ? 0.45 : 1; }
-  _bwStatus(live ? 'Live: your own Chrome (first use of a tab needs the "Allow debugging?" click)'
-                 : 'Playwright: isolated, profile-backed browser');
+  if (p) { p.disabled = ownProfile; p.style.opacity = ownProfile ? 0.45 : 1; p.style.display = ios ? 'none' : ''; }
+  document.querySelectorAll('[data-bw-chrome]').forEach(el => { el.disabled = ios; el.style.display = ios ? 'none' : ''; });
+  if (ios) { document.getElementById('bw-inspect-btn')?.classList.remove('active'); const panel=document.getElementById('bw-inspect-panel'); if(panel)panel.style.display='none'; }
+  const stop = document.getElementById('bw-ios-stop');
+  if (stop) stop.style.display = ios ? '' : 'none';
+  _bwShowProfile('');
+  _bwStatus(ios ? 'Simulator Safari · press Go to connect' : 'Desktop Chrome · press Go to connect');
+}
+async function _bwStopIos() {
+  _bwStopLive();
+  try {
+    await _bwFetch('/api/browser/stop', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session:_bwSession}) });
+    _bwOnBackend();
+    _bwStatus('Safari automation stopped');
+  } catch (e) { _bwStatus('Stop failed: ' + e.message); }
 }
 
 function _bwStatus(msg) {
@@ -36119,9 +42569,10 @@ async function _bwGo() {
   try {
     const body = { url, session: _bwSession };
     const backend = _bwBackend();
-    if (backend) body.backend = backend;
+    if (backend.startsWith('ios:')) body.udid = backend.slice(4);
+    else if (backend) body.backend = backend;
     else if (profile) body.profile = profile;   // empty = auto-select by URL
-    const r = await fetch('/api/browser/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const r = await _bwFetch('/api/browser/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const d = await r.json();
     if (d.error) { _bwStatus('Error: ' + d.error); return; }
     // SAY WHERE IT LANDED, and say so when that is not where you asked.
@@ -36171,7 +42622,7 @@ async function _bwGo() {
 
 async function _bwFetchViewport() {
   try {
-    const r = await fetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'eval', script: '({w:window.innerWidth,h:window.innerHeight})', session: _bwSession }) });
+    const r = await _bwFetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'eval', script: '({w:window.innerWidth,h:window.innerHeight})', session: _bwSession }) });
     const d = await r.json();
     const res = (d.data || {}).result;
     if (res && res.w && res.h) _bwViewport = { w: res.w, h: res.h };
@@ -36184,12 +42635,13 @@ async function _bwScreenshot(retries, silent) {
   _bwShotInFlight = true;
   if (!silent) _bwStatus('Taking screenshot…');
   try {
-    const r = await fetch('/api/browser/screenshot?session=' + _bwSession + '&t=' + Date.now());
+    const r = await _bwFetch('/api/browser/screenshot?session=' + _bwSession + '&t=' + Date.now());
     const d = await r.json();
     if (d.path) {
+      if (d.viewport) _bwViewport = d.viewport;
       const img = document.getElementById('bw-img');
       img.onerror = () => _bwViewportFail('the screenshot could not be loaded');
-      img.src = _authUrl('/api/file/raw?path=' + encodeURIComponent(d.path) + '&t=' + Date.now());
+      img.src = _authUrl(d.serve ? d.serve + '&t=' + Date.now() : '/api/file/raw?path=' + encodeURIComponent(d.path) + '&t=' + Date.now());
       img.style.display = '';
       document.getElementById('bw-placeholder').style.display = 'none';
       _bwHasFrame = true; _bwShotFails = 0;
@@ -36258,7 +42710,7 @@ function _bwViewportFail(reason) {
         + '<button class="bw-btn" onclick="_bwGo()">Restart browser</button></div>';
   };
   render(null);                       // paint immediately; never block on the probe
-  fetch(API + '/api/browser/status')  // then correct it once the truth is known
+  _bwFetch('/api/browser/status' + (_bwBackend().startsWith('ios:') ? '?session=' + encodeURIComponent(_bwSession) : ''))  // then correct it once the truth is known
     .then(r => r.json())
     .then(s => { if (!_bwHasFrame) render(s && s.running === true); })
     .catch(() => {});
@@ -36299,7 +42751,7 @@ async function _bwClick(event) {
   try { document.getElementById('bw-viewport').focus({ preventScroll: true }); } catch(e) {}
   _bwStatus('Click ' + x + ',' + y + '…');
   try {
-    await fetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'click', x, y, session: _bwSession }) });
+    await _bwFetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'click', x, y, session: _bwSession }) });
     setTimeout(() => _bwScreenshot(1), 800);
   } catch(e) { _bwStatus('Error: ' + e.message); }
 }
@@ -36309,7 +42761,7 @@ async function _bwAction(payload, note) {
   try {
     payload.session = _bwSession;
     if (note) _bwStatus(note);
-    await fetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    await _bwFetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     setTimeout(() => _bwScreenshot(1), 500);
   } catch(e) { _bwStatus('Error: ' + e.message); }
 }
@@ -36340,7 +42792,7 @@ function _bwViewportKey(event) {
 async function _bwBack() {
   _bwStatus('Going back…');
   try {
-    await fetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'back', session: _bwSession }) });
+    await _bwFetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'back', session: _bwSession }) });
     setTimeout(() => _bwScreenshot(1), 800);
   } catch(e) { _bwStatus('Error: ' + e.message); }
 }
@@ -36358,7 +42810,7 @@ async function _bwLoadElements() {
   const list = document.getElementById('bw-elements-list');
   list.innerHTML = '<div style="padding:8px;color:var(--dim);font-size:0.74rem;">Loading…</div>';
   try {
-    const r = await fetch('/api/browser/state?session=' + _bwSession);
+    const r = await _bwFetch('/api/browser/state?session=' + _bwSession);
     const d = await r.json();
     if (d.viewport) _bwViewport = d.viewport;
     const els = d.elements || [];
@@ -36377,14 +42829,15 @@ async function _bwLoadElements() {
 async function _bwClickIndex(index) {
   _bwStatus('Click element [' + index + ']…');
   try {
-    await fetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'click', index, session: _bwSession }) });
+    await _bwFetch('/api/browser/action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'click', index, session: _bwSession }) });
     setTimeout(() => { _bwScreenshot(1); _bwLoadElements(); }, 800);
   } catch(e) { _bwStatus('Error: ' + e.message); }
 }
 
 // ── Inspect panel: console / network / errors (full browser troubleshooting) ──
-let _bwInspData = { console: [], network: [], errors: [] };
+let _bwInspData = { console: [], network: [], errors: [], trail: [] };
 let _bwInspActiveTab = 'console';
+let _bwTrailMeta = { measured: false, n_considered: 0, returned: 0, truncated: false };
 async function _bwToggleInspect() {
   const panel = document.getElementById('bw-inspect-panel');
   const btn = document.getElementById('bw-inspect-btn');
@@ -36396,13 +42849,18 @@ async function _bwToggleInspect() {
 function _bwInspTab(t) {
   _bwInspActiveTab = t;
   document.querySelectorAll('#browser-view .bw-itab').forEach(b => b.classList.toggle('active', b.dataset.itab === t));
+  if (t === 'trail') { _bwLoadTrail(); return; }
   _bwRenderInspect();
+}
+function _bwRefreshInspect() {
+  if (_bwInspActiveTab === 'trail') return _bwLoadTrail();
+  return _bwLoadInspect();
 }
 async function _bwLoadInspect() {
   const list = document.getElementById('bw-inspect-list');
   if (list && !list.children.length) list.innerHTML = '<div class="il-empty">Loading…</div>';
   try {
-    const r = await fetch('/api/browser/inspect?session=' + _bwSession + '&limit=300');
+    const r = await _bwFetch('/api/browser/inspect?session=' + _bwSession + '&limit=300');
     const d = await r.json();
     if (d.error) { list.innerHTML = '<div class="il-empty">' + esc(d.error) + '</div>'; return; }
     _bwInspData = { console: d.console || [], network: d.network || [], errors: d.errors || [] };
@@ -36418,7 +42876,16 @@ async function _bwLoadInspect() {
 function _bwRenderInspect() {
   const list = document.getElementById('bw-inspect-list');
   const rows = _bwInspData[_bwInspActiveTab] || [];
-  if (!rows.length) { list.innerHTML = '<div class="il-empty">No ' + _bwInspActiveTab + ' entries. Interact with the page, then refresh.</div>'; return; }
+  if (!rows.length) {
+    if (_bwInspActiveTab === 'trail') {
+      list.innerHTML = '<div class="il-empty">' + (_bwTrailMeta.measured
+        ? 'No recorded browser actions for this worker yet.'
+        : 'Browser trail was not measured. Refresh to retry.') + '</div>';
+    } else {
+      list.innerHTML = '<div class="il-empty">No ' + _bwInspActiveTab + ' entries. Interact with the page, then refresh.</div>';
+    }
+    return;
+  }
   let html = '';
   if (_bwInspActiveTab === 'console') {
     html = rows.map(e => '<div class="il ' + esc(e.level) + '"><span class="lv ' + esc(e.level) + '">' + esc(e.level) + '</span><span>' + esc(e.text || '') + '</span></div>').join('');
@@ -36430,14 +42897,63 @@ function _bwRenderInspect() {
              '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;">' + esc(n.url || '') + '</span>' +
              '<span class="ms">' + (n.ms != null ? n.ms + 'ms' : '') + '</span></div>';
     }).join('');
-  } else {
+  } else if (_bwInspActiveTab === 'errors') {
     html = rows.map(e => '<div class="il error"><span class="lv error">err</span><span>' + esc(e.text || '') + (e.stack ? '\n' + esc(e.stack) : '') + '</span></div>').join('');
+  } else {
+    html = rows.map(e => {
+      const d = e.data || {};
+      const kind = String(e.event || 'browser').replace(/^browser\./, '').replace(/_/g, ' ');
+      let detail = '';
+      if (d.action) {
+        detail = d.action;
+        if (d.target && d.target.kind === 'index') detail += ' [' + d.target.index + ']';
+        else if (d.target && d.target.kind === 'selector') detail += ' selector (' + (d.target.selector_chars || 0) + ' chars withheld)';
+        else if (d.target && d.target.kind === 'coordinates') detail += ' at ' + d.target.x + ',' + d.target.y;
+        if (d.typed_chars != null) detail += ' · ' + d.typed_chars + ' chars (contents withheld)';
+        if (d.script_chars != null) detail += ' · ' + d.script_chars + ' script chars (contents withheld)';
+        if (d.file_count != null) detail += ' · ' + d.file_count + ' file(s) (paths withheld)';
+      } else if (d.profile) {
+        detail = d.profile;
+      }
+      const url = d.url || d.requested_url || '';
+      if (url) detail += (detail ? ' · ' : '') + url;
+      const when = e.at ? new Date(e.at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '';
+      const status = d.http_status ? ' · HTTP ' + d.http_status : '';
+      return '<div class="il"><span class="lv">' + esc(kind) + '</span>'
+        + '<span style="flex:1;min-width:0;word-break:break-word;">' + esc(detail || 'recorded') + esc(status) + '</span>'
+        + '<span class="ms">' + esc(when) + '</span></div>';
+    }).join('');
   }
   list.innerHTML = html;
 }
+async function _bwLoadTrail() {
+  const list = document.getElementById('bw-inspect-list');
+  if (list) list.innerHTML = '<div class="il-empty">Loading durable trail…</div>';
+  try {
+    const r = await fetch('/api/browser/history?session=' + encodeURIComponent(_bwSession) + '&limit=100');
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+    _bwTrailMeta = {
+      measured: d.measured === true,
+      n_considered: Number(d.n_considered || 0),
+      returned: Number(d.returned || 0),
+      truncated: d.truncated === true,
+    };
+    _bwInspData.trail = d.events || [];
+    const count = document.getElementById('bw-ic-trail');
+    if (count) count.textContent = _bwTrailMeta.n_considered
+      ? '(' + _bwTrailMeta.returned + (_bwTrailMeta.truncated ? '/' + _bwTrailMeta.n_considered : '') + ')'
+      : '';
+    _bwRenderInspect();
+  } catch(e) {
+    _bwTrailMeta = { measured: false, n_considered: 0, returned: 0, truncated: false };
+    _bwInspData.trail = [];
+    if (list) list.innerHTML = '<div class="il-empty">Trail unavailable: ' + esc(e.message) + '</div>';
+  }
+}
 async function _bwClearInspect() {
-  try { await fetch('/api/browser/inspect/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ session: _bwSession }) }); } catch(e) {}
-  _bwInspData = { console: [], network: [], errors: [] };
+  try { await _bwFetch('/api/browser/inspect/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ session: _bwSession }) }); } catch(e) {}
+  _bwInspData = { console: [], network: [], errors: [], trail: _bwInspData.trail || [] };
   ['console','network','errors'].forEach(k => { const el = document.getElementById('bw-ic-' + k); if (el) el.textContent = ''; });
   _bwRenderInspect();
 }
@@ -36498,6 +43014,87 @@ async function _bwNewProfile() {
     const sel = document.getElementById('bw-profile');
     if (sel) sel.value = d.profile;
   } catch(e) { showToast('Could not create profile'); }
+}
+
+async function _bwImportProfile() {
+  _bwStatus('Scanning for browsers...');
+  let sources;
+  try {
+    const r = await fetch('/api/browser/import/discover');
+    const d = await r.json();
+    sources = d.sources || [];
+  } catch(e) { _bwStatus('Import scan failed: ' + e); return; }
+
+  if (!sources.length) {
+    showToast('No browsers with importable profiles found on this machine');
+    _bwStatus('');
+    return;
+  }
+  _bwStatus('');
+
+  // Build the dialog HTML
+  var html = '<div style="max-height:340px;overflow-y:auto;margin-bottom:12px;">';
+  html += '<div style="font-size:0.78rem;color:var(--dim);margin-bottom:10px;">Select a browser profile to import cookies from.</div>';
+
+  // Radio list: one selection
+  var idx = 0;
+  for (var i = 0; i < sources.length; i++) {
+    var src = sources[i];
+    html += '<div style="margin-bottom:8px;"><div style="font-weight:600;font-size:0.85rem;margin-bottom:4px;">' + esc(src.name);
+    if (src.cookie_support === 'partial') html += ' <span style="color:var(--warn);font-size:0.72rem;">(partial support)</span>';
+    html += '</div>';
+    for (var j = 0; j < src.profiles.length; j++) {
+      var p = src.profiles[j];
+      var rid = 'bwi-radio-' + idx;
+      html += '<label for="' + rid + '" style="display:flex;align-items:center;gap:6px;padding:3px 8px;font-size:0.82rem;cursor:pointer;border-radius:4px;" onmouseover="this.style.background=\'rgba(255,255,255,0.06)\'" onmouseout="this.style.background=\'\'">';
+      html += '<input type="radio" name="bwi-source" id="' + rid + '" value="' + esc(src.id) + '|' + esc(p.name) + '"' + (p.default && idx < 2 ? ' checked' : '') + '>';
+      html += '<span>' + esc(p.display_name);
+      if (p.display_name !== p.name) html += ' <span style="color:var(--dim);font-size:0.72rem;">(' + esc(p.name) + ')</span>';
+      html += '</span></label>';
+      idx++;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  html += '<div style="margin-top:4px;"><label style="font-size:0.82rem;font-weight:500;">Destination profile name</label>';
+  html += '<input id="bwi-dest" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:4px;" placeholder="e.g. chrome-default" value="imported-chrome"></div>';
+
+  var ok = await showFormModal('Import browser profile', html, 'Import');
+  if (!ok) return;
+
+  var sel = document.querySelector('input[name="bwi-source"]:checked');
+  if (!sel) { showToast('No source profile selected'); return; }
+  var parts = sel.value.split('|');
+  var browserId = parts[0];
+  var profileName = parts[1];
+  var dest = (document.getElementById('bwi-dest') || {}).value || '';
+  dest = dest.trim();
+  if (!dest) { showToast('Destination name is required'); return; }
+
+  _bwStatus('Importing cookies...');
+  try {
+    var r = await fetch('/api/browser/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest })
+    });
+    var d = await r.json();
+    if (d.error) {
+      showToast('Import failed: ' + d.error, 'error');
+      _bwStatus('Import failed');
+      return;
+    }
+    var msg = 'Imported ' + d.imported_cookies + ' cookies into profile "' + esc(d.profile) + '"';
+    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + ' skipped)';
+    showToast(msg);
+    _bwStatus(msg);
+    await _bwLoadProfiles();
+    var profileSel = document.getElementById('bw-profile');
+    if (profileSel) profileSel.value = d.profile;
+  } catch(e) {
+    showToast('Import failed: ' + e.message, 'error');
+    _bwStatus('Import failed');
+  }
 }
 
 async function _bwSaveProfile() {
@@ -37001,17 +43598,17 @@ function _jrnlShowConfig() {
   const overlay = document.createElement('div');
   overlay.id = 'jrnl-config-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
-  overlay.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">' +
+  overlay.innerHTML = '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">' +
     '<h3 style="margin:0 0 16px;font-size:0.95rem;">Journal Prompts</h3>' +
     '<p style="font-size:0.75rem;color:var(--dim);margin:0 0 12px;">Configure up to 3 optional prompts shown when creating entries.</p>' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 1</label>' +
-    '<input type="text" id="jrnl-cfg-p1" value="' + esc(_jrnlConfig.prompt1 || '') + '" placeholder="e.g. What are you grateful for?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:0.8rem;font-family:inherit;">' +
+    '<input type="text" id="jrnl-cfg-p1" value="' + esc(_jrnlConfig.prompt1 || '') + '" placeholder="e.g. What are you grateful for?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;font-family:inherit;">' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 2</label>' +
-    '<input type="text" id="jrnl-cfg-p2" value="' + esc(_jrnlConfig.prompt2 || '') + '" placeholder="e.g. How are you feeling?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:0.8rem;font-family:inherit;">' +
+    '<input type="text" id="jrnl-cfg-p2" value="' + esc(_jrnlConfig.prompt2 || '') + '" placeholder="e.g. How are you feeling?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;font-family:inherit;">' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 3</label>' +
-    '<input type="text" id="jrnl-cfg-p3" value="' + esc(_jrnlConfig.prompt3 || '') + '" placeholder="e.g. What did you learn today?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:0.8rem;font-family:inherit;">' +
+    '<input type="text" id="jrnl-cfg-p3" value="' + esc(_jrnlConfig.prompt3 || '') + '" placeholder="e.g. What did you learn today?" style="width:100%;padding:6px 8px;margin:4px 0 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;font-family:inherit;">' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">' +
-    '<button onclick="document.getElementById(\'jrnl-config-overlay\').remove()" style="padding:6px 14px;background:none;border:1px solid var(--border);border-radius:6px;color:var(--fg);cursor:pointer;font-family:inherit;">Cancel</button>' +
+    '<button onclick="document.getElementById(\'jrnl-config-overlay\').remove()" style="padding:6px 14px;background:none;border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;font-family:inherit;">Cancel</button>' +
     '<button onclick="_jrnlSaveConfig()" style="padding:6px 14px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-family:inherit;">Save</button>' +
     '</div></div>';
   document.body.appendChild(overlay);
@@ -37398,3 +43995,834 @@ function _dpInit() {
 }
 if (document.body) _dpInit();
 else document.addEventListener('DOMContentLoaded', _dpInit);
+
+// Linked work record: projections of existing board/message/artifact primitives.
+let _bdRecordTab = 'preview';
+const _bdSectionOpen = new Map();
+function _boardQuick(query) {
+  boardOwnerFilter = query.includes('owner:human') ? 'human' : 'all';
+  boardSearchQuery = query; _boardActiveView = '';
+  document.getElementById('board-search').value = query;
+  _bfSyncHash(); renderBoard();
+  amuxTrack('board_quick_filter', {query, owner:boardOwnerFilter, measured:true, n_considered:_boardLastVisible.length});
+}
+function _bdTaskLink(id, label) {
+  return '<button type="button" class="bd-related-link" onclick="_openIssue(\'' + escJs(id) + '\')">'
+    + '<span class="task-id-chip">' + esc(id) + '</span><span>' + esc(label || '') + '</span><span aria-hidden="true">›</span></button>';
+}
+async function _bdOpenCommit(hash, worker) {
+  if (!worker) {
+    _bdAudit('board-artifact-navigation', { verdict: 'missing-repository-context', ref: hash, card: boardDetailId });
+    showToast('This commit needs an owning worker or a full repository URL to open.', true); return;
+  }
+  closeBoardDetail();
+  openPeek(worker);
+  setPeekTab('commits');
+  await _commitsSelect(hash);
+}
+function _bdFilterSections(tab) {
+  document.querySelectorAll('#bd-meta .bd-card-section').forEach(section => {
+    const kind = section.dataset.recordKind || 'details';
+    section.hidden = tab !== 'preview' && kind !== tab;
+    if (tab !== 'preview' && !section.hidden && section.tagName === 'DETAILS') section.open = true;
+  });
+}
+function _bdEnhanceRecord(item) {
+  const meta = document.getElementById('bd-meta');
+  const summary = document.getElementById('bd-record-summary');
+  const owner = item.session || (item.owner_type === 'human' ? 'You' : 'Unassigned');
+  if (summary) summary.innerHTML = '<div class="bd-record-tags">'
+    + (item.type ? '<span class="bd-type-chip">' + esc(item.type) + '</span>' : '')
+    + (item.tags || []).map(tag => '<span class="board-card-tag">' + esc(tag) + '</span>').join('') + '</div>'
+    + '<div class="bd-record-properties"><div><span>Owner</span>'
+    + (item.session ? '<button class="bd-owner-link" onclick="closeBoardDetail();openPeek(\'' + escJs(item.session) + '\')"><span class="bd-avatar">'
+      + esc(owner.slice(0, 2).toUpperCase()) + '</span>' + esc(owner) + '</button>' : '<b>' + esc(owner) + '</b>')
+    + '</div><div><span>Due date</span><b>' + esc(item.due || 'No due date') + '</b></div><div><span>Epic</span>'
+    + (item.epic ? _bdTaskLink(item.epic, '') : '<b>No epic linked</b>') + '</div></div>';
+  if (!meta) return;
+  const evidence = String(item.evidence || '').trim();
+  let ac = item.acceptance_criteria || [];
+  if (typeof ac === 'string') { try { ac = JSON.parse(ac); } catch (_) { ac = [ac]; } }
+  if (!Array.isArray(ac)) ac = [ac];
+  const extra = document.createElement('section'); extra.className = 'bd-card-section bd-evidence-section';
+  extra.innerHTML = '<h4>Evidence & acceptance criteria</h4>'
+    + (ac.length ? '<ul>' + ac.map(c => '<li>' + esc(typeof c === 'string' ? c : JSON.stringify(c)) + '</li>').join('') : '<p class="bd-muted">Transition requirements are listed in the gate section.</p>')
+    + (evidence ? '<div class="bd-evidence-text">' + _linkifyUrls(_linkifyCardIds(esc(evidence))).replace(/\n/g, '<br>') + '</div>' : '<p class="bd-muted">No execution evidence recorded yet.</p>');
+  meta.appendChild(extra);
+  if (item.verification) {
+    const v = item.verification;
+    const record = document.createElement('section'); record.className = 'bd-card-section bd-verification-section';
+    const label = {needs_reverification:'Criteria changed — verification needs a fresh check', current:'Verified against recorded criteria', history_unavailable:'Verified — earlier criteria were not recorded', not_verified:'Not currently verified'}[v.state] || 'Verification';
+    record.innerHTML = '<h4>Verification</h4><p>' + esc(label) + '</p>'
+      + (v.method ? '<p class="bd-muted">' + esc(v.method === 'independent_harness' ? 'Independent harness' : 'Named gate acknowledgement') + ' · ' + esc(v.actor || '') + '</p>' : '')
+      + (v.criteria_version != null ? '<p>Current criteria v' + esc(String(v.criteria_version)) + ' · Last checked v' + esc(String(v.verified_criteria_version ?? '—')) + '</p>' : '')
+      + (v.gate_matches === false ? '<p>The current gate differs from the recorded gate. Earlier evidence is retained.</p>' : '')
+      + (Array.isArray(v.criteria) ? '<ul>' + v.criteria.map(c => '<li>' + esc(c.description) + '</li>').join('') + '</ul>' : '');
+    if (v.state === 'needs_reverification' && v.gate_matches === false) record.innerHTML += '<button class="btn" onclick="_bdRecheckGate()">Recheck current gate</button>';
+    meta.appendChild(record);
+  }
+
+  const sectionKinds = { 'Linked messages': 'related', 'Linked tasks': 'related', 'Subtasks': 'subtasks', 'Produced output': 'files', 'Retired artifacts': 'files', 'Worker actions': 'history' };
+  const titles = { 'Source message': 'Linked messages', 'Source messages': 'Linked messages', 'Task relationships': 'Linked tasks', 'Produced assets': 'Produced output', 'Column gate requirements': 'Gate criteria', 'Work summary': 'Next action & results' };
+  const counts = { subtasks: (item.children || []).length, related: (item.messages || []).length + (item.depends_on || []).length + (item.epic ? 1 : 0), files: 0 };
+  meta.querySelectorAll(':scope > section.bd-card-section').forEach(section => {
+    const heading = section.querySelector('h4');
+    if (!heading) return;
+    const original = heading.textContent;
+    const base = original.replace(/\s*\(\d+\)$/, '');
+    const label = titles[base] || base;
+    const kind = sectionKinds[label] || 'details';
+    if (label === 'Produced output') counts.files = Number((original.match(/\((\d+)\)$/) || [])[1] || 0);
+    const disclosure = document.createElement('details');
+    disclosure.className = section.className; disclosure.dataset.recordKind = kind;
+    const key = item.id + ':' + label;
+    disclosure.open = _bdSectionOpen.has(key) ? _bdSectionOpen.get(key) : !['Gate criteria', 'Next action & results', 'Worker actions', 'Retired artifacts'].includes(label);
+    const head = document.createElement('summary');
+    head.innerHTML = '<span class="bd-section-icon" aria-hidden="true">' + ({related:'↗',subtasks:'☷',files:'◇',history:'◷'}[kind] || '≡') + '</span><h4>' + esc(label + original.slice(base.length)) + '</h4>';
+    heading.remove(); disclosure.appendChild(head);
+    const body = document.createElement('div'); body.className = 'bd-section-body';
+    while (section.firstChild) body.appendChild(section.firstChild);
+    disclosure.appendChild(body); disclosure.addEventListener('toggle', () => _bdSectionOpen.set(key, disclosure.open));
+    section.replaceWith(disclosure);
+  });
+  for (const [tab, title] of Object.entries({subtasks:'Subtasks', files:'Produced output', related:'Linked messages & tasks'})) {
+    if (!meta.querySelector('[data-record-kind="' + tab + '"]')) {
+      const empty = document.createElement('section'); empty.className = 'bd-card-section'; empty.dataset.recordKind = tab;
+      empty.innerHTML = '<div class="bd-section-body"><h4>' + title + '</h4><p class="bd-muted">Nothing linked yet.</p></div>';
+      meta.appendChild(empty);
+    }
+  }
+  for (const [tab, count] of Object.entries(counts)) {
+    const badge = document.getElementById('bd-count-' + tab); if (badge) badge.textContent = String(count);
+  }
+  // Keep every relationship reachable from Related, while Subtasks narrows to
+  // the epic/child/dependency section rather than a separate relation store.
+  _bdFilterSections(_bdRecordTab);
+  _bdAudit('board-linked-record', { verdict: 'rendered', measured: true, n_considered: counts.subtasks + counts.related + counts.files,
+    card: item.id, children: counts.subtasks, related: counts.related, outputs: counts.files, evidence: !!evidence });
+}
+
+async function _bdRecheckGate() {
+  const id = boardDetailId;
+  const current = boardItems.find(item => item.id === id);
+  if (!current || !_bdHydrated) return;
+  const ack = await _gateConfirm(current, 'verified');
+  if (!ack || id !== boardDetailId) return;
+  const saved = await updateBoardItem(id, {status:'verified', reverify:true, gate_checked:Array.isArray(ack) ? ack : [], expect_rev:_bdLoadedIdentity.rev});
+  if (saved && id === boardDetailId) openBoardDetail(id);
+}
+
+function pickCardFiles(name) {
+  const input = document.createElement('input'); input.type = 'file'; input.multiple = true;
+  input.onchange = () => {
+    const files = Array.from(input.files || []);
+    _outboxDiagnostic('card_files_selected', {session:name, count:files.length});
+    for (const file of files) _enqueueUpload(file, _cardSink(name));
+  };
+  input.click();
+}
+
+// ── Record tab (AMUX-4625) ───────────────────────────────────────────────────
+// One tap records audio on this device. Every 1 s chunk is written to its OWN
+// IndexedDB database the moment it arrives, so a reload, a crash or iOS killing
+// the backgrounded PWA keeps everything captured up to the last second. When
+// amux is reachable each finished recording is uploaded once to the folder set
+// in this tab; the server writes the recording's datetime into the file and a
+// sidecar, and transcribes it locally. The device copy is dropped only after
+// the server's sha256 matches the bytes this device holds, so an unsynced
+// recording is never discarded automatically.
+const _RECORDER_DB = 'amux-recorder';
+const _RECORDER_MIMES = ['audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'];
+const _RECORDER_MAX_AUTO = 8;   // server-refused uploads stop auto-retrying after this; Retry still works
+let _recorderDbP = null;
+let _recorderStream = null, _recorderMedia = null, _recorderLive = null;
+let _recorderSeq = 0, _recorderWrites = Promise.resolve(), _recorderStarting = false, _recorderFinalizing = '';
+let _recorderStopReason = '', _recorderTimer = 0, _recorderRaf = 0, _recorderAudioCtx = null, _recorderAnalyser = null;
+let _recorderWake = null, _recorderSyncing = false, _recorderSyncTimer = 0, _recorderRecovered = false;
+let _recorderServer = [], _recorderServerDir = '', _recorderServerErr = '', _recorderConfig = null;
+let _recorderLocal = [], _recorderAudioEl = null, _recorderInited = false;
+
+function _recorderUsed() { try { return localStorage.getItem('amux_recorder_used') === '1'; } catch (e) { return false; } }
+
+function _recorderDb() {
+  if (_recorderDbP) return _recorderDbP;
+  _recorderDbP = new Promise((resolve, reject) => {
+    const req = indexedDB.open(_RECORDER_DB, 1);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      if (!d.objectStoreNames.contains('recs')) d.createObjectStore('recs', {keyPath: 'id'});
+      if (!d.objectStoreNames.contains('chunks')) d.createObjectStore('chunks', {keyPath: ['rec', 'seq']});
+    };
+    req.onsuccess = () => {
+      const d = req.result;
+      d.onversionchange = () => { d.close(); _recorderDbP = null; };
+      resolve(d);
+    };
+    req.onerror = () => { _recorderDbP = null; reject(req.error || new Error('recorder storage unavailable')); };
+  });
+  return _recorderDbP;
+}
+function _recorderReq(req) {
+  return new Promise((resolve, reject) => { req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error); });
+}
+// A write resolves only when its transaction COMMITS; an abort rejects, so a
+// caller can never report "saved" for a chunk the browser refused.
+function _recorderTx(stores, write) {
+  return _recorderDb().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction(stores, 'readwrite');
+    tx.oncomplete = () => resolve();
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error('recorder storage transaction aborted'));
+    try { write(tx); } catch (e) { try { tx.abort(); } catch (_) {} reject(e); }
+  }));
+}
+function _recorderChunkRange(id) { return IDBKeyRange.bound([id, 0], [id, Infinity]); }
+async function _recorderList() { const d = await _recorderDb(); return _recorderReq(d.transaction('recs').objectStore('recs').getAll()); }
+async function _recorderGet(id) { const d = await _recorderDb(); return _recorderReq(d.transaction('recs').objectStore('recs').get(id)); }
+async function _recorderChunks(id) {
+  const d = await _recorderDb();
+  return _recorderReq(d.transaction('chunks').objectStore('chunks').getAll(_recorderChunkRange(id)));
+}
+// Read-modify-write inside ONE transaction: a chunk append and a sync patch on
+// the same recording cannot overwrite each other's fields.
+function _recorderPatch(id, patch) {
+  return _recorderTx(['recs'], tx => {
+    const s = tx.objectStore('recs');
+    const r = s.get(id);
+    r.onsuccess = () => { if (r.result) s.put(Object.assign(r.result, patch)); };
+  });
+}
+function _recorderAddChunk(id, seq, blob, at) {
+  return _recorderTx(['recs', 'chunks'], tx => {
+    tx.objectStore('chunks').put({rec: id, seq, blob, size: blob.size});
+    const s = tx.objectStore('recs');
+    const r = s.get(id);
+    r.onsuccess = () => {
+      const m = r.result;
+      if (!m) return;
+      m.seq = Math.max(m.seq || 0, seq + 1);
+      m.bytes = (m.bytes || 0) + blob.size;
+      m.last_chunk_at = at;
+      if (seq === 0 && blob.type) m.mime = blob.type;   // what was actually recorded
+      s.put(m);
+    };
+  });
+}
+function _recorderDropChunks(id) { return _recorderTx(['chunks'], tx => { tx.objectStore('chunks').delete(_recorderChunkRange(id)); }); }
+
+function _recorderStatus(t) { const el = document.getElementById('recorder-status'); if (el) el.textContent = t; }
+function _recorderClock(ms) {
+  const s = Math.max(0, Math.floor((ms || 0) / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, '0');
+  return h ? h + ':' + String(m).padStart(2, '0') + ':' + sec : m + ':' + sec;
+}
+function _recorderSize(b) {
+  b = b || 0;
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(b < 102400 ? 1 : 0) + ' KB';
+  return (b / 1048576).toFixed(1) + ' MB';
+}
+function _recorderHex(buf) { return Array.from(new Uint8Array(buf), x => x.toString(16).padStart(2, '0')).join(''); }
+
+function _recorderToggle() {
+  if (_recorderLive) _recorderStop('stopped');
+  else _recorderStart();
+}
+
+async function _recorderStart() {
+  if (_recorderStarting || _recorderLive) return;
+  if (!navigator.mediaDevices || !window.MediaRecorder) { _recorderStatus('This browser cannot record audio.'); return; }
+  _recorderStarting = true;
+  _recorderStatus('Starting the microphone…');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true}});
+  } catch (e) {
+    _recorderStarting = false;
+    _recorderStatus('Microphone unavailable: ' + ((e && (e.message || e.name)) || 'permission denied'));
+    return;
+  }
+  const release = () => { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} };
+  const candidates = _RECORDER_MIMES.filter(m => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(m));
+  const mime = candidates[0] || '';
+  let rec;
+  try { rec = new MediaRecorder(stream, Object.assign({audioBitsPerSecond: 32000}, mime ? {mimeType: mime} : {})); }
+  catch (e) {
+    try { rec = new MediaRecorder(stream); }
+    catch (e2) { release(); _recorderStarting = false; _recorderStatus('Recorder unavailable: ' + (e2.message || e2.name)); return; }
+  }
+  const now = Date.now();
+  const meta = {
+    id: 'r' + now.toString(36) + Math.random().toString(36).slice(2, 6),
+    started_at: now, ended_at: 0, dur_ms: 0, tz_offset_min: -new Date(now).getTimezoneOffset(),
+    mime: rec.mimeType || mime || 'audio/webm', device: String(navigator.userAgent || '').slice(0, 160),
+    location: null, state: 'recording', seq: 0, bytes: 0, last_chunk_at: now,
+    attempts: 0, net_failures: 0, last_attempt: 0, error: '', path: '', file: '', upload_sha256: '', recovered: false,
+  };
+  try { await _recorderTx(['recs'], tx => { tx.objectStore('recs').put(meta); }); }
+  catch (e) {
+    release(); _recorderStarting = false;
+    _recorderStatus('Not recording: this device refused storage (' + ((e && e.message) || 'unknown') + ')');
+    return;
+  }
+  try { localStorage.setItem('amux_recorder_used', '1'); } catch (e) {}
+  _recorderStream = stream; _recorderMedia = rec; _recorderLive = meta;
+  _recorderSeq = 0; _recorderWrites = Promise.resolve(); _recorderStopReason = '';
+  _recorderAttach(rec, meta, candidates.slice(1));
+  stream.getAudioTracks().forEach(t => t.addEventListener('ended', () => {
+    _recorderStop('the microphone was released, usually because the app went to the background or another app took it');
+  }));
+  try { rec.start(1000); }
+  catch (e) {
+    release(); _recorderStream = null; _recorderMedia = null; _recorderLive = null; _recorderStarting = false;
+    await _recorderPatch(meta.id, {state: 'empty', error: 'recorder did not start'}).catch(() => {});
+    _recorderStatus('Recorder did not start: ' + (e.message || e.name));
+    _recorderRender();
+    return;
+  }
+  _recorderStarting = false;
+  _recorderWakeLock();
+  _recorderStartMeter();
+  clearInterval(_recorderTimer);
+  _recorderTimer = setInterval(_recorderTick, 500);
+  _recorderTick();
+  let wantLocation = false;
+  try { wantLocation = localStorage.getItem('amux_recorder_location') === '1'; } catch (e) {}
+  if (wantLocation) _recorderLocate(meta.id);
+  _recorderRender();
+}
+
+function _recorderAttach(rec, meta, fallbacks) {
+  rec.ondataavailable = ev => {
+    if (!ev.data || !ev.data.size) return;
+    const seq = _recorderSeq++, at = Date.now(), blob = ev.data;
+    meta.bytes += blob.size; meta.last_chunk_at = at;
+    _recorderWrites = _recorderWrites
+      .then(() => _recorderAddChunk(meta.id, seq, blob, at))
+      .catch(e => { meta.write_error = (e && e.message) || 'write failed'; _recorderStatus('A second of audio could not be saved: ' + meta.write_error); });
+  };
+  rec.onstop = () => { if (!rec._recorderReplaced) _recorderFinalize(meta.id); };
+  rec.onerror = ev => {
+    const why = (ev && ev.error && ev.error.message) || 'unknown error';
+    // A browser can CLAIM a format it cannot encode: Chromium without an AAC
+    // encoder passes isTypeSupported('audio/mp4') and then fails with "Encoder
+    // initialization failed". Before any audio exists, move to the next format
+    // on the same microphone stream instead of ending the recording.
+    if (_recorderSeq === 0 && fallbacks.length && _recorderLive === meta && _recorderStream) {
+      rec._recorderReplaced = true;
+      try { if (rec.state !== 'inactive') rec.stop(); } catch (e) {}
+      let next = null;
+      try { next = new MediaRecorder(_recorderStream, {audioBitsPerSecond: 32000, mimeType: fallbacks[0]}); } catch (e) { next = null; }
+      if (next) {
+        meta.mime = next.mimeType || fallbacks[0];
+        _recorderPatch(meta.id, {mime: meta.mime}).catch(() => {});
+        _recorderMedia = next;
+        _recorderAttach(next, meta, fallbacks.slice(1));
+        try { next.start(1000); return; } catch (e) { next._recorderReplaced = false; }
+      }
+    }
+    _recorderStop('the recorder failed (' + why + ')');
+  };
+}
+
+function _recorderStop(reason) {
+  const rec = _recorderMedia;
+  if (!_recorderLive) return;
+  if (!_recorderStopReason) _recorderStopReason = reason || 'stopped';
+  if (rec && rec.state !== 'inactive') {
+    try { rec.stop(); return; } catch (e) {}
+  }
+  _recorderFinalize(_recorderLive.id);   // already inactive: onstop may never come
+}
+
+async function _recorderFinalize(id) {
+  if (!id || !_recorderLive || _recorderLive.id !== id || _recorderFinalizing === id) return;
+  _recorderFinalizing = id;
+  clearInterval(_recorderTimer); _recorderTimer = 0;
+  _recorderStopMeter();
+  _recorderReleaseWake();
+  try { _recorderStream && _recorderStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  _recorderStream = null; _recorderMedia = null;
+  await _recorderWrites;   // the last dataavailable fires before stop, so every chunk is queued here
+  const reason = _recorderStopReason || 'stopped';
+  let m = null;
+  try { m = await _recorderGet(id); } catch (e) {}
+  const endedAt = Date.now();
+  try {
+    if (!m || !m.seq) {
+      await _recorderPatch(id, {state: 'empty', ended_at: endedAt, error: 'nothing was captured'});
+      _recorderStatus('Nothing was captured' + (reason === 'stopped' ? '.' : ': ' + reason + '.'));
+    } else {
+      const dur = Math.max(0, endedAt - m.started_at);
+      await _recorderPatch(id, {state: 'local', ended_at: endedAt, dur_ms: dur});
+      _recorderStatus((reason === 'stopped' ? 'Saved on this device' : 'Recording ended: ' + reason + '. Saved what was captured')
+        + ' (' + _recorderClock(dur) + ', ' + _recorderSize(m.bytes) + ').');
+    }
+  } catch (e) {
+    _recorderStatus('Recording stopped, but its details could not be saved: ' + ((e && e.message) || 'storage error'));
+  }
+  _recorderLive = null; _recorderFinalizing = ''; _recorderStopReason = '';
+  await _recorderRender();
+  _recorderSync();
+}
+
+async function _recorderWakeLock() {
+  if (!_recorderLive || _recorderWake || !('wakeLock' in navigator)) return;
+  try {
+    _recorderWake = await navigator.wakeLock.request('screen');
+    _recorderWake.addEventListener('release', () => { _recorderWake = null; });
+  } catch (e) { _recorderWake = null; }
+}
+function _recorderReleaseWake() {
+  try { if (_recorderWake) _recorderWake.release(); } catch (e) {}
+  _recorderWake = null;
+}
+
+function _recorderLocate(id) {
+  if (!navigator.geolocation) return;
+  try {
+    navigator.geolocation.getCurrentPosition(p => {
+      const loc = {lat: +p.coords.latitude.toFixed(6), lon: +p.coords.longitude.toFixed(6), accuracy_m: Math.round(p.coords.accuracy || 0)};
+      if (_recorderLive && _recorderLive.id === id) _recorderLive.location = loc;
+      _recorderPatch(id, {location: loc}).catch(() => {});
+    }, () => {}, {enableHighAccuracy: false, timeout: 10000, maximumAge: 60000});
+  } catch (e) {}
+}
+function _recorderSetLocation(on) {
+  try { localStorage.setItem('amux_recorder_location', on ? '1' : '0'); } catch (e) {}
+  if (on && _recorderLive) _recorderLocate(_recorderLive.id);
+}
+
+function _recorderStartMeter() {
+  try {
+    _recorderAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_recorderAudioCtx.state === 'suspended') _recorderAudioCtx.resume().catch(() => {});
+    const src = _recorderAudioCtx.createMediaStreamSource(_recorderStream);
+    _recorderAnalyser = _recorderAudioCtx.createAnalyser();
+    _recorderAnalyser.fftSize = 512;
+    src.connect(_recorderAnalyser);
+  } catch (e) { return; }   // the meter is cosmetic; recording never depends on it
+  const data = new Uint8Array(_recorderAnalyser.fftSize);
+  const fill = document.getElementById('recorder-level-fill');
+  const draw = () => {
+    if (!_recorderLive || !_recorderAnalyser) return;
+    _recorderAnalyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+    const level = Math.min(1, Math.sqrt(sum / data.length) * 4);
+    if (fill) fill.style.transform = 'scaleX(' + Math.max(0.02, level).toFixed(3) + ')';
+    _recorderRaf = requestAnimationFrame(draw);
+  };
+  draw();
+}
+function _recorderStopMeter() {
+  if (_recorderRaf) cancelAnimationFrame(_recorderRaf);
+  _recorderRaf = 0; _recorderAnalyser = null;
+  try { if (_recorderAudioCtx) _recorderAudioCtx.close(); } catch (e) {}
+  _recorderAudioCtx = null;
+  const fill = document.getElementById('recorder-level-fill');
+  if (fill) fill.style.transform = 'scaleX(0.02)';
+}
+function _recorderTick() {
+  const el = document.getElementById('recorder-elapsed');
+  if (!_recorderLive) { if (el) el.textContent = '0:00'; return; }
+  const ms = Date.now() - _recorderLive.started_at;
+  if (el) el.textContent = _recorderClock(ms);
+  if (!_recorderLive.write_error) _recorderStatus('Recording · ' + _recorderSize(_recorderLive.bytes) + ' saved on this device · tap to stop');
+}
+
+// A recording left 'recording' by a reload or a crash is finished with what it
+// captured; one left 'syncing' by a killed upload goes back in the queue.
+async function _recorderRecover() {
+  if (_recorderRecovered) return;
+  _recorderRecovered = true;
+  const liveId = _recorderLive && _recorderLive.id;
+  for (const m of await _recorderList()) {
+    if (m.id === liveId) continue;
+    if (m.state === 'recording') {
+      const end = m.last_chunk_at || m.started_at;
+      await _recorderPatch(m.id, {state: m.seq ? 'local' : 'empty', recovered: true, ended_at: end, dur_ms: Math.max(0, end - m.started_at)});
+    } else if (m.state === 'syncing') {
+      await _recorderPatch(m.id, {state: 'local'});
+    }
+  }
+}
+
+function _recorderReady(m, force) {
+  if (!['local', 'failed'].includes(m.state)) return false;
+  if (force) return true;
+  if (m.state === 'failed' && (m.attempts || 0) >= _RECORDER_MAX_AUTO) return false;
+  const wait = m.state === 'failed'
+    ? Math.min(600000, 5000 * Math.pow(2, m.attempts || 0))
+    : Math.min(60000, 2000 * Math.pow(2, m.net_failures || 0));
+  return Date.now() - (m.last_attempt || 0) > wait;
+}
+
+async function _recorderSync(force) {
+  if (_recorderSyncing || navigator.onLine === false) return;
+  if (!_recorderUsed() && !_recorderInited) return;
+  _recorderSyncing = true;
+  let synced = 0;
+  try {
+    await _recorderRecover();
+    const liveId = _recorderLive && _recorderLive.id;
+    const recs = (await _recorderList()).filter(m => m.id !== liveId).sort((a, b) => a.started_at - b.started_at);
+    for (const m of recs) {
+      if (!_recorderReady(m, force === true)) continue;
+      if (await _recorderUpload(m)) synced++;
+      if (navigator.onLine === false) break;
+    }
+  } catch (e) {
+    _recorderStatus('Sync stopped: ' + ((e && e.message) || 'storage error'));
+  } finally { _recorderSyncing = false; }
+  if (synced) showToast(synced + ' recording' + (synced === 1 ? '' : 's') + ' synced');
+  _recorderScheduleSync();
+  if (activeView === 'record') {
+    if (synced) await _recorderLoadServer();
+    _recorderRender();
+  }
+}
+
+async function _recorderScheduleSync() {
+  let pending = 0;
+  try { pending = (await _recorderList()).filter(m => ['local', 'failed', 'syncing'].includes(m.state)).length; } catch (e) {}
+  if (pending && !_recorderSyncTimer) _recorderSyncTimer = setInterval(() => _recorderSync(), 60000);
+  if (!pending && _recorderSyncTimer) { clearInterval(_recorderSyncTimer); _recorderSyncTimer = 0; }
+}
+
+async function _recorderUpload(m) {
+  const chunks = await _recorderChunks(m.id);
+  if (!chunks.length) {
+    await _recorderPatch(m.id, {state: 'empty', error: 'no audio on this device'});
+    return false;
+  }
+  const type = m.mime || chunks[0].blob.type || 'audio/webm';
+  const blob = new Blob(chunks.map(c => c.blob), {type});
+  await _recorderPatch(m.id, {state: 'syncing', last_attempt: Date.now(), error: ''});
+  if (activeView === 'record') _recorderRender();
+  let sha = '';
+  try { sha = _recorderHex(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer())); } catch (e) { sha = ''; }
+  const q = new URLSearchParams({
+    id: m.id, started_at: String(m.started_at), ended_at: String(m.ended_at || m.last_chunk_at || m.started_at),
+    dur_ms: String(m.dur_ms || 0), tz_offset_min: String(m.tz_offset_min || 0), mime: type, device: m.device || '',
+  });
+  if (m.location) {
+    q.set('lat', String(m.location.lat)); q.set('lon', String(m.location.lon));
+    if (m.location.accuracy_m != null) q.set('accuracy_m', String(m.location.accuracy_m));
+  }
+  if (m.recovered) q.set('recovered', '1');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 300000);
+  let r;
+  try {
+    r = await fetch(API + '/api/recordings/upload?' + q.toString(), {
+      method: 'POST', headers: _authHeaders({'Content-Type': type.split(';')[0]}), body: blob, signal: ctl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    // Unreachable is not a refusal: it does not use up the retry budget.
+    await _recorderPatch(m.id, {state: 'local', error: 'Waiting for a connection to amux', net_failures: (m.net_failures || 0) + 1, last_attempt: Date.now()});
+    return false;
+  }
+  clearTimeout(timer);
+  let d = null;
+  try { d = await r.json(); } catch (e) { d = null; }
+  if (r.ok && d && d.ok) {
+    const serverSha = String(d.upload_sha256 || '');
+    const done = {path: d.path || '', file: d.file || '', upload_sha256: serverSha, synced_at: Date.now(), net_failures: 0, error: ''};
+    if (sha && serverSha === sha) {
+      await _recorderPatch(m.id, Object.assign(done, {state: 'synced', keep_local: false}));
+      await _recorderDropChunks(m.id);   // the folder holds identical bytes
+      return true;
+    }
+    if (!sha) {
+      // This browser could not hash, so nothing proves the copies match: keep ours.
+      await _recorderPatch(m.id, Object.assign(done, {state: 'synced', keep_local: true}));
+      return true;
+    }
+    await _recorderPatch(m.id, {state: 'failed', attempts: (m.attempts || 0) + 1, net_failures: 0,
+      error: 'The folder copy does not match this device (folder sha256 ' + (serverSha.slice(0, 12) || 'missing') + ', device ' + sha.slice(0, 12) + '). The audio stays here.'});
+    return false;
+  }
+  if (r.status === 409 && d && d.kind === 'id_conflict') {
+    await _recorderPatch(m.id, {state: 'conflict', attempts: (m.attempts || 0) + 1, net_failures: 0,
+      error: d.error || 'The folder already holds different audio under this recording id.'});
+    return false;
+  }
+  const msg = (d && (d.error || d.message)) || ('HTTP ' + r.status);
+  await _recorderPatch(m.id, {state: 'failed', attempts: (m.attempts || 0) + 1, net_failures: 0, error: String(msg).slice(0, 240)});
+  return false;
+}
+
+async function _recorderRetry(id) {
+  await _recorderPatch(id, {state: 'local', attempts: 0, net_failures: 0, last_attempt: 0, error: ''});
+  await _recorderRender();
+  _recorderSync(true);
+}
+
+async function _recorderLoadServer() {
+  try {
+    const r = await fetch(API + '/api/recordings?limit=100', {cache: 'no-store'});
+    const d = await r.json().catch(() => null);
+    if (!r.ok || !d) { _recorderServerErr = (d && d.error) || ('Folder listing unavailable (HTTP ' + r.status + ')'); return; }
+    _recorderServer = Array.isArray(d.recordings) ? d.recordings : [];
+    _recorderServerDir = d.dir || '';
+    _recorderServerErr = '';
+  } catch (e) {
+    _recorderServerErr = 'Offline: showing recordings on this device only';
+  }
+}
+
+async function _recorderLoadConfig() {
+  try {
+    const r = await fetch(API + '/api/recordings/config', {cache: 'no-store'});
+    const d = await r.json().catch(() => null);
+    _recorderConfig = r.ok && d ? d : {error: (d && d.error) || ('HTTP ' + r.status)};
+  } catch (e) { _recorderConfig = {error: 'Offline'}; }
+  _recorderRenderSettings();
+}
+
+async function _recorderSaveDir() {
+  const inp = document.getElementById('recorder-dir');
+  const help = document.getElementById('recorder-dir-help');
+  const dir = ((inp && inp.value) || '').trim();
+  if (!dir) { if (help) help.textContent = 'Enter a folder path.'; if (inp) inp.setAttribute('aria-invalid', 'true'); return; }
+  try {
+    const r = await fetch(API + '/api/recordings/config', {
+      method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({dir}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (inp) inp.setAttribute('aria-invalid', 'true');
+      if (help) help.textContent = 'Not saved: ' + (d.error || ('HTTP ' + r.status));
+      return;
+    }
+    if (inp) inp.removeAttribute('aria-invalid');
+    showToast('Recordings folder saved');
+  } catch (e) {
+    if (help) help.textContent = 'Not saved: amux is unreachable.';
+    return;
+  }
+  await _recorderLoadConfig();
+  await _recorderLoadServer();
+  _recorderRender();
+}
+
+function _recorderRenderSettings() {
+  const c = _recorderConfig || {};
+  const inp = document.getElementById('recorder-dir');
+  const help = document.getElementById('recorder-dir-help');
+  const tr = document.getElementById('recorder-transcriber');
+  const loc = document.getElementById('recorder-location');
+  try { if (loc) loc.checked = localStorage.getItem('amux_recorder_location') === '1'; } catch (e) {}
+  if (c.error) { if (help) help.textContent = 'Settings unavailable: ' + c.error; return; }
+  if (inp && document.activeElement !== inp) inp.value = c.dir || '';
+  if (help) {
+    const src = {env: 'Set by AMUX_RECORDINGS_DIR on the server, which overrides this field.', pref: 'Saved in amux settings.', default: 'Default folder.'}[c.dir_source] || '';
+    help.textContent = src + (c.dir_exists === false ? ' The folder does not exist yet; the first sync creates it.' : '')
+      + (c.ffmpeg === false ? ' ffmpeg is missing on the server, so the datetime is kept on the file and sidecar only.' : '');
+  }
+  if (tr) {
+    const t = c.transcriber || {};
+    tr.textContent = t.available
+      ? 'Transcripts: on, locally with ' + (t.engine || 'a local engine') + (t.model ? ' (' + t.model + ')' : '') + '.'
+      : 'Transcripts: off. ' + (t.why_unavailable || 'No local transcriber is configured on the server.');
+  }
+}
+
+function _recorderMerged() {
+  const byId = new Map();
+  for (const s of _recorderServer) byId.set(s.id, {id: s.id, server: s, local: null});
+  for (const l of _recorderLocal) {
+    const row = byId.get(l.id) || {id: l.id, server: null, local: null};
+    row.local = l;
+    byId.set(l.id, row);
+  }
+  const rows = Array.from(byId.values());
+  rows.forEach(r => { r.started = (r.local && r.local.started_at) || (r.server && r.server.started_at) || 0; });
+  return rows.sort((a, b) => b.started - a.started);
+}
+function _recorderHasLocalAudio(l) { return !!l && l.state !== 'empty' && (l.state !== 'synced' || !!l.keep_local); }
+
+function _recorderSyncWords(row) {
+  const l = row.local;
+  if (!l) return {cls: 'synced', text: 'Synced to the folder'};
+  const err = l.error ? ': ' + l.error : '';
+  switch (l.state) {
+    case 'recording': return {cls: 'recording', text: 'Recording'};
+    case 'syncing': return {cls: 'syncing', text: 'Syncing'};
+    case 'synced': return {cls: 'synced', text: l.keep_local ? 'Synced to the folder (also kept on this device)' : 'Synced to the folder'};
+    case 'failed': return {cls: 'failed', text: 'Sync failed' + err};
+    case 'conflict': return {cls: 'failed', text: 'Not synced' + (err || ': the folder holds different audio under this id')};
+    case 'empty': return {cls: 'empty', text: 'Nothing was captured'};
+    default: return {cls: 'local', text: 'On this device, waiting to sync' + (l.error ? ' (' + l.error + ')' : '')};
+  }
+}
+function _recorderTranscriptWords(row) {
+  const t = row.server && row.server.transcript;
+  if (!t) return row.local && row.local.state === 'empty' ? '' : 'Transcript after sync';
+  return ({pending: 'Transcript queued', running: 'Transcribing', done: 'Transcript ready',
+    failed: 'Transcription failed' + (t.error ? ': ' + t.error : ''),
+    unavailable: 'No local transcriber' + (t.error ? ': ' + t.error : '')})[t.status] || ('Transcript ' + (t.status || 'unknown'));
+}
+
+async function _recorderRender() {
+  try { _recorderLocal = await _recorderList(); } catch (e) { _recorderLocal = []; }
+  const on = !!_recorderLive;
+  const btn = document.getElementById('recorder-btn');
+  if (btn) {
+    btn.classList.toggle('recording', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.setAttribute('aria-label', on ? 'Stop recording' : 'Start recording');
+  }
+  const tab = document.getElementById('tab-record');
+  if (tab) tab.classList.toggle('recording', on);
+  if (!on) _recorderTick();
+  const summary = document.getElementById('recorder-sync-summary');
+  const waiting = _recorderLocal.filter(m => ['local', 'failed', 'syncing', 'conflict'].includes(m.state)).length;
+  if (summary) {
+    summary.textContent = waiting
+      ? waiting + ' recording' + (waiting === 1 ? '' : 's') + (navigator.onLine === false ? ' will sync when amux is reachable' : ' waiting to sync')
+      : (_recorderLocal.length || _recorderServer.length ? 'Everything recorded here is synced' : '');
+  }
+  const list = document.getElementById('recorder-list');
+  if (!list) return;
+  const rows = _recorderMerged();
+  let h = '';
+  if (_recorderServerErr) h += '<div class="ui-help recorder-note">' + esc(_recorderServerErr) + '</div>';
+  if (_recorderServerDir) h += '<div class="ui-help recorder-note">Folder: ' + esc(_recorderServerDir) + '</div>';
+  if (!rows.length) h += '<div class="recorder-empty">No recordings yet.</div>';
+  let day = '';
+  for (const row of rows) {
+    const l = row.local, s = row.server;
+    const d = new Date(row.started || Date.now());
+    const dayKey = d.toLocaleDateString([], {weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'});
+    if (dayKey !== day) { day = dayKey; h += '<div class="recorder-day">' + esc(dayKey) + '</div>'; }
+    const dur = (l && (l.state === 'recording' ? Date.now() - l.started_at : l.dur_ms)) || (s && s.dur_ms) || 0;
+    const bytes = (s && s.bytes) || (l && l.bytes) || 0;
+    const sync = _recorderSyncWords(row);
+    const tWords = _recorderTranscriptWords(row);
+    const excerpt = s && s.transcript && s.transcript.excerpt ? s.transcript.excerpt : '';
+    const id = esc(row.id);
+    const canPlay = (l && _recorderHasLocalAudio(l) && l.state !== 'recording') || (s && s.path);
+    let actions = '';
+    if (canPlay) actions += '<button class="btn" type="button" onclick="_recorderPlay(\'' + id + '\')">Play</button>';
+    if (s && s.transcript && s.transcript.status === 'done') actions += '<button class="btn" type="button" onclick="_recorderShowTranscript(\'' + id + '\')">Transcript</button>';
+    if (l && (l.state === 'failed' || l.state === 'conflict')) actions += '<button class="btn primary" type="button" onclick="_recorderRetry(\'' + id + '\')">Retry sync</button>';
+    if (s && s.transcript && (s.transcript.status === 'failed' || s.transcript.status === 'unavailable')) actions += '<button class="btn" type="button" onclick="_recorderRetranscribe(\'' + id + '\')">Transcribe again</button>';
+    if (l && l.state !== 'recording' && l.state !== 'syncing' && (l.state !== 'synced' || l.keep_local)) actions += '<button class="btn danger" type="button" onclick="_recorderDeleteLocal(\'' + id + '\')">Delete from this device</button>';
+    h += '<div class="recorder-item" data-rec-id="' + id + '" data-sync-state="' + esc((l && l.state) || 'synced') + '">'
+      + '<div class="recorder-item-head"><span class="recorder-when">' + esc(d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})) + '</span>'
+      + '<span class="recorder-meta">' + esc(_recorderClock(dur)) + ' · ' + esc(_recorderSize(bytes)) + (l && l.recovered ? ' · recovered after a reload' : '') + '</span></div>'
+      + '<div class="recorder-sync recorder-sync-' + sync.cls + '">' + esc(sync.text) + '</div>'
+      + (tWords ? '<div class="recorder-transcript-state">' + esc(tWords) + '</div>' : '')
+      + (excerpt ? '<div class="recorder-excerpt">' + esc(excerpt) + '</div>' : '')
+      + (actions ? '<div class="recorder-actions">' + actions + '</div>' : '')
+      + '</div>';
+  }
+  list.innerHTML = h;
+}
+
+async function _recorderPlay(id) {
+  try {
+    if (_recorderAudioEl) {
+      _recorderAudioEl.pause();
+      if (_recorderAudioEl.dataset.objectUrl) URL.revokeObjectURL(_recorderAudioEl.dataset.objectUrl);
+    }
+    const l = await _recorderGet(id).catch(() => null);
+    let src = '', objectUrl = '';
+    if (l && _recorderHasLocalAudio(l)) {
+      const ch = await _recorderChunks(id);
+      if (ch.length) { objectUrl = URL.createObjectURL(new Blob(ch.map(c => c.blob), {type: l.mime || ch[0].blob.type})); src = objectUrl; }
+    }
+    if (!src) {
+      const s = _recorderServer.find(x => x.id === id);
+      if (s && s.path) src = _authUrl(API + '/api/file/raw?path=' + encodeURIComponent(s.path));
+    }
+    if (!src) { showToast('No audio to play'); return; }
+    _recorderAudioEl = new Audio(src);
+    _recorderAudioEl.dataset.objectUrl = objectUrl;
+    await _recorderAudioEl.play();
+  } catch (e) { showToast('Playback failed: ' + ((e && (e.message || e.name)) || 'unknown')); }
+}
+
+async function _recorderShowTranscript(id) {
+  let d;
+  try {
+    const r = await fetch(API + '/api/recordings/' + encodeURIComponent(id), {cache: 'no-store'});
+    d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) { showToast('Transcript unavailable: ' + ((e && e.message) || 'offline')); return; }
+  const t = d.transcript || {};
+  const when = d.recorded_at_local || new Date(d.started_at || Date.now()).toLocaleString();
+  const text = t.text || t.error || 'No transcript yet.';
+  const copy = await showFormModal('Transcript',
+    '<div class="ui-help">' + esc(when) + (d.dur_ms ? ' · ' + esc(_recorderClock(d.dur_ms)) : '') + '</div>'
+    + '<div class="recorder-transcript">' + esc(text) + '</div>', 'Copy text');
+  if (copy && t.text) {
+    try { await navigator.clipboard.writeText(t.text); showToast('Transcript copied'); } catch (e) { showToast('Copy failed'); }
+  }
+}
+
+async function _recorderRetranscribe(id) {
+  try {
+    const r = await fetch(API + '/api/recordings/' + encodeURIComponent(id) + '/transcribe', {
+      method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}), body: '{}',
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('Not queued: ' + (d.error || ('HTTP ' + r.status))); return; }
+    showToast('Transcription queued');
+  } catch (e) { showToast('Not queued: amux is unreachable'); return; }
+  await _recorderLoadServer();
+  _recorderRender();
+}
+
+async function _recorderDeleteLocal(id) {
+  if (_recorderLive && _recorderLive.id === id) return;
+  const l = await _recorderGet(id).catch(() => null);
+  if (!l) return;
+  if (l.state !== 'synced' && l.state !== 'empty') {
+    const ok = await showConfirm('This recording has not synced, so its audio exists only on this device. Delete it?', 'Delete', true);
+    if (!ok) return;
+  }
+  try {
+    await _recorderTx(['recs', 'chunks'], tx => {
+      tx.objectStore('chunks').delete(_recorderChunkRange(id));
+      tx.objectStore('recs').delete(id);
+    });
+  } catch (e) { showToast('Not deleted: ' + ((e && e.message) || 'storage error')); return; }
+  _recorderRender();
+}
+
+async function _recorderInit() {
+  if (!_recorderInited) {
+    _recorderInited = true;
+    try { await _recorderRecover(); } catch (e) {}
+  }
+  _recorderRender();
+  _recorderLoadConfig();
+  await _recorderLoadServer();
+  await _recorderRender();
+  _recorderSync();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') {
+    // Flush the partial second so a suspension loses as little as possible.
+    try { if (_recorderMedia && _recorderMedia.state === 'recording') _recorderMedia.requestData(); } catch (e) {}
+    return;
+  }
+  if (_recorderLive) {
+    const tracks = _recorderStream ? _recorderStream.getAudioTracks() : [];
+    if (!_recorderMedia || _recorderMedia.state === 'inactive' || !tracks.some(t => t.readyState === 'live')) {
+      _recorderStop('recording stopped while the app was in the background');
+    } else {
+      _recorderWakeLock();
+    }
+  }
+  if (_recorderUsed()) _recorderSync();
+});
+window.addEventListener('pagehide', () => {
+  try { if (_recorderMedia && _recorderMedia.state === 'recording') _recorderMedia.requestData(); } catch (e) {}
+});
+window.addEventListener('online', () => { if (_recorderUsed()) setTimeout(() => _recorderSync(), 1500); });
+if (_recorderUsed()) setTimeout(() => _recorderSync(), 5000);

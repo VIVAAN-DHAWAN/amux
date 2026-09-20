@@ -71,10 +71,10 @@ fn the_fleet_list_spawns_nothing_unbounded() {
 /// It used to require `let probe_start = std::time::Instant::now();` in the
 /// source, guarding the property "fifty `pgrep -P` calls each just under budget
 /// is still minutes". 99cee1c8 (AMUX-3894) removed the loop entirely — one
-/// `ps -eo ppid=` answers "does this pid have a child" for every pid at once —
-/// so the clock it grepped for is legitimately gone and the test went red on a
-/// fix, which is the worst kind of red: it accuses the change that removed the
-/// hazard.
+/// one process-table snapshot answers "does this pid have a child" for every
+/// pid at once — so the clock it grepped for is legitimately gone and the test
+/// went red on a fix, which is the worst kind of red: it accuses the change that
+/// removed the hazard.
 ///
 /// The property is not merely retired, because the hazard is not gone; it moved.
 /// The fix's own comment names the correct invariant: "N sequential subprocesses
@@ -118,7 +118,7 @@ fn the_child_liveness_probe_is_one_subprocess_not_one_per_lane() {
             "`{spawner}` is back INSIDE the per-lane loop. That is one subprocess per lane, \
              which is the AMUX-3894 shape: ~50 spawns per cache miss, a fleet-size-dependent \
              cost that no per-call timeout can bound. Answer the question once outside the \
-             loop (`ps -eo ppid=`) and look the answer up in here. Body was:\n{body}"
+             loop (one process-table snapshot) and look the answer up in here. Body was:\n{body}"
         );
     }
 
@@ -126,10 +126,22 @@ fn the_child_liveness_probe_is_one_subprocess_not_one_per_lane() {
     // above passes against a file that simply stopped probing at all — which
     // would read every shell-foreground lane as not-running.
     let outside = SRC[..at].to_string() + &SRC[end..];
+    let probe_start = outside.find("let ps_probe = {").expect("single process snapshot is missing");
+    let probe = outside[probe_start..].split("};").next().unwrap();
+    assert_eq!(probe.matches(r#"Command::new("ps")"#).count(), 1, "snapshot must run ps once");
+    let args = probe.lines().find(|line| line.trim_start().starts_with("c.args("))
+        .expect("process snapshot has no argument list");
+    let literals: Vec<_> = args.split('"').skip(1).step_by(2).collect();
+    assert!(literals.contains(&"-eo"), "snapshot must enumerate the full process population");
+    assert!(literals.iter().any(|columns| columns.split(',').any(|c| c == "ppid=")),
+        "snapshot must contain parent identity; additional process fields are allowed: {args}");
+    assert!(probe.contains(r#"run_bounded(c, probe_budget(), "ps/ppid")"#),
+        "the single process snapshot must retain its deadline and diagnostic identity");
+    eprintln!("gate_probe verdict=bounded_fleet_process_snapshot measured=true n_considered=1 args={args}");
     assert!(
-        outside.contains(r#"c.args(["-eo", "ppid="])"#),
-        "premise gone: the one-shot `ps -eo ppid=` probe is not outside the loop, so \
-         'no spawns inside the loop' means 'no liveness probe at all'"
+        outside.contains("sessions_with_codex_tool_children(&pane_roots, out)"),
+        "the shared process snapshot must also derive provider tool-child activity rather than \
+         adding a second per-lane process probe"
     );
 
     assert!(

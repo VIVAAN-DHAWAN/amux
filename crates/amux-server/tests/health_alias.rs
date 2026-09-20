@@ -56,3 +56,106 @@ async fn api_health_is_an_alias_and_not_a_second_implementation() {
     let (bogus, _) = get("/api/health-not-a-route").await;
     assert_eq!(bogus, 404, "the alias must be one route, not a prefix catch-all");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn exhausted_read_pool_keeps_health_identity_and_runtime_responsive() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(amux_server::db::Store::open(&dir.path().join("health.db")).unwrap());
+    let state = AppState {
+        store: store.clone(), started: std::time::Instant::now(), build_hash: "pinned-image".into(),
+        auth_token: None, reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    // AF-933: `min_idle(1)` (AMUX-4739) means the pool starts with ONE real
+    // connection and grows the rest lazily, on demand, the first time each
+    // is actually requested -- it does not pre-create up to max_size at
+    // `Store::open`. A single linear `while let Some(conn) = try_read()`
+    // pass can therefore stop early: the 2nd/3rd/4th `try_read()` each need
+    // r2d2 to open and configure a brand-new SQLite connection before they
+    // can succeed, and on a slower disk (measured flaky on GitHub Actions,
+    // reliable on this box's local SSD) that creation can still be
+    // in-flight when `try_get`'s effectively-zero wait gives up, returning
+    // None while real capacity remains unclaimed. The old `assert!(!held.is_empty())`
+    // could not catch this: ANY nonzero drain passes it, so the test
+    // proceeded believing the pool was exhausted when 1-3 slots were still
+    // free, and the later health() call could legitimately succeed (200)
+    // against a pool that was never actually saturated.
+    //
+    // Retry on a miss instead of stopping at the first one, so lazy
+    // connection creation has a chance to finish; only give up after
+    // several CONSECUTIVE misses, which is what actual exhaustion looks
+    // like once the pool has finished growing.
+    let mut held = Vec::new();
+    let mut consecutive_misses = 0;
+    while consecutive_misses < 20 {
+        match store.try_read() {
+            Some(conn) => { held.push(conn); consecutive_misses = 0; }
+            None => { consecutive_misses += 1; std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+    }
+    assert!(!held.is_empty());
+    // Simulate fleet work borrowing every connection. A real OS thread releases
+    // them even if the old synchronous health handler blocks the entire runtime.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+    });
+    let started = std::time::Instant::now();
+    let request = amux_server::api::health::health(axum::extract::State(state.clone()));
+    let heartbeat = async {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        started.elapsed()
+    };
+    let ((status, axum::Json(body)), heartbeat_delay) = tokio::join!(request, heartbeat);
+    let elapsed = started.elapsed();
+    release.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_millis(250), "health waited for fleet work: {elapsed:?}");
+    assert!(heartbeat_delay < std::time::Duration::from_millis(250), "health blocked the runtime: {heartbeat_delay:?}");
+    assert_eq!(status.as_u16(), 503);
+    assert_eq!(body.build, "pinned-image");
+    assert!(!body.board.measured);
+    assert_eq!(body.board.error.as_deref(), Some("read_pool_exhausted"));
+    let (status, axum::Json(body)) = amux_server::api::health::health(axum::extract::State(state)).await;
+    assert_eq!(status.as_u16(), 200);
+    assert!(body.board.measured && body.board.ok);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_probe_success_remains_visible_during_the_next_slow_probe() {
+    use std::{sync::{Arc, mpsc}, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(amux_server::db::Store::open(&dir.path().join("progress.db")).unwrap());
+    let state = AppState {
+        store:store.clone(), started:std::time::Instant::now(), build_hash:"probe-progress".into(),
+        auth_token:None, reconciled:Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let block_writer = || {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let db = store.clone();
+        let thread = std::thread::spawn(move || db.write(move |_| {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(amux_server::db::WriteOutcome {applied:false,events:vec![]})
+        }).unwrap());
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (release_tx,thread)
+    };
+    let (release, thread) = block_writer();
+    let (status, axum::Json(body)) = amux_server::api::health::health(axum::extract::State(state.clone())).await;
+    assert_eq!(status.as_u16(),503);
+    assert_eq!(body.board.error.as_deref(),Some("probe_deadline_exceeded"));
+    assert!(!body.board.measured);
+    assert_eq!(body.store_probe.last_success_age_ms,None,"never claim a measurement before completion");
+    assert!(body.store_probe.in_flight_age_ms.is_some());
+    release.send(()).unwrap(); thread.join().unwrap();
+    // The detached work must publish its success even though its HTTP caller
+    // already received 503. A new healthy response alone does not prove this.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (release, thread) = block_writer();
+    let (status, axum::Json(body)) = amux_server::api::health::health(axum::extract::State(state)).await;
+    release.send(()).unwrap(); thread.join().unwrap();
+    assert_eq!(status.as_u16(),503);
+    assert!(!body.board.measured,"the current request is still unmeasured");
+    assert!(body.store_probe.last_success_age_ms.is_some_and(|age| age < 5000),
+        "the earlier detached probe completed successfully; a watchdog must see that progress");
+}

@@ -50,7 +50,7 @@ async function boot(page: import('@playwright/test').Page) {
   }, { name: NAME, root: ROOT });
 }
 
-test('worker card and peek share all 25 worker actions, plus both peek-only actions', async ({ page }) => {
+test('worker card and peek share all worker actions, plus both peek-only actions', async ({ page }) => {
   await boot(page);
   const state = await page.evaluate((sample) => {
     const w = window as any;
@@ -67,6 +67,13 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
       copy.querySelectorAll('.mi').forEach((icon) => icon.remove());
       return (copy.textContent || '').trim();
     };
+    // Prove the final action is reachable in the same render snapshot. Holding
+    // a locator across an await races the app's normal session-poll rerender;
+    // iOS WebKit correctly reported that detached-node race in the full suite.
+    const focus = peek.querySelector<HTMLElement>('#peek-focus-btn')!;
+    focus.scrollIntoView({ block: 'nearest' });
+    const focusRect = focus.getBoundingClientRect();
+    const peekRect = peek.getBoundingClientRect();
     const style = getComputedStyle(peek);
     return {
       card: keys(card),
@@ -77,20 +84,25 @@ test('worker card and peek share all 25 worker actions, plus both peek-only acti
       maxHeight: style.maxHeight,
       scrollHeight: peek.scrollHeight,
       clientHeight: peek.clientHeight,
+      focusReachable: focus.isConnected
+        && focusRect.top >= peekRect.top - 1
+        && focusRect.bottom <= peekRect.bottom + 1,
       headerIds: document.querySelectorAll('#peek-worker-menu-btn').length,
       composerIds: document.querySelectorAll('#peek-composer-more-btn').length,
       legacyDuplicateIds: document.querySelectorAll('#peek-more-btn').length,
     };
   }, SAMPLE);
 
-  expect(state.card).toHaveLength(25);
+  // 28 since 9af1c88b added Pause/Resume to the shared worker menu (AMUX-4632).
+  expect(state.card).toHaveLength(28);
+  expect(state.card).toContain('task-queue');
+  expect(state.card).toContain('copy-directory-link');
   expect(state.peek).toEqual(state.card);
   expect(state.peekOnly).toEqual(['File browser', 'Focus mode']);
   expect(state.overflowY).toBe('auto');
   expect(state.maxHeight).not.toBe('none');
   expect(state.scrollHeight).toBeGreaterThan(state.clientHeight);
-  await page.locator('#peek-focus-btn').scrollIntoViewIfNeeded();
-  await expect(page.locator('#peek-focus-btn')).toBeVisible();
+  expect(state.focusReachable).toBe(true);
   expect(state.headerIds).toBe(1);
   expect(state.composerIds).toBe(1);
   expect(state.legacyDuplicateIds).toBe(0);

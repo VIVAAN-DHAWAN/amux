@@ -2,19 +2,21 @@
 //!
 //! Files come from amux-dashboard's `static/` at compile time. index.html
 //! gets its AMUX-BOOTSTRAP block substituted at serve time — the same
-//! values the Python server injects (amux-server.py:65679), same trust
-//! model: the dashboard shell + auth token are served unauthenticated on
-//! the LAN, exactly as the Python server does today. Cloud deployments put
-//! a gateway in front of both. Parity, not a new decision.
+//! values the Python server injects (amux-server.py:65679). The owner's bearer
+//! is injected only for a browser on this machine or a request that explicitly
+//! presents it. A remote browser carrying a verified local-member cookie gets
+//! the shell WITHOUT that bearer and continues through its revocable cookie.
 
 use super::AppState;
 use amux_dashboard::DashboardAssets;
-use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::{Extension, Router};
 use sha2::Digest;
+use std::net::{IpAddr, SocketAddr};
 
+const OWNER_COOKIE: &str = "__Host-amux_owner";
 
 /// The public iCal URL the dashboard's Subscribe button shows.
 ///
@@ -85,19 +87,32 @@ pub fn routes() -> Router<AppState> {
 /// came in on that socket — never from a client-supplied `Host` header, which
 /// would let any client trigger the migration prompt against the real origin.
 type Legacy = Option<axum::Extension<crate::legacy_port::OnLegacyListener>>;
+type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
 
 fn legacy_port_of(l: Legacy) -> Option<u16> {
     l.map(|axum::Extension(crate::legacy_port::OnLegacyListener(p))| p)
 }
 
-async fn index(State(state): State<AppState>, legacy: Legacy) -> Response {
-    serve_index(&state, legacy_port_of(legacy))
+fn peer_ip(peer: Peer) -> Option<IpAddr> {
+    peer.map(|Extension(ConnectInfo(addr))| addr.ip())
+}
+
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer: Peer,
+    legacy: Legacy,
+) -> Response {
+    serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await
 }
 
 async fn serve_path(
     State(state): State<AppState>,
+    headers: HeaderMap,
     method: axum::http::Method,
     uri: Uri,
+    peer: Peer,
     legacy: Legacy,
 ) -> Response {
     let path = uri.path().trim_start_matches('/');
@@ -122,23 +137,285 @@ async fn serve_path(
     if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
+    if matches!(path, "business" | "business/" | "business/index.html") {
+        return serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await;
+    }
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_for(path);
-            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
+            let mut resp =
+                ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response();
+            if path == "sw.js" {
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    "no-cache".parse().unwrap(),
+                );
+            }
+            resp
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
-        None => serve_index(&state, legacy_port_of(legacy)),
+        None => serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await,
     }
 }
 
-fn serve_index(state: &AppState, legacy: Option<u16>) -> Response {
-    let Some(index) = DashboardAssets::get("index.html") else {
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|cookies| {
+        cookies.split(';').find_map(|part| {
+            let (cookie_name, value) = part.trim().split_once('=')?;
+            (cookie_name == name && !value.is_empty()).then_some(value)
+        })
+    })
+}
+
+fn owner_session_value(state: &AppState) -> Option<String> {
+    let owner_auth = state.auth_token.as_deref()?;
+    let mut hash = sha2::Sha256::new();
+    hash.update(format!("amux-owner-session:{owner_auth}"));
+    Some(hex::encode(hash.finalize()))
+}
+
+fn has_owner_session(state: &AppState, headers: &HeaderMap) -> bool {
+    match (owner_session_value(state), cookie_value(headers, OWNER_COOKIE)) {
+        (Some(expected), Some(provided)) => {
+            super::auth::constant_time_eq(provided.as_bytes(), expected.as_bytes())
+        }
+        _ => false,
+    }
+}
+
+// A cookie proves access to the bootstrap, not to API mutations. Keep that
+// distinction in diagnostics without recording the cookie or the owner token.
+pub(crate) fn owner_session_status(state: &AppState, headers: &HeaderMap) -> &'static str {
+    if has_owner_session(state, headers) {
+        "valid"
+    } else if cookie_value(headers, OWNER_COOKIE).is_some() {
+        "invalid"
+    } else {
+        "missing"
+    }
+}
+
+fn establish_owner_session(state: &AppState) -> Response {
+    let Some(value) = owner_session_value(state) else {
+        return Redirect::to("/").into_response();
+    };
+    let cookie = format!(
+        "{OWNER_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
+    );
+    // Redirect to /api/_clear_sw, which is outside the SW's intercept scope
+    // (the SW passes through all /api/* paths). That page unregisters the
+    // stale SW, clears caches, then redirects to /. Without this, an old SW
+    // serves a cached HTML shell that predates the cookie and the auth token
+    // is missing (iOS "connecting forever" bug).
+    let mut response = Redirect::to("/api/_clear_sw").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("hex owner-session cookie is a valid header"),
+    );
+    tracing::info!(
+        target: "amux::local_invite",
+        verdict = "owner_session_established",
+        "verified owner access was exchanged for an HttpOnly session"
+    );
+    response
+}
+
+/// Tiny HTML page that unregisters service workers and clears caches,
+/// then redirects to /. Served at /api/_clear_sw so the old SW (which
+/// passes through /api/* paths) cannot intercept it.
+pub async fn clear_sw_landing() -> Response {
+    const PAGE: &str = r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>amux</title></head><body>
+<p style="font-family:system-ui;text-align:center;margin-top:40vh">Refreshing...</p>
+<script>
+(async () => {
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map(r => r.unregister()));
+  } catch(e) {}
+  try {
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => caches.delete(k)));
+  } catch(e) {}
+  location.replace('/');
+})();
+</script></body></html>"#;
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8"),
+         (header::CACHE_CONTROL, "no-store")],
+        PAGE,
+    ).into_response()
+}
+
+mod tailnet_auth;
+
+async fn serve_shell(
+    state: &AppState,
+    legacy: Option<u16>,
+    headers: &HeaderMap,
+    uri: &Uri,
+    peer: Option<IpAddr>,
+) -> Response {
+    // Remove the bearer from the address bar before app.js or the service
+    // worker starts. The resulting HttpOnly cookie survives the SW's canonical
+    // `/` fetch and reload without leaving the bearer in history or caches.
+    if super::auth::has_owner_query_token(state, uri) {
+        return establish_owner_session(state);
+    }
+    // Same-owner Tailscale devices may opt into the existing HttpOnly owner
+    // session. Use the real socket peer and daemon identity, never a forwarded
+    // IP, hostname, or a claim supplied by the browser. Invitees remain scoped.
+    if state.auth_token.is_some() && !has_owner_session(state, headers)
+        && !super::org::has_local_member_cookie(headers)
+    {
+        if let Some(ip) = peer {
+            if tailnet_auth::verified(ip).await { return establish_owner_session(state); }
+        }
+    }
+    serve_index(state, legacy, headers, uri, peer)
+}
+
+fn request_authority(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| uri.authority().map(|authority| authority.to_string()))
+}
+
+fn owner_bootstrap_allowed(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    peer: Option<IpAddr>,
+) -> bool {
+    // An explicit owner credential always wins, including when the owner is
+    // recovering a browser that still carries an old member cookie.
+    if super::auth::has_owner_token(state, headers, uri) || has_owner_session(state, headers) {
+        return true;
+    }
+
+    let verified_member = super::org::is_verified_local_member(headers);
+    let has_member_cookie = super::org::has_local_member_cookie(headers);
+    if verified_member || has_member_cookie {
+        if has_member_cookie && !verified_member && state.auth_token.is_some() {
+            tracing::warn!(
+                target: "amux::local_invite",
+                verdict = "revoked_member_bootstrap_withheld",
+                "a dashboard reload carried an unverified member cookie; owner credentials were withheld"
+            );
+        }
+        return false;
+    }
+
+    let authority = request_authority(headers, uri);
+    let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref());
+    if let Some((peer_field, authority_field)) = withheld_bootstrap_record(
+        state.auth_token.is_some(),
+        local,
+        peer,
+        authority.as_deref(),
+    ) {
+        // AF-639: the ONLY server-side record that a browser was handed a
+        // tokenless shell. Withholding is correct and deliberate (see
+        // `inject_bootstrap`), and it is INVISIBLE: the window that receives
+        // it then 401s on every /api call for the life of the tab, and the
+        // request log shows those refusals with nothing naming a cause.
+        // Measured 2026-09-09 on this fleet: 28,355 401s in 24h from one
+        // laptop over Tailscale, at the SPA's 5s poll cadence, with zero log
+        // lines explaining them.
+        //
+        // The two fields ARE the predicate rather than context around it:
+        // `peer` is who connected and `authority` is the name they addressed,
+        // and the shell is withheld precisely when that name does not resolve
+        // back to that peer. A reader who has both can reproduce the verdict.
+        tracing::warn!(
+            target: "amux::shell_bootstrap",
+            verdict = "remote_bootstrap_withheld",
+            peer = %peer_field,
+            authority = %authority_field,
+            "served a tokenless dashboard shell: the addressed host does not resolve to this peer, so every /api request from that window will 401 until it loads the shell with ?_token="
+        );
+    }
+    local
+}
+
+/// Whether this shell-serve is the withheld case, and the two fields the log
+/// line carries: `(peer, authority)`.
+///
+/// Split out from the `tracing::warn!` above so the decision is testable.
+/// Capturing the emitted line instead is NOT a workable check here: `tracing`
+/// caches interest per callsite for the whole PROCESS, the suite runs tests in
+/// parallel threads of one process, and a sibling test that reaches this code
+/// path with no subscriber installed caches the callsite as disabled for every
+/// later test. Measured 2026-09-09 while writing this: a capture-based version
+/// passed run alone and failed in the suite, with a self-check probe proving
+/// the capture harness itself was working. That is a test whose result depends
+/// on scheduling, which is worse than no test.
+///
+/// What this cannot see is whether the warn is WIRED to it. That is checked
+/// against the running server instead, with the curl repro on AF-639.
+fn withheld_bootstrap_record(
+    auth_configured: bool,
+    local: bool,
+    peer: Option<IpAddr>,
+    authority: Option<&str>,
+) -> Option<(String, String)> {
+    // No token configured means nothing 401s, so there is nothing to report
+    // and a line here would bury the real ones.
+    if local || !auth_configured {
+        return None;
+    }
+    Some((
+        peer.map_or_else(|| "unknown".to_string(), |p| p.to_string()),
+        authority.unwrap_or("").to_string(),
+    ))
+}
+
+fn serve_index(
+    state: &AppState,
+    legacy: Option<u16>,
+    headers: &HeaderMap,
+    uri: &Uri,
+    peer: Option<IpAddr>,
+) -> Response {
+    let asset = if uri.path() == "/business" || uri.path().starts_with("/business/") {
+        "business/index.html"
+    } else {
+        "index.html"
+    };
+    let Some(index) = DashboardAssets::get(asset) else {
         return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
     };
     let html = String::from_utf8_lossy(&index.data).into_owned();
-    let injected = inject_bootstrap(&html, state, legacy);
+    let owner_access = owner_bootstrap_allowed(state, headers, uri, peer);
+    let member_verified = super::org::is_verified_local_member(headers);
+    let owner_session = owner_session_status(state, headers);
+    let verdict = if owner_access || member_verified || state.auth_token.is_none() {
+        "dashboard_bootstrap_authenticated"
+    } else {
+        "dashboard_bootstrap_access_required"
+    };
+    tracing::info!(
+        target: "amux::auth",
+        verdict,
+        owner_access,
+        owner_session,
+        member_verified,
+        member_cookie = super::org::has_local_member_cookie(headers),
+        bearer_present = headers.contains_key(header::AUTHORIZATION),
+        peer_loopback = peer.map(|ip| ip.is_loopback()),
+        // Deliberately no URL/query, cookie, or credential values.
+        "dashboard bootstrap access decision"
+    );
+    let injected = inject_bootstrap(
+        &html,
+        state,
+        legacy,
+        owner_access,
+    );
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         injected,
@@ -169,20 +446,32 @@ fn serve_index(state: &AppState, legacy: Option<u16>) -> Response {
 /// `_AMUX_LEGACY_PORT` is 0 on the canonical listener, so the SPA's check is
 /// "did the server say I am on the retired port", not "does my URL look odd" —
 /// the client never has to know either number.
-fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>) -> String {
+fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_access: bool) -> String {
     const BEGIN: &str = "<!-- AMUX-BOOTSTRAP-BEGIN";
     const END: &str = "<!-- AMUX-BOOTSTRAP-END -->";
     let (Some(b), Some(e)) = (html.find(BEGIN), html.find(END)) else {
         return html.to_string(); // no markers: serve untouched, never corrupt
     };
-    let auth = state.auth_token.clone().unwrap_or_default();
-    let ui_token = if auth.is_empty() {
+    let owner_auth = state.auth_token.clone().unwrap_or_default();
+    // Invited and anonymous remote browsers never inherit the owner's bearer
+    // from the public SPA bootstrap. Locality or an explicitly supplied owner
+    // credential is required.
+    let auth = if owner_access { owner_auth.clone() } else { String::new() };
+    let ui_token = if owner_auth.is_empty() {
         String::new()
     } else {
         let mut h = sha2::Sha256::new();
-        h.update(format!("amux-ui-guard:{auth}"));
+        h.update(format!("amux-ui-guard:{owner_auth}"));
         hex::encode(h.finalize())[..40].to_string()
     };
+    // AF-639: an EMPTY `_AMUX_AUTH_TOKEN` has two causes the SPA must not
+    // confuse. Auth disabled entirely (no token configured) means nothing will
+    // 401 and there is nothing to tell anyone. Withheld from a remote browser
+    // means EVERY /api call will 401 for the life of that window, and no
+    // reload can fix it because the server will withhold again. Only the
+    // second is worth a human's attention, and the client cannot derive which
+    // one it is from the empty string alone.
+    let auth_withheld = !owner_access && !owner_auth.is_empty();
     let home = std::env::var("HOME").unwrap_or_default();
     let jstr = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let block = format!(
@@ -190,7 +479,8 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>) -> String
          window._AMUX_S3_ICAL_URL={};window._AMUX_AUTH_TOKEN={};window._AMUX_HOME={};\
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
          window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
-         window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};</script>\n",
+         window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};\
+         window._AMUX_AUTH_WITHHELD={};window._AMUX_MDAI_ROOT={};</script>\n",
         jstr(&ical_subscribe_url()),
         jstr(&auth),
         jstr(&home),
@@ -211,6 +501,11 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>) -> String
         )),
         legacy.unwrap_or(0),
         crate::legacy_port::canonical_port(),
+        auth_withheld,
+        // The `.mdai` scan root, so the client joins list paths onto the right
+        // root instead of $HOME when a `mdai_root` pref points elsewhere
+        // (AMUX-4477).
+        jstr(&crate::api::mdai::mdai_root_str()),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Client update adoption is the SSE ping's job, exactly like Python
@@ -265,17 +560,160 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn business_shell_preserves_the_existing_bootstrap_identity_boundary() {
+        let state = state(Some("business-test-owner-token"));
+        for (host, address, expected) in [
+            ("localhost:8824", "127.0.0.1:12345", true),
+            ("business.example.test", "203.0.113.4:12345", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, host.parse().unwrap());
+            let response = serve_path(State(state.clone()), headers,
+                axum::http::Method::GET, "/business/".parse().unwrap(),
+                Some(Extension(ConnectInfo(address.parse().unwrap()))), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("<title>Amux Business</title>"));
+            assert!(body.contains("/business/assets/"));
+            assert_eq!(body.contains("window._AMUX_AUTH_TOKEN=\"business-test-owner-token\""), expected);
+        }
+    }
+
     #[test]
     fn bootstrap_injects_auth_and_derived_ui_token() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
-        let out = inject_bootstrap(html, &state(Some("tok123")), None);
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
+        let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
         assert!(out.contains("window._AMUX_AUTH_TOKEN=\"tok123\""));
         // Python-parity UI token: sha256("amux-ui-guard:tok123")[..40]
         let mut h = sha2::Sha256::new();
         h.update("amux-ui-guard:tok123");
         let expect = &hex::encode(h.finalize())[..40];
         assert!(out.contains(expect), "{out}");
-        assert!(!out.contains("old"), "placeholder block replaced");
+        // AMUX-4658: the placeholder used to be the word `old`, and `out` embeds
+        // $HOME. A parallel test points HOME at a macOS tempdir under
+        // /var/folders, which contains "old", so this failed on local runs.
+        assert!(!out.contains("STALE-BOOTSTRAP-PLACEHOLDER"), "placeholder block replaced: {out}");
+    }
+
+    #[test]
+    fn invited_member_bootstrap_withholds_owner_bearer_but_keeps_ui_guard() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
+        let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
+        let member = inject_bootstrap(html, &state(Some("tok123")), None, false);
+        assert!(member.contains("window._AMUX_AUTH_TOKEN=\"\""), "{member}");
+        assert!(!member.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{member}");
+        let owner_guard = owner.split("window._AMUX_UI_TOKEN=").nth(1)
+            .and_then(|value| value.split(';').next()).unwrap();
+        assert!(member.contains(&format!("window._AMUX_UI_TOKEN={owner_guard}")), "{member}");
+    }
+
+    /// AF-639. A remote browser is denied the owner bearer on purpose, and
+    /// until now the server said nothing about it. Measured on this fleet:
+    /// 28,355 401s in 24 hours from one laptop over Tailscale, at the SPA's 5s
+    /// poll cadence, and not one log line naming the cause.
+    #[test]
+    fn the_withheld_bootstrap_record_reports_the_predicate_and_only_the_real_case() {
+        let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+
+        // The case that produced the 28k refusals: auth on, browser remote.
+        let (p, a) = withheld_bootstrap_record(true, false, Some(peer), Some("desktop.example:8824"))
+            .expect("a remote browser denied the bearer must be reported");
+        assert_eq!(p, "203.0.113.5", "the peer is half the predicate");
+        assert_eq!(a, "desktop.example:8824", "the authority is the other half");
+
+        // The three cases that must stay SILENT, each for its own reason.
+        assert!(
+            withheld_bootstrap_record(true, true, Some(peer), Some("h")).is_none(),
+            "a local browser gets the bearer; there is nothing to report"
+        );
+        assert!(
+            withheld_bootstrap_record(false, false, Some(peer), Some("h")).is_none(),
+            "with no token configured NOTHING 401s, so this line would bury the real ones"
+        );
+        assert!(
+            withheld_bootstrap_record(false, true, Some(peer), Some("h")).is_none(),
+            "neither condition holds"
+        );
+
+        // A request with no authority at all is still the withheld case, and
+        // the empty field is the answer rather than a reason to say nothing.
+        let (p2, a2) = withheld_bootstrap_record(true, false, None, None)
+            .expect("an unknown peer is still a withheld shell");
+        assert_eq!(p2, "unknown");
+        assert_eq!(a2, "");
+    }
+
+    /// The predicate the log line describes must be the one the caller acts
+    /// on. Reading `owner_bootstrap_allowed` end to end is what catches the
+    /// two drifting apart, which no test of the pure function alone can see.
+    #[test]
+    fn owner_bootstrap_allowed_and_the_withheld_record_agree_on_a_remote_browser() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "amux.invalid".parse().unwrap());
+        let uri: Uri = "/".parse().unwrap();
+        // TEST-NET-3 (RFC 5737) with a reserved TLD (RFC 2606): even on a host
+        // with a wildcard resolver, `amux.invalid` cannot resolve TO this
+        // peer, so the verdict is the same everywhere this runs.
+        let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+
+        let allowed = owner_bootstrap_allowed(&state(Some("tok123")), &headers, &uri, Some(peer));
+        assert!(!allowed, "a remote browser must not be bootstrapped with the owner bearer");
+        assert!(
+            withheld_bootstrap_record(true, allowed, Some(peer), Some("amux.invalid")).is_some(),
+            "the same inputs that withhold the bearer must also produce the log record"
+        );
+
+        // And the shell built from that decision really is tokenless, so the
+        // record describes a window that will 401 rather than a hypothesis.
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
+        let shell = inject_bootstrap(html, &state(Some("tok123")), None, allowed);
+        assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
+        assert!(shell.contains("window._AMUX_AUTH_WITHHELD=true;"), "{shell}");
+    }
+
+    /// AF-639, client half. An empty `_AMUX_AUTH_TOKEN` has two causes with
+    /// opposite consequences, and the SPA cannot tell them apart from the
+    /// empty string.
+    #[test]
+    fn the_shell_says_whether_an_empty_token_means_withheld_or_auth_disabled() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
+        let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
+        let withheld = inject_bootstrap(html, &state(Some("tok123")), None, false);
+        let no_auth = inject_bootstrap(html, &state(None), None, false);
+
+        assert!(owner.contains("window._AMUX_AUTH_WITHHELD=false;"), "{owner}");
+        assert!(withheld.contains("window._AMUX_AUTH_WITHHELD=true;"), "{withheld}");
+
+        // Auth disabled: the token is empty here too and NOTHING will 401.
+        // Reporting "withheld" would put a permanent banner in front of every
+        // user of a tokenless server.
+        assert!(no_auth.contains("window._AMUX_AUTH_TOKEN=\"\""), "{no_auth}");
+        assert!(no_auth.contains("window._AMUX_AUTH_WITHHELD=false;"), "{no_auth}");
+    }
+
+    /// The bootstrap block is one Rust string literal held together by
+    /// backslash line continuations, and dropping one does not fail to
+    /// compile: it renders as a run of spaces inside the emitted JavaScript.
+    /// This lane shipped that exact bug twice (AF-621, AF-634), so the guard
+    /// covers the whole script rather than the line just added to it.
+    #[test]
+    fn the_injected_script_carries_no_run_of_spaces_from_a_dropped_continuation() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
+        let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
+        let script = out
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("the injected block has a script element");
+        assert!(
+            !script.contains("  "),
+            "a dropped line continuation renders as a run of spaces: {script:?}"
+        );
+        // The guard is worth nothing if the block it reads is empty.
+        assert!(script.contains("window._AMUX_AUTH_WITHHELD="), "{script:?}");
+        assert!(script.len() > 200, "script suspiciously short: {script:?}");
     }
 
     #[test]
@@ -283,9 +721,9 @@ mod tests {
         // Client adoption rides the SSE ping's `v` (sse.rs::ping_payload,
         // Python parity) — the old /health-polling banner must stay gone,
         // or a backend-only deploy shows UI Python never showed.
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
-        let out = inject_bootstrap(html, &s, None);
+        let out = inject_bootstrap(html, &s, None, true);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
         assert!(!out.contains("amux-update-bar"));
         // The CRM feature-flag layer still injects.
@@ -305,17 +743,17 @@ mod tests {
     /// SOCKET the request arrived on.
     #[test]
     fn legacy_marker_is_injected_only_when_served_on_the_retired_port() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
 
-        let canonical = inject_bootstrap(html, &s, None);
+        let canonical = inject_bootstrap(html, &s, None, true);
         assert!(
             canonical.contains("window._AMUX_LEGACY_PORT=0"),
             "a document served on the canonical port must report legacy 0, or every \
              already-migrated client is told to migrate: {canonical}"
         );
 
-        let from_legacy = inject_bootstrap(html, &s, Some(8822));
+        let from_legacy = inject_bootstrap(html, &s, Some(8822), true);
         assert!(
             from_legacy.contains("window._AMUX_LEGACY_PORT=8822"),
             "a document served on the retired port must say so — this is the ONLY \
@@ -336,7 +774,83 @@ mod tests {
     #[test]
     fn missing_markers_serve_untouched() {
         let html = "<head>no markers</head>";
-        assert_eq!(inject_bootstrap(html, &state(None), None), html);
+        assert_eq!(inject_bootstrap(html, &state(None), None, false), html);
+    }
+
+    async fn shell(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&str>,
+        peer: Option<&str>,
+    ) -> String {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        let mut request = builder.body(axum::body::Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            let addr: SocketAddr = format!("{peer}:50000").parse().unwrap();
+            request.extensions_mut().insert(ConnectInfo(addr));
+        }
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn owner_bearer_is_not_bootstrapped_to_remote_or_revoked_member_shells() {
+        let app = routes().with_state(state(Some("tok123")));
+
+        let remote = shell(&app, "https://remote-node.example/", None, None).await;
+        assert!(remote.contains("window._AMUX_AUTH_TOKEN=\"\""), "{remote}");
+
+        let local = shell(
+            &app,
+            "https://desktop.tailnet.example/",
+            None,
+            Some("127.0.0.1"),
+        )
+        .await;
+        assert!(local.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{local}");
+
+        // Deleting a member removes the DB row but their HttpOnly cookie stays
+        // in the browser. Even on the owner's machine that stale cookie must
+        // not change roles on reload and inherit the owner credential.
+        let revoked = shell(
+            &app,
+            "https://desktop.tailnet.example/",
+            Some("amux_member=revoked-invite-token"),
+            Some("127.0.0.1"),
+        )
+        .await;
+        assert!(revoked.contains("window._AMUX_AUTH_TOKEN=\"\""), "{revoked}");
+        assert!(!revoked.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{revoked}");
+
+        // A remote owner can still authenticate explicitly. Exchange the URL
+        // token for an HttpOnly cookie before serving any credential-bearing
+        // HTML, so the service worker's canonical `/` cache and reload retain
+        // the owner session without retaining the URL token.
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("https://remote-node.example/?_token=tok123")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/api/_clear_sw");
+        let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure"), "{set_cookie}");
+        assert!(!set_cookie.contains("tok123"), "the raw bearer must not be copied into the cookie");
+        let owner_cookie = set_cookie.split(';').next().unwrap();
+        let explicit = shell(&app, "https://remote-node.example/", Some(owner_cookie), None).await;
+        assert!(explicit.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{explicit}");
     }
 
     /// AF-61: the GET-only version of this test passed for months while every

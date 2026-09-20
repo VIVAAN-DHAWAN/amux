@@ -217,11 +217,7 @@ pub fn import_chrome_profile(
     }
     let source = chrome_dir.join(name);
     if !source.is_dir() {
-        anyhow::bail!(
-            "Chrome profile {name:?} does not exist at {}; create an amux profile with POST \
-             /api/browser/profile/create instead",
-            source.display()
-        );
+        return Err(anyhow::Error::new(ProfileMissing { profile: name.to_string(), source }));
     }
 
     let parent = destination
@@ -648,14 +644,22 @@ pub fn running_all() -> Vec<(String, String, i64, u32, u16, i64)> {
     v
 }
 
+/// The clock `last_verb_at` is stamped with. Shared so a reader computing an age
+/// against it cannot use a different `now` (AMUX-4685: /keepalive reports the
+/// seconds remaining before the activity arm fires, which is only meaningful
+/// against the same clock the stamp used).
+pub fn now_secs_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// Stamp the current time as the last verb on a profile. Called by every
 /// driver verb (navigate, screenshot, action, state) so the reaper can tell
 /// "browser with open page but nobody driving it" from "browser in active use".
 pub fn touch_verb(profile: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     if let Ok(mut g) = RUNNING.lock() {
         if let Some(b) = g.get_mut(profile) {
             b.last_verb_at = now;
@@ -668,10 +672,7 @@ pub fn touch_verb(profile: &str) {
 /// one browser is running, that browser gets the stamp (it is the one being
 /// driven). Called from API verb handlers where we have the session name.
 pub fn touch_verb_for_session(session: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     if let Ok(mut g) = RUNNING.lock() {
         // Prefer the browser owned by this session.
         if !session.is_empty() {
@@ -1209,6 +1210,32 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
 /// cannot drift from the data structure the way a separate check would.
 pub static RUNNING: LazyLock<Mutex<std::collections::HashMap<String, RunningBrowser>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Serialises every TEST that reads or writes `RUNNING` (AMUX-4718).
+///
+/// `RUNNING`'s own `Mutex` makes each access atomic and does nothing for the
+/// property tests need, which is that the map does not change BETWEEN a test's
+/// seed and its assertion. Four tests across three modules call
+/// `test_clear_running`, cargo runs them on parallel threads in one binary, and
+/// a `clear()` landing inside another test's window empties the registry under
+/// it.
+///
+/// Measured 2026-09-16 before this lock existed: `cargo test -p amux-server
+/// --lib browser` failed 4 runs of 4, with 1, 3, 3 and 2 failures, always from
+/// the same three names. Each of those passes 6 of 6 alone. The FULL suite
+/// failed 1 run in 5, which is why this went unfixed: the instrument most
+/// people run is the weak one, and a green there means very little.
+///
+/// READERS TAKE IT TOO, and that is the half a writer-only lock would miss.
+/// `driver_verbs_answer_natively_never_proxy` seeds nothing and asserts a 409
+/// for "no browser running"; a peer's seed turns that into a 200. It was one of
+/// the three.
+///
+/// `tokio::sync::Mutex`, not `std`: the guard is held across `.await` in every
+/// one of these tests, which is a clippy deny and a real hazard on a
+/// multi-threaded runtime.
+#[cfg(test)]
+pub static TEST_REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Locate a Chrome/Chromium binary. None is an honest answer the API
 /// surfaces as 501 — not a fallback to some other browser.
@@ -1796,6 +1823,19 @@ pub async fn start(
         None => tracing::warn!(session, port, "launch tab not claimed — CDP listed no page tab"),
     }
 
+    // MINIMISE BY DEFAULT (AMUX-4357), against this browser's own port so no
+    // other profile is touched. FIRE AND FORGET: the window already appeared on
+    // spawn, so blocking the start return on it buys nothing and only adds
+    // latency (which raced a unit test's exit-monitor into reaping a seeded
+    // browser). The spawned task logs its own outcome for the sweep.
+    if !headless && start_minimized_by_default() {
+        let mport = port;
+        tokio::spawn(async move {
+            if minimize_launched(mport).await {
+                tracing::info!(port = mport, "browser: window minimised after start (AMUX-4357; AMUX_BROWSER_START_MINIMIZED=0 keeps it on screen)");
+            }
+        });
+    }
     let started_at = chrono::Utc::now().timestamp();
     let info = StartedBrowser {
         profile: profile.to_string(),
@@ -2064,6 +2104,17 @@ pub struct CdpClient {
     next_id: u64,
 }
 
+/// What to do with a CDP frame that will not parse (AMUX-4824).
+#[derive(Debug, PartialEq, Eq)]
+enum FrameVerdict {
+    /// The frame carries OUR id, so the response we are waiting for is the
+    /// damaged one. Fail now rather than waiting out the deadline.
+    Ours,
+    /// Another command's response, or an event, or unattributable. Not this
+    /// call's problem; keep reading until the deadline.
+    Skip,
+}
+
 impl CdpClient {
     /// HARD INVARIANT (owner directive, AMUX-2598): browser automation
     /// executes on the SERVER machine, never in a dashboard-viewing client's
@@ -2092,6 +2143,47 @@ impl CdpClient {
         Ok(Self { ws, next_id: 0 })
     }
 
+/// Recover a CDP frame's `id` from text that does NOT parse as JSON (AMUX-4824).
+///
+/// A truncated frame still carries its head, and CDP puts `"id":<n>` in the
+/// object's first field, so the id survives exactly the damage that makes the
+/// frame unparseable. That is the whole point: it answers "was this mine?" when
+/// the parser cannot.
+///
+/// DELIBERATELY NOT A JSON PARSER. It scans for the first `"id":` and reads the
+/// digits after it. An EVENT has no `id` at all (it has `method`), so `None`
+/// means "not a response", which is already a reason to skip. A wrong answer
+/// here is bounded: attributing a frame to us that is not ours fails one call
+/// that would otherwise time out; failing to attribute ours turns a fast error
+/// into a deadline. Neither invents a result.
+fn cdp_frame_id_hint(text: &str) -> Option<u64> {
+    // Only look at the head. A frame whose `id` is megabytes in is not a CDP
+    // response, and scanning the whole of a large malformed payload for every
+    // skipped frame is work with no answer at the end of it.
+    let head = &text[..text.len().min(512)];
+    let at = head.find("\"id\":")? + 5;
+    let rest = head[at..].trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The shipped decision, as a function so a test can drive it (AMUX-4824).
+///
+/// Inline, this was a `match` arm inside the socket loop, and nothing but a
+/// live CDP connection could reach it. That is the same shape that let a
+/// deadline test pass against a rebuilt expression earlier today: a decision
+/// only exercised through machinery nobody can stand up in a test is a decision
+/// no mutation can reach.
+fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdict {
+    match hint {
+        Some(found) if found == waiting_for => FrameVerdict::Ours,
+        // `None` is an EVENT (no id at all) or a frame damaged past
+        // attribution. Both are skipped: claiming them would fail a call over
+        // a message it never asked for, which is the defect this fixes.
+        _ => FrameVerdict::Skip,
+    }
+}
+
     /// One CDP command. Chrome interleaves EVENT messages on the same
     /// socket; anything without our id is skipped, and the deadline caps the
     /// whole exchange so a wedged page degrades to an error, not a hung
@@ -2109,15 +2201,68 @@ impl CdpClient {
         let fut = async {
             use tokio_tungstenite::tungstenite::Message;
             self.ws.send(Message::Text(payload)).await?;
+            let mut skipped_unparseable = 0u32;
             loop {
                 let Some(frame) = self.ws.next().await else {
-                    anyhow::bail!("CDP websocket closed during {method}");
+                    anyhow::bail!(
+                        "CDP websocket closed during {method} ({skipped_unparseable} unparseable \
+                         frame(s) skipped)"
+                    );
                 };
                 match frame? {
                     Message::Text(t) => {
-                        let v: Value = serde_json::from_str(&t).map_err(|e| {
-                            anyhow::anyhow!("CDP sent non-JSON during {method}: {e}")
-                        })?;
+                        // AN UNPARSEABLE FRAME IS ONLY FATAL IF IT IS OURS
+                        // (AMUX-4824). Chrome interleaves EVENTS on this
+                        // socket, and this used to parse every text frame
+                        // before looking at the id, so a malformed event
+                        // killed an unrelated command. The comment four lines
+                        // below already says an id mismatch is "not ours, keep
+                        // reading"; a frame that will not parse never reached
+                        // that check.
+                        //
+                        // Observed: GET /api/browser/state answered 502 four
+                        // times in 16s with "unexpected end of hex escape at
+                        // line 1 column 2917" — serde's message for input that
+                        // ENDS inside a \uXXXX, i.e. a truncated frame (a lone
+                        // surrogate reports differently). Nothing distinguished
+                        // "Chrome truncated OUR result" from "Chrome truncated
+                        // some event we did not ask for".
+                        let v: Value = match serde_json::from_str(&t) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // Recover the id WITHOUT a full parse, so a
+                                // malformed frame can still be attributed.
+                                match Self::unparseable_frame_verdict(
+                                    Self::cdp_frame_id_hint(&t),
+                                    id,
+                                ) {
+                                    FrameVerdict::Ours => {
+                                        return Err(anyhow::anyhow!(
+                                            "CDP sent non-JSON during {method}: {e}                                              (frame {} bytes, id {id} matched ours)",
+                                            t.len()
+                                        ));
+                                    }
+                                    FrameVerdict::Skip => {
+                                        // Not ours, or unattributable. Skipping
+                                        // is what an id mismatch already does.
+                                        // The deadline still bounds the loop, so
+                                        // a truly lost response degrades to a
+                                        // timeout rather than hanging.
+                                        let hint = Self::cdp_frame_id_hint(&t);
+                                        skipped_unparseable += 1;
+                                        tracing::warn!(
+                                            target: "amux::browser",
+                                            verdict = "cdp_frame_unparseable",
+                                            %method, error = %e, bytes = t.len(),
+                                            id_hint = ?hint, waiting_for = id,
+                                            measured = true, n_considered = 1,
+                                            "skipped a CDP frame that is not valid JSON and is not                                              the response this call is waiting for"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         if v.get("id").and_then(Value::as_u64) == Some(id) {
                             if let Some(err) = v.get("error") {
                                 anyhow::bail!(
@@ -2129,7 +2274,10 @@ impl CdpClient {
                         }
                         // No id match: a protocol event — not ours, keep reading.
                     }
-                    Message::Close(_) => anyhow::bail!("CDP websocket closed during {method}"),
+                    Message::Close(_) => anyhow::bail!(
+                        "CDP websocket closed during {method} ({skipped_unparseable} unparseable \
+                         frame(s) skipped)"
+                    ),
                     _ => {} // Ping/Pong/Binary: tungstenite answers pings itself.
                 }
             }
@@ -2314,6 +2462,33 @@ impl std::fmt::Display for ExternalProfileInUse {
 }
 
 impl std::error::Error for ExternalProfileInUse {}
+
+/// The request named a Chrome profile that has no directory to import.
+///
+/// AMUX-4638: this left `start` as a 502, so a caller's typo reached every 5xx
+/// sweep as an upstream fault and was filed three times (AMUX-4431, AMUX-4509,
+/// AMUX-4638). Typed so the API answers 404 on the TYPE, the rule
+/// [`ProfileDelegated`] follows. Display reproduces the `bail!()` string it
+/// replaces exactly, so anything quoting the message sees no difference.
+#[derive(Debug)]
+pub struct ProfileMissing {
+    pub profile: String,
+    pub source: PathBuf,
+}
+
+impl std::fmt::Display for ProfileMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Chrome profile {:?} does not exist at {}; create an amux profile with POST \
+             /api/browser/profile/create instead",
+            self.profile,
+            self.source.display()
+        )
+    }
+}
+
+impl std::error::Error for ProfileMissing {}
 
 /// Is a Chrome that exited BEFORE CDP bound the delegation signature?
 ///
@@ -2964,8 +3139,19 @@ mod multi_browser_tests {
     /// clobber each other's seeds — which is exactly how the first draft of
     /// this failed: "two profiles must coexist" saw three, and "a profile is a
     /// slot" saw a neighbour's entry. Serial by construction beats a flake.
+    ///
+    /// THAT REASONING WAS RIGHT AND ITS REMEDY WAS LOCAL (AMUX-4718). Merging
+    /// two tests stops THESE two racing and does nothing about the three in
+    /// `api::browser::tests` and one in `runtime_jobs::browser_reaper` that
+    /// share the same global. Those failed 4 runs of 4 under `--lib browser`.
+    /// The lock is the general form of what this comment already knew.
+    ///
+    /// `blocking_lock` because this is a plain `#[test]` with no runtime, where
+    /// it is the correct call. Inside an async test it would panic, which is
+    /// why the others `.await` it.
     #[test]
     fn multiple_workers_can_use_same_and_different_browsers() {
+        let _reg = TEST_REGISTRY.blocking_lock();
         test_clear_running();
         test_seed_running_port("alpha", "worker-a", 111, 9001);
         test_seed_running_port("beta", "worker-b", 222, 9002);
@@ -3582,42 +3768,94 @@ pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result
 /// driver screenshot (`~/.amux/browser-screenshots/<backend>-<session>.png`,
 /// response carries `path`). Zero decoded bytes is an ERROR — a 0-byte file
 /// reading as success is the lie ethos rule 7 exists for.
-pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -> anyhow::Result<(PathBuf, usize)> {
-    // ACTIVATE BEFORE CAPTURING (AMUX-3712).
-    //
-    // `Page.captureScreenshot` waits for the renderer to produce a frame, and a
-    // tab that is not the active surface does not composite. A backgrounded or
-    // occluded tab therefore does not FAIL, it BLOCKS, until the 30s deadline
-    // below turns into a 502. That is this card's entire signature: 30,003ms and
-    // 30,006ms, the deadline to the millisecond, twice, against a browser whose
-    // active surface was an omnibox popup rather than the page being captured.
-    //
-    // BEST EFFORT AND NON-FATAL, with a deadline of its own. If the renderer is
-    // genuinely wedged, bringToFront cannot fix it and must not become a second
-    // way for the same fault to be reported; if the tab was merely
-    // backgrounded, this is the whole fix. Proceeding on failure means it can
-    // only help.
-    //
-    // The WARN is the discriminator, and it is the thing that did not exist:
-    // "capture timed out" alone cannot separate a backgrounded tab from a dead
-    // one, and those want opposite responses. A timeout AFTER a successful
-    // bringToFront is a wedged renderer.
-    if let Err(e) =
-        c.call("Page.bringToFront", json!({}), std::time::Duration::from_secs(5)).await
-    {
-        tracing::warn!(
-            "[browser] Page.bringToFront failed for session {session:?} before capture: {e} — \
-             capturing anyway. If the capture now times out, the renderer is wedged rather than \
-             merely backgrounded (AMUX-3712)"
-        );
+/// The window state Chrome reports for this target's window ("normal",
+/// "minimized", "maximized", "fullscreen") with the window id, or `None` when
+/// there is no window to ask about (headless) or the call is refused. Callers
+/// read `None` as "not minimised" — the pre-AMUX-4357 behaviour.
+pub async fn window_state(c: &mut CdpClient) -> Option<(u64, String)> {
+    let w = c
+        .call("Browser.getWindowForTarget", json!({}), std::time::Duration::from_secs(5))
+        .await
+        .ok()?;
+    let id = w.get("windowId").and_then(Value::as_u64)?;
+    let b = c
+        .call("Browser.getWindowBounds", json!({ "windowId": id }), std::time::Duration::from_secs(5))
+        .await
+        .ok()?;
+    let state = b.get("bounds")?.get("windowState")?.as_str()?.to_string();
+    Some((id, state))
+}
+
+/// AMUX-4357 (Ethan, 2026-09-10: "when using amux browser, the browser keeps
+/// overriding the screen on my macbook — make it minimized by default").
+/// Chrome activates its window on launch, and a fleet that starts browsers
+/// all day keeps taking the human's screen. Minimising over CDP needs no
+/// Automation permission (an osascript would prompt on every rebuild, the
+/// same re-prompt AMUX-3527 is about).
+///
+/// Measured 2026-09-11 on this box, the shape the screenshot path relies on:
+/// the ACTIVE tab still renders and captures while minimised (20 KB PNG in
+/// 67 ms); a BACKGROUND tab blocks on capture until restored; and BOTH
+/// `Page.bringToFront` and `Target.activateTarget` restore the window, while
+/// `Page.navigate` and a new tab leave it minimised.
+pub async fn minimize_window(c: &mut CdpClient) -> anyhow::Result<u64> {
+    let (id, _) = window_state(c)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Browser.getWindowForTarget reported no window for this target"))?;
+    c.call(
+        "Browser.setWindowBounds",
+        json!({ "windowId": id, "bounds": { "windowState": "minimized" } }),
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    Ok(id)
+}
+
+/// Default ON. `AMUX_BROWSER_START_MINIMIZED=0` (or `false`) in server.env
+/// keeps a headed launch on screen, for a box whose owner wants to watch it.
+pub fn start_minimized_by_default() -> bool {
+    match std::env::var("AMUX_BROWSER_START_MINIMIZED") {
+        Ok(v) => !(v.trim() == "0" || v.trim().eq_ignore_ascii_case("false")),
+        Err(_) => true,
     }
-    let r = c
-        .call(
-            "Page.captureScreenshot",
-            json!({ "format": "png" }),
-            std::time::Duration::from_secs(30),
-        )
-        .await?;
+}
+
+/// Minimise the browser we JUST launched, addressed by its own CDP port. This
+/// deliberately does NOT go through `connect_session`/`resolve_page`, which run
+/// `adopt_if_orphaned` machine-wide and would disturb OTHER profiles' registry
+/// entries (that reaped a peer's staged browser in a unit test — AMUX-4357).
+/// Best-effort: a failure logs and returns false, never fails the start.
+async fn minimize_launched(port: u16) -> bool {
+    let ws = match cdp_list(port).await.ok().and_then(|tabs| {
+        tabs.as_array().and_then(|ts| {
+            ts.iter()
+                .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                .and_then(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+    }) {
+        Some(ws) => ws,
+        None => {
+            tracing::warn!(port, "browser: no page target to minimise after launch (AMUX-4357)");
+            return false;
+        }
+    };
+    match CdpClient::connect(&ws).await {
+        Ok(mut cdp) => match minimize_window(&mut cdp).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(port, error = %e, "browser: minimise-after-launch failed (AMUX-4357)");
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!(port, error = %e, "browser: could not connect to minimise after launch (AMUX-4357)");
+            false
+        }
+    }
+}
+
+fn write_screenshot(r: &Value, home: &Path, session: &str) -> anyhow::Result<(PathBuf, usize)> {
     let b64 = r
         .get("data")
         .and_then(Value::as_str)
@@ -3634,6 +3872,18 @@ pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -
     let file = dir.join(format!("native-{}.png", safe_file_component(session)));
     std::fs::write(&file, &bytes)?;
     Ok((file, bytes.len()))
+}
+
+pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -> anyhow::Result<(PathBuf, usize)> {
+    // Capturing evidence must never activate a user's desktop. Headless is the
+    // start API default; explicitly headed/minimized windows stay where they are.
+    let r = c.call("Page.captureScreenshot", json!({"format":"png", "fromSurface":true}),
+        std::time::Duration::from_secs(30)).await.map_err(|e| {
+        tracing::warn!(session, error=%e, verdict="capture_failed_without_focus",
+            "browser: background capture failed; window was not raised");
+        anyhow::anyhow!("background capture failed without changing focus: {e}; use a headless browser or explicitly identify the window")
+    })?;
+    write_screenshot(&r, home, session)
 }
 
 /// Session names come from callers; a name is a FILE component here, so
@@ -4594,6 +4844,7 @@ mod tests {
         assert!(escape.to_string().contains("[A-Za-z0-9._-]+"));
         let missing = import_chrome_profile(home.path(), &chrome, "missing").unwrap_err();
         assert!(missing.to_string().contains("does not exist"));
+        assert!(missing.downcast_ref::<ProfileMissing>().is_some(), "{missing}");
         assert!(!home.path().join("playwright-auth/profiles/missing").exists());
     }
 
@@ -4751,87 +5002,36 @@ mod tests {
         assert!(err.to_string().contains("boom"), "{err}");
     }
 
-    /// AMUX-3712: the capture activates the tab first, and a failure to activate
-    /// does not abort the capture.
-    ///
-    /// THE SPECIMEN: `GET /api/browser/screenshot` returned 502 with "CDP
-    /// Page.captureScreenshot timed out after 30s" at 11:12:41 and again at
-    /// 12:06:17 on 2026-08-25, at 30,006ms and 30,003ms. The deadline to the
-    /// millisecond, twice, is not a slow capture — it is a capture that never
-    /// returns. `Page.captureScreenshot` waits on a compositor frame, and the
-    /// browser in question had its active surface on an omnibox popup, so the
-    /// page being captured was not compositing at all.
-    ///
-    /// BOTH CELLS MATTER. The order cell is the fix. The tolerate-failure cell
-    /// is what stops the fix becoming a second way for a wedged renderer to
-    /// fail: bringToFront cannot revive a dead renderer, so if it errors the
-    /// capture must still be attempted rather than short-circuiting into a
-    /// different error message for the same fault.
     #[tokio::test]
-    async fn a_capture_activates_the_tab_first_and_survives_a_failed_activation() {
+    async fn capture_never_raises_a_window_even_when_the_renderer_fails() {
         use std::sync::{Arc, Mutex};
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        // 1x1 transparent PNG, so the capture path writes real bytes.
-        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
-
-        // `fail_front` drives the second cell: the fake refuses bringToFront.
-        let serve = |fail_front: bool, seen: Arc<Mutex<Vec<String>>>| async move {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        for fail_capture in [false, true] {
+            let seen=Arc::new(Mutex::new(Vec::<String>::new()));
+            let calls=seen.clone();
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr=listener.local_addr().unwrap();
+            let server=tokio::spawn(async move {
+                let (stream,_)=listener.accept().await.unwrap();
+                let mut ws=tokio_tungstenite::accept_async(stream).await.unwrap();
                 use tokio_tungstenite::tungstenite::Message;
-                while let Some(Ok(msg)) = ws.next().await {
-                    if let Message::Text(t) = msg {
-                        let v: Value = serde_json::from_str(&t).unwrap();
-                        let id = v["id"].as_u64().unwrap();
-                        let method = v["method"].as_str().unwrap_or("").to_string();
-                        seen.lock().unwrap().push(method.clone());
-                        let resp = match method.as_str() {
-                            "Page.bringToFront" if fail_front => {
-                                json!({"id": id, "error": {"message": "not attached to an active page"}})
-                            }
-                            "Page.captureScreenshot" => json!({"id": id, "result": {"data": PNG_B64}}),
-                            _ => json!({"id": id, "result": {}}),
-                        };
-                        ws.send(Message::Text(resp.to_string())).await.unwrap();
-                    }
+                while let Some(Ok(Message::Text(text)))=ws.next().await {
+                    let v:Value=serde_json::from_str(&text).unwrap();
+                    let method=v["method"].as_str().unwrap().to_string();
+                    calls.lock().unwrap().push(method.clone());
+                    let response=if method=="Page.captureScreenshot" && !fail_capture {
+                        json!({"id":v["id"],"result":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}})
+                    }else{json!({"id":v["id"],"error":{"message":"controlled renderer failure"}})};
+                    ws.send(Message::Text(response.to_string())).await.unwrap();
                 }
             });
-            addr
-        };
-
-        let home = fake_home();
-
-        // CELL 1 — the order. bringToFront must precede the capture, or a
-        // backgrounded tab blocks for 30s instead of being made visible.
-        let addr = serve(false, seen.clone()).await;
-        let mut c = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
-        let (path, size) = screenshot_to_file(&mut c, home.path(), "cell1").await.expect("capture");
-        assert!(size > 0 && path.exists(), "the capture wrote real bytes");
-        let calls = seen.lock().unwrap().clone();
-        let front = calls.iter().position(|m| m == "Page.bringToFront");
-        let shot = calls.iter().position(|m| m == "Page.captureScreenshot");
-        assert!(front.is_some(), "the tab must be activated before capturing: {calls:?}");
-        assert!(front < shot, "activation must come FIRST, not after: {calls:?}");
-
-        // CELL 2 — a refused activation must not abort the capture. Without
-        // this, a wedged renderer would report "not attached to an active page"
-        // instead of the timeout that actually describes it, and the fix would
-        // have added a failure mode rather than removed one.
-        let seen2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let addr2 = serve(true, seen2.clone()).await;
-        let mut c2 = CdpClient::connect(&format!("ws://{addr2}")).await.unwrap();
-        let (_, size2) = screenshot_to_file(&mut c2, home.path(), "cell2")
-            .await
-            .expect("a refused bringToFront must not fail the capture");
-        assert!(size2 > 0);
-        assert!(
-            seen2.lock().unwrap().iter().any(|m| m == "Page.captureScreenshot"),
-            "the capture must still be attempted after a failed activation: {:?}",
-            seen2.lock().unwrap()
-        );
+            let mut c=CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+            let home=fake_home();
+            let shot=screenshot_to_file(&mut c,home.path(),"background-capture").await;
+            if fail_capture {assert!(shot.unwrap_err().to_string().contains("without changing focus"));}
+            else {let (p,n)=shot.unwrap();assert!(p.exists() && n>0);}
+            assert_eq!(*seen.lock().unwrap(),vec!["Page.captureScreenshot".to_string()]);
+            server.abort();
+        }
     }
 
     /// The server-machine invariant, hermetically: a CDP endpoint that is
@@ -5341,6 +5541,91 @@ mod last_exit_persistence_tests {
         assert!(
             mem.expect("checked")["from_disk"].is_null(),
             "the in-memory copy must NOT claim it came from disk"
+        );
+    }
+}
+
+/// AMUX-4824: a CDP frame that will not parse must still say whose it was.
+#[cfg(test)]
+mod cdp_frame_attribution_tests {
+    use super::*;
+
+    /// The shape from the incident: GET /api/browser/state answered 502 four
+    /// times in 16 seconds with "unexpected end of hex escape at line 1 column
+    /// 2917" — serde's message for input that ENDS inside a \uXXXX, so the
+    /// frame was truncated. The id is in the head, which survives that damage.
+    #[test]
+    fn a_truncated_response_still_yields_its_id() {
+        let truncated = format!("{}{}", r#"{"id":7,"result":{"value":""#, "x".repeat(200)) + r"\u00";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&truncated).is_err(),
+            "the fixture must actually be unparseable, or this test proves nothing"
+        );
+        assert_eq!(CdpClient::cdp_frame_id_hint(&truncated), Some(7));
+    }
+
+    /// An EVENT carries no `id`, so an unparseable event is unattributable and
+    /// must not be mistaken for a response. This is the case that used to kill
+    /// an unrelated command.
+    #[test]
+    fn an_event_has_no_id_so_it_can_never_be_claimed_as_a_response() {
+        let ev = r#"{"method":"Runtime.consoleAPICalled","params":{"args":[{"value":"\u00"#;
+        assert!(serde_json::from_str::<serde_json::Value>(ev).is_err());
+        assert_eq!(
+            CdpClient::cdp_frame_id_hint(ev),
+            None,
+            "no id means not a response; skipping it is what an id mismatch already does"
+        );
+    }
+
+    /// A DIFFERENT command's malformed response is also not ours. Two calls can
+    /// be in flight on one socket, and only the matching id may fail this call.
+    #[test]
+    fn another_commands_malformed_response_is_not_ours() {
+        let other = r#"{"id":12,"result":{"value":"\u00"#;
+        assert_eq!(CdpClient::cdp_frame_id_hint(other), Some(12));
+        assert_ne!(CdpClient::cdp_frame_id_hint(other), Some(7), "id 12 is not id 7");
+    }
+
+    /// Whitespace and key order are the parser's problem, not ours, but the id
+    /// must still be found when CDP pretty-prints or puts `id` later.
+    #[test]
+    fn the_id_is_found_despite_spacing_and_ordering() {
+        assert_eq!(CdpClient::cdp_frame_id_hint(r#"{"id": 42,"result":{"#), Some(42));
+        assert_eq!(CdpClient::cdp_frame_id_hint(r#"{"result":null,"id":99,"#), Some(99));
+        assert_eq!(CdpClient::cdp_frame_id_hint("{}"), None);
+        assert_eq!(CdpClient::cdp_frame_id_hint(""), None);
+    }
+
+    /// THE SHIPPED DECISION, driven directly. `call`'s socket loop calls this
+    /// exact function, so mutating the fatal-vs-skip rule reddens here. Inline
+    /// it was a match arm only a live CDP connection could reach, which is a
+    /// decision no mutation can get at.
+    #[test]
+    fn only_our_own_id_makes_an_unparseable_frame_fatal() {
+        assert_eq!(CdpClient::unparseable_frame_verdict(Some(7), 7), FrameVerdict::Ours);
+        assert_eq!(
+            CdpClient::unparseable_frame_verdict(Some(12), 7),
+            FrameVerdict::Skip,
+            "another command's damaged response must not fail this call"
+        );
+        assert_eq!(
+            CdpClient::unparseable_frame_verdict(None, 7),
+            FrameVerdict::Skip,
+            "an event carries no id; failing on it is the defect AMUX-4824 fixes"
+        );
+    }
+
+    /// Only the head is scanned, so a huge malformed payload costs a bounded
+    /// read. A frame whose id sits past the window is treated as unattributable
+    /// rather than scanned for — skipping is the safe direction.
+    #[test]
+    fn only_the_head_is_scanned() {
+        let far = format!("{{{}\"id\":5,", " ".repeat(600));
+        assert_eq!(
+            CdpClient::cdp_frame_id_hint(&far),
+            None,
+            "an id past the head window is not searched for; the frame is skipped, not claimed"
         );
     }
 }

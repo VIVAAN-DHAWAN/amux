@@ -8,6 +8,8 @@ import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { E2E_ANTHROPIC_KEY } from './test-env';
+import { reapStaleTmp } from './tmp-reap';
 
 // ONE SERVER AND ONE AMUX_HOME PER PROJECT — not one shared by all of them
 // (AF-46, measured 2026-08-13).
@@ -46,9 +48,43 @@ const TARGETS = [
   { name: 'ios-safari', port: 18843, use: { ...devices['iPhone 15'] } },
 ];
 
+// The broad suite exercises dashboard/runtime behaviour, not a real Anthropic
+// credential. A clean CI home has no key, which makes the product correctly
+// show the self-hosted setup banner. On narrow viewports that banner covers the
+// terminal toolbar, so one missing external prerequisite turns every later
+// click test into a 30s pointer-interception timeout. `/api/identity`
+// intentionally ignores process-injected keys, so seed an obviously non-secret
+// value in each isolated project's durable server.env: the exact configuration
+// surface the product checks. settings_api_key_anthropic still
+// overwrites/restores it through the real endpoint, while unrelated specs run
+// in the configured-install state they actually assume.
+
 // One temp home per TARGET, created eagerly so each server and its tests agree.
+// Reap what earlier (usually interrupted) runs left behind before minting more
+// — see e2e/tmp-reap.ts. First real run on this box took 5,079 dirs / 2.58 GB.
+//
+// BOTH ROOTS on macOS. `os.tmpdir()` is the per-user `/var/folders/.../T`, but
+// a run whose TMPDIR was forced to `/tmp` (the lifecycle harness does exactly
+// that, because the long per-user path overflows the Unix socket limit) leaves
+// its homes in `/private/tmp` instead, where a reaper watching only
+// `os.tmpdir()` never sees them. Measured: 5,079 in one root and 349 in the
+// other, from the same prefix.
+for (const root of new Set([os.tmpdir(), ...(process.platform === 'darwin' ? ['/tmp'] : [])])) {
+  reapStaleTmp(root, 'amux-e2e-');
+}
 const homes: Record<string, string> = Object.fromEntries(
   TARGETS.map((t) => [t.name, fs.mkdtempSync(path.join(os.tmpdir(), `amux-e2e-${t.name}-`))]),
+);
+for (const home of Object.values(homes)) {
+  fs.writeFileSync(
+    path.join(home, 'server.env'),
+    `ANTHROPIC_API_KEY=${E2E_ANTHROPIC_KEY}\n`,
+    { mode: 0o600 },
+  );
+}
+console.log(
+  '[e2e] provider prerequisite: seeded each isolated server.env with a non-secret test key; ' +
+    'missing-key setup UI is outside this broad suite.',
 );
 
 // SAY OUT LOUD WHAT EACH TARGET ACTUALLY COVERS, every run.
@@ -128,6 +164,10 @@ console.log(
 
 export default defineConfig({
   testDir: '.',
+  reporter: process.env.AMUX_E2E_EVIDENCE_DIR
+    ? [['line'], ['./ci-evidence-reporter.mjs']] : undefined,
+  // Real providers and peer coordination require the dedicated lifecycle lab.
+  testIgnore: ['**/lifecycle/live-*.spec.ts'],
   timeout: 30_000,
   retries: 0,
   use: {

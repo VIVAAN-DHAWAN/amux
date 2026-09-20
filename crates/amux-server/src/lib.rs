@@ -7,6 +7,8 @@
 pub mod api;
 pub mod backend;
 pub mod config;
+pub mod fanout_workspace;
+mod cargo_target_guard;
 pub mod legacy_port;
 pub mod log_dedupe;
 
@@ -95,9 +97,11 @@ pub mod integrations;
 pub mod invariants;
 pub mod opencode;
 pub mod orchestrator;
+pub mod reconciliation;
 pub mod provider;
 pub mod push;
 pub mod runtime_jobs;
+pub mod activation;
 pub mod tls;
 
 use std::sync::Arc;
@@ -108,18 +112,36 @@ use std::time::Instant;
 /// rule; ethos rule 4). Falls back to the compile-time version when the
 /// binary path is unreadable.
 pub fn build_hash() -> String {
-    (|| -> Option<String> {
-        let exe = std::env::current_exe().ok()?;
-        let bytes = std::fs::read(exe).ok()?;
-        use sha2::Digest;
-        let mut h = sha2::Sha256::new();
-        h.update(&bytes);
-        Some(hex::encode(&h.finalize()[..8]))
-    })()
-    .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
+    // Identity belongs to this process image. Re-hashing the installed path
+    // per invariant row read tens of GB per pass while holding the sole writer
+    // (AF-911 / AMUX-4744). A replaced executable is a candidate until exec;
+    // activation::Candidate still hashes those on-disk candidates separately.
+    static RUNNING_BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUNNING_BUILD.get_or_init(|| {
+        let measured = std::env::current_exe().ok()
+            .and_then(|exe| activation::file_build_hash(&exe).ok());
+        match measured {
+            Some(build) => {
+                tracing::info!(verdict="running_build_measured", %build, measured=true,
+                    "running executable identity measured once for this process");
+                build
+            }
+            None => {
+                tracing::warn!(verdict="running_build_unmeasured", measured=false,
+                    "running executable unreadable; using package version identity");
+                format!("v{}", env!("CARGO_PKG_VERSION"))
+            }
+        }
+    }).clone()
 }
 
 pub fn run() {
+    let maintenance = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("amux-maintenance")
+        .enable_all()
+        .build()
+        .expect("maintenance runtime");
+    runtime_jobs::executor::install(maintenance.handle().clone());
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async_main());
 }
@@ -280,7 +302,10 @@ async fn async_main() {
         None => tracing_subscriber::fmt().with_env_filter(env_filter()).init(),
     }
 
-    tracing::info!(port = cfg.port, db = %cfg.db_path.display(), "starting amux-rust");
+    let running_build = build_hash();
+    tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
+        commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
+        self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok(), "starting amux-rust");
 
     // WAS THIS RESTART ANNOUNCED? (AF-176)
     //
@@ -340,6 +365,10 @@ async fn async_main() {
     // reader that starts up cannot report an age spanning the outage without
     // the outage itself already being on the record.
     runtime_jobs::heartbeat::record_boot(&store, cfg.port);
+    tracing::info!(target: "runtime", verdict = "maintenance_runtime_isolated",
+        runtime_pool = runtime_jobs::executor::pool_name(), pid = std::process::id(),
+        commit = env!("AMUX_BUILD_COMMIT_FULL"),
+        "registered maintenance jobs run on separate threads from HTTP and TLS");
 
     // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
     // Lets docs/rust-migration/migration-rehearsal.sh exercise the EXACT production
@@ -388,7 +417,7 @@ async fn async_main() {
     let state = api::AppState {
         store: store.clone(),
         started: Instant::now(),
-        build_hash: build_hash(),
+        build_hash: running_build.clone(),
         auth_token,
         reconciled: reconciled.clone(),
     };
@@ -444,15 +473,6 @@ async fn async_main() {
     );
 
     // Ghost-rescue (AMUX-2629): the FALLBACK sweep for the keystroke delivery
-    // path — it presses Enter for an amux message that was typed into a lane's
-    // input box and never submitted. Every rescue logs at WARN because a
-    // rescue means the send path failed. It retires when interactive lanes are
-    // protocol-driven; see runtime_jobs::ghost_rescue for the exit condition.
-    // The handle is dropped on purpose — a PeriodicTask is NOT aborted on drop
-    // (runtime_jobs' contract: an internal maintenance loop outlives the handle
-    // that spawned it, and is stopped only by an explicit `abort`).
-    drop(runtime_jobs::ghost_rescue::spawn(state.clone()));
-
     // Board -> worker drive loop (AMUX-2637): auto-pickup + the advance nudge.
     // Python owned this entire loop and the cutover left it behind, so no card
     // was assigned and no nudge was sent to any of the fleet's python-owned
@@ -476,16 +496,6 @@ async fn async_main() {
     // repair at boot, then holds the line on a 20s sweep against an
     // expiring viewer lease.
     drop(runtime_jobs::pane_size::spawn());
-    // The idle uncommitted-work nudge (AMUX-2638). Ownership comes from the
-    // staged-guard, never from the dirty tree — see the module docs for the
-    // three sweeps that rule exists to prevent. It owns its own tokio::spawn
-    // (it decides whether to run at all from AMUX_COMMIT_NUDGE_SECS), so it is
-    // `adopt`ed rather than spawned here — same contract, same call site.
-    {
-        let h = runtime_jobs::commit_nudge::spawn(state.clone());
-        jobs::adopt(jobs::ids::COMMIT_NUDGE, None, &h);
-    }
-
     // AUTOFIX (AMUX-2681) — notice, file, hand off. Runs in the SERVER, on
     // purpose: the thing that watches for breakage must not share fate with
     // the thing that breaks, so nothing in it touches a pane, a send or a turn
@@ -506,7 +516,10 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
-    drop(runtime_jobs::queue_disposition::spawn(state.clone()));
+    drop(runtime_jobs::host_metrics::spawn(state.clone()));
+    // Record tab transcripts (AMUX-4624): the folder is the work list, so a
+    // restart or a late model install resolves on the next tick.
+    drop(runtime_jobs::recordings_transcribe::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
     // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
     // unset — see runtime_jobs::telegram_poll's module doc for why polling,
@@ -522,10 +535,15 @@ async fn async_main() {
     // AMUX-3761: a durable record of WHICH RULE decided each lane's status,
     // so "was that badge accurate?" is answerable after the screenshot arrives.
     drop(runtime_jobs::status_history::spawn(state.clone()));
+    // CDC poller (migration 0061): tails board_change_log so the catch-up
+    // endpoint (/api/board/changes) stays current.
+    drop(runtime_jobs::cdc_poller::spawn(state.clone()));
     // The token_ledger WRITER. Every reader of that table was ported at the
     // cutover and this was not, so /api/stats/daily served a confident
     // total_tokens: 0 for 36 hours (AMUX-2892).
     drop(runtime_jobs::token_ledger::spawn(state.clone()));
+    drop(runtime_jobs::board_hygiene::spawn(state.clone()));
+    drop(runtime_jobs::message_capture::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
@@ -554,6 +572,8 @@ async fn async_main() {
     // spawned further down (after the listener is up) and now needs the store to
     // tell a lane its browser was released (AF-497).
     let reaper_store = state.store.clone();
+    api::board_intake::initialize();
+    api::history_ask::initialize();
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
@@ -583,8 +603,27 @@ async fn async_main() {
     let protocol = Arc::new(opencode::structured::StructuredCliProtocol::with_conversation_sink(
         Arc::new(StoreConversationSink { store: store.clone() }),
     ));
+    opencode::set_process_protocol(protocol.clone());
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
+    let durable_fleet_state = {
+        use rusqlite::OptionalExtension;
+        let conn = store
+            .read()
+            .expect("fleet state must be readable before the orchestrator starts");
+        let raw = conn
+            .query_row(
+                "SELECT state FROM _amux_fleet_state WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("durable fleet state must be queryable");
+        raw.map(|value| {
+            serde_json::from_str(&value).expect("durable fleet state must be valid JSON")
+        })
+        .unwrap_or(amux_core::circuit::FleetState::Normal)
+    };
     let runtime = Arc::new(orchestrator::runtime::Runtime {
         store: store.clone(),
         backends: backends.clone(),
@@ -595,14 +634,28 @@ async fn async_main() {
             .unwrap_or(3),
         heartbeat_every: 10,
         breaker: amux_core::circuit::FleetCircuitBreaker {
-            // Spend trip disabled until the token ledger wires in (Phase 4)
-            // — 0 budget with 0 accounting would trip instantly on lies.
-            window_budget_tokens: u64::MAX,
-            window_secs: 3600,
-            min_progress_per_window: 0, // no-progress trip opt-in via config later
-            max_failures_per_window: 50,
+            window_budget_tokens: cfg
+                .env
+                .get("AMUX_FLEET_WINDOW_TOKENS")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5_000_000),
+            window_secs: cfg
+                .env
+                .get("AMUX_FLEET_WINDOW_SECS")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3600),
+            min_progress_per_window: cfg
+                .env
+                .get("AMUX_FLEET_MIN_PROGRESS")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+            max_failures_per_window: cfg
+                .env
+                .get("AMUX_FLEET_MAX_FAILURES")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(50),
         },
-        fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+        fleet_state: std::sync::Mutex::new(durable_fleet_state),
         protocol: Some(protocol.clone() as Arc<dyn opencode::AgentProtocol>),
         pickup_unowned: cfg.env.get("AMUX_RS_PICKUP_UNOWNED").map(|v| v == "1").unwrap_or(false),
         // RR-0044b: staggered un-park interval after a provider rate-limit
@@ -756,17 +809,36 @@ async fn async_main() {
              binary change (AEAB-52: a test harness pins its build on purpose)"
         );
     } else {
-        jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async {
+        jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async move {
             let Ok(exe) = std::env::current_exe() else { return };
             let Ok(meta) = std::fs::metadata(&exe) else { return };
-            let initial = meta.modified().ok();
+            let mut observed = meta.modified().ok();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 jobs::tick(jobs::ids::SELF_ADOPT);
                 let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
-                if current.is_some() && current != initial {
-                    tracing::info!(
+                if current.is_some() && current != observed {
+                    let path = exe.clone();
+                    let candidate = match tokio::task::spawn_blocking(move || activation::Candidate::read(&path)).await {
+                        Ok(Ok(candidate)) => candidate,
+                        error => {
+                            tracing::warn!(verdict = "adoption_identity_unmeasured", ?error,
+                                pid = std::process::id(), "self-adoption deferred: cannot verify installed image");
+                            continue;
+                        }
+                    };
+                    let running_commit = env!("AMUX_BUILD_COMMIT_FULL");
+                    if let Some(reason) = candidate.skip_reason(running_commit, &running_build) {
+                        tracing::warn!(verdict = reason, pid = std::process::id(),
+                            running_commit, running_build = %running_build,
+                            candidate_commit = ?candidate.commit, candidate_build = %candidate.build,
+                            "self-adoption skipped: installation did not advance the running revision");
+                        observed = current;
+                        continue;
+                    }
+                    tracing::info!(pid = std::process::id(), running_commit, running_build = %running_build,
+                        candidate_commit = ?candidate.commit, candidate_build = %candidate.build,
                         "binary changed on disk — exec'ing the new build in place (self-adoption, \
                          AMUX-3458: no exit means no launchd throttle window)"
                     );

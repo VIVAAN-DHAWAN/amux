@@ -101,6 +101,130 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::RwLock;
 
+/// Shared snapshot context for disk-pressure findings and the reclaim view.
+pub(crate) fn apfs_snapshot_note(n: usize) -> String {
+    if n == 0 {
+        return "No local Time Machine snapshots were observed. This probe does not \
+                establish snapshot retention as the cause of unrecovered space. \
+                Remeasure free space before deciding on further deletion."
+            .into();
+    }
+    format!(
+        "{n} local Time Machine snapshots may retain blocks shared with deleted files. \
+         Their count does not measure retained bytes, prove that every deletion is \
+         blocked, or establish how long a backup disk has been absent. macOS can \
+         remove snapshots automatically as they age or storage is needed. Check \
+         backup status and remeasure free space before deciding on further deletion."
+    )
+}
+
+
+/// Bound both child lifetime and stdout consumption. A child can exit while a
+/// descendant still holds its stdout open, so wait_with_output after try_wait
+/// is not a deadline. Nonblocking reads also prevent a full pipe deadlock.
+pub(crate) fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::process::{Command, Stdio};
+    let deadline = std::time::Instant::now() + budget;
+    let mut child = Command::new(program).args(args).stdout(Stdio::piped())
+        .stderr(Stdio::null()).spawn().ok()?;
+    let result = (|| {
+        let mut stdout = child.stdout.take()?;
+        let fd = stdout.as_raw_fd();
+        // The owned pipe remains alive throughout these calls.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let mut output = Vec::new();
+        let mut eof = false;
+        let mut status = None;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(program, budget_s = budget.as_secs_f64(),
+                    "storage_probe_timeout: subprocess or stdout exceeded its budget; measurement unknown");
+                return None;
+            }
+            let mut progressed = false;
+            if !eof {
+                let mut buf = [0; 8192];
+                match stdout.read(&mut buf) {
+                    Ok(0) => eof = true,
+                    Ok(n) => {
+                        progressed = true;
+                        output.extend_from_slice(&buf[..n]);
+                        if output.len() > 1024 * 1024 {
+                            tracing::warn!(program, "storage_probe_output_limit: measurement unknown");
+                            return None;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                }
+            }
+            if status.is_none() { status = child.try_wait().ok()?; }
+            if let Some(status) = status {
+                if !status.success() { return None; }
+                if eof { return Some(output); }
+            }
+            if !progressed {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    })();
+    // Reap on every exit, including I/O errors and deadline/size failures.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+pub(crate) fn parse_local_snapshots(stdout: &[u8]) -> Option<Vec<String>> {
+    let mut lines = std::str::from_utf8(stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    let header = lines.next()?;
+    if !header.starts_with("Snapshots for ") || !header.ends_with(':') {
+        return None;
+    }
+    // A recognized empty listing is zero. Empty stdout, localized/changed
+    // formats and unexpected diagnostics are unmeasured, even after exit 0.
+    let mut snapshots = Vec::new();
+    for line in lines {
+        if line
+            .strip_prefix("com.apple.TimeMachine.")
+            .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+        snapshots.push(line.to_owned());
+    }
+    Some(snapshots)
+}
+
+
+pub(crate) const SNAPSHOT_UNMEASURED: &str = "Local snapshot retention is unmeasured: the probe did not return a successful recognized listing (unsupported platform/output, command failure, or timeout). Do not infer that snapshots are absent or that deleting them is necessary.";
+
+pub(crate) fn local_snapshots() -> Option<Vec<String>> {
+    probe_local_snapshots("/usr/bin/tmutil", &["listlocalsnapshots", "/"], std::time::Duration::from_secs(5))
+}
+
+fn probe_local_snapshots(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<String>> {
+    let snapshots = bounded_output(program, args, budget)
+        .and_then(|stdout| parse_local_snapshots(&stdout));
+    let measured = snapshots.is_some();
+    let n_considered = snapshots.as_ref().map_or(0, Vec::len);
+    if measured {
+        tracing::info!(measured, n_considered, "storage_snapshot_probe");
+    } else {
+        tracing::warn!(measured, n_considered, why_unmeasured = SNAPSHOT_UNMEASURED, "storage_snapshot_probe");
+    }
+    snapshots
+}
+
 /// Default tick: hourly. Retention is not time-critical; the only thing that
 /// matters is that it happens without traffic.
 pub const STORAGE_TICK_SECS: u64 = 3600;
@@ -164,6 +288,16 @@ pub const SPECS: &[SweepSpec] = &[
         unit: TsUnit::Secs,
         env: "AMUX_SESSION_EVENTS_RETAIN_DAYS",
         default_days: 90.0,
+    },
+    // ~1.8 KB per sample at a 300 s default interval: ~520 KB/day, ~15 MB at
+    // 30 days. Kept longer than the interaction log because a row is small and
+    // the question it answers ("when did the disk fill?") is asked weeks late.
+    SweepSpec {
+        table: "host_metrics",
+        ts_col: "ts",
+        unit: TsUnit::Secs,
+        env: "AMUX_HOST_METRICS_RETAIN_DAYS",
+        default_days: 30.0,
     },
     // MILLISECONDS. The expensive one: 1,893 B/row (it stores `before`/`detail`/
     // `result` blobs), 3,236 rows/day. At 90d this single table would reach 524MB —
@@ -230,6 +364,16 @@ pub const SPECS: &[SweepSpec] = &[
         unit: TsUnit::IsoText,
         env: "AMUX_STATE_EVENTS_RETAIN_DAYS",
         default_days: 14.0,
+    },
+    // 19k rows, ~1,930 B/row, ~325 rows/day. Delivery receipts for messages sent
+    // to lanes. 30d x 325 x 1,930B = ~18MB. Discovered at 37MB / 59 days with no
+    // retention at all (2026-09-09 disk audit).
+    SweepSpec {
+        table: "steering_history",
+        ts_col: "queued_at",
+        unit: TsUnit::Secs,
+        env: "AMUX_STEERING_HISTORY_RETAIN_DAYS",
+        default_days: 30.0,
     },
 ];
 
@@ -307,13 +451,17 @@ fn iso_utc(secs: i64) -> String {
 /// The oldest row's timestamp, normalised to SECONDS, for guard 2. `IsoText`
 /// returns None: the ISO column is compared lexicographically and cannot land
 /// 1000x off, so the mismatch this guard exists to catch cannot occur there.
+fn retention_eligible(spec: &SweepSpec) -> &'static str {
+    if spec.table == "cmd_history" { "capture_pending=0" } else { "1=1" }
+}
+
 fn oldest_secs(conn: &Connection, spec: &SweepSpec) -> Option<f64> {
     match spec.unit {
         TsUnit::IsoText => None,
         TsUnit::Secs | TsUnit::Millis => {
             let raw: f64 = conn
                 .query_row(
-                    &format!("SELECT MIN({}) FROM {}", spec.ts_col, spec.table),
+                    &format!("SELECT MIN({}) FROM {} WHERE {}", spec.ts_col, spec.table, retention_eligible(spec)),
                     [],
                     |r| r.get(0),
                 )
@@ -367,10 +515,13 @@ pub fn sweep_one(conn: &Connection, spec: &SweepSpec, now_secs: f64) -> SweepRes
     }
 
     match conn.execute(
-        &format!("DELETE FROM {} WHERE {} < ?1", spec.table, spec.ts_col),
+        &format!("DELETE FROM {} WHERE {} < ?1 AND {}", spec.table, spec.ts_col, retention_eligible(spec)),
         rusqlite::params![&cutoff],
     ) {
         Ok(rows) => {
+            // Include protected unfinished message consequences in the actual
+            // survivor count without weakening the timestamp-unit guard above.
+            let kept = total - rows as i64;
             if rows > 0 {
                 tracing::info!(
                     table = spec.table,
@@ -500,31 +651,26 @@ pub fn rotate_server_log(logs_dir: &Path) -> Option<u64> {
 /// is the honest "this was never a unit of work", so holding its attachment
 /// forever would make the protection a leak that never frees anything. That
 /// asymmetry is what the control cell pins.
-pub fn card_referenced_uploads(conn: &Connection) -> std::collections::HashSet<String> {
+pub fn card_referenced_uploads(conn: &Connection, uploads: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let texts = super::log_retention::reference_texts(conn, "/uploads/")?;
     let mut out = std::collections::HashSet::new();
-    // Filter in SQL so a 13k-card board does not get fully deserialised every
-    // sweep tick; the regex then only runs over rows that mention the directory.
-    let sql = "SELECT COALESCE(title,'') || ' ' || COALESCE(desc,'') || ' ' \
-               || COALESCE(evidence,'') || ' ' || COALESCE(log,'') AS t \
-               FROM issues \
-               WHERE COALESCE(archived,0) = 0 AND COALESCE(status,'') != 'discarded' \
-                 AND (COALESCE(title,'') LIKE '%/uploads/%' \
-                   OR COALESCE(desc,'') LIKE '%/uploads/%' \
-                   OR COALESCE(evidence,'') LIKE '%/uploads/%' \
-                   OR COALESCE(log,'') LIKE '%/uploads/%')";
-    let Ok(mut st) = conn.prepare(sql) else { return out };
-    let re = match regex::Regex::new(r"/uploads/([A-Za-z0-9._-]+)") {
-        Ok(r) => r,
-        Err(_) => return out,
+    let md = match std::fs::symlink_metadata(uploads) {
+        Ok(md) => md,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error.into()),
     };
-    if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
-        for text in rows.flatten() {
-            for c in re.captures_iter(&text) {
-                out.insert(c[1].to_string());
-            }
+    anyhow::ensure!(md.is_dir() && !md.file_type().is_symlink(), "upload retention root must be a real directory");
+    // Match actual names rather than parsing prose: upload names may contain
+    // spaces and Unicode, and a URL may percent-escape them. A prefix match is
+    // deliberately conservative (extra retention is safer than lost evidence).
+    for entry in std::fs::read_dir(uploads)? {
+        let name = entry?.file_name().into_string().map_err(|_| anyhow::anyhow!("upload filename is not UTF-8"))?;
+        let needle = format!("/uploads/{name}");
+        if texts.iter().any(|text| text.contains(&needle)) {
+            out.insert(name);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Reap files in `dir` older than `max_age_secs`, EXCEPT any whose filename is
@@ -592,6 +738,429 @@ pub fn prune_dir_by_age(dir: &Path, max_age_secs: u64, label: &str) -> (usize, u
     (n, bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Directory-level pruning (evidence, stale build targets, temp browser dirs)
+// ---------------------------------------------------------------------------
+
+/// Subdirectories under `~/.amux/` whose CONTENTS are pruned by age. Unlike
+/// `AGE_PRUNED_DIRS` (which reaps files), these contain sub-DIRECTORIES that
+/// each represent one task/run. The whole subtree is removed when the
+/// directory's mtime ages past the retention.
+///
+/// (dir name under home, retain-days env var, default days)
+pub const AGE_PRUNED_SUBDIRS: &[(&str, &str, u64)] = &[
+    // 29 GB on 2026-09-09, all from one day of customer evidence captures.
+    // Age is only eligibility. Linked evidence and actively used captures are
+    // protected by the reference/activity/descendant checks before deletion.
+    ("evidence", "AMUX_EVIDENCE_RETAIN_DAYS", 7),
+    // 233 MB on 2026-09-09 across 5 audit workspaces. Each is a self-contained
+    // acceptance test workspace (handoff proofs, scroll accuracy, etc.). 30 days
+    // keeps them around for review but prevents indefinite accumulation.
+    ("audits", "AMUX_AUDITS_RETAIN_DAYS", 30),
+];
+
+/// Quick recursive size estimate. Best-effort: unreadable entries are skipped.
+fn dir_size_fast(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
+/// Delete rotated session logs (`*.log.1`) older than the retention and any
+/// stale diagnostic files that accumulate in the logs directory. Returns
+/// (files removed, bytes freed).
+///
+/// `AMUX_ROTATED_LOG_RETAIN_DAYS` (default 3). The .log.1 is the previous
+/// generation; anything in it that mattered has been acted on. 35 of them
+/// accumulated to 1.2 GB with zero retention (2026-09-09 disk audit).
+///
+/// `server-rs.log.1` is excluded: rotate_server_log owns that file. A merge on
+/// 2026-09-09 collided two implementations of this function, and only the one
+/// deleted there carried the exclusion.
+pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
+    let days = env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3);
+    if days == 0 {
+        return (0, 0);
+    }
+    let max_age = days * 86_400;
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // server-rs.log.1 is rotate_server_log's to manage. The narrower
+        // duplicate of this function carried that exclusion and this one did
+        // not; the merge that collided them would have silently handed the
+        // broader sweep the server's own rotation (E0428, 2026-09-09).
+        if name == "server-rs.log.1" {
+            continue;
+        }
+        let dominated = name.ends_with(".log.1")
+            || name.ends_with(".log.2")
+            || name.ends_with(".sample.txt")
+            || (name.starts_with("tmux-stall-") && name.ends_with(".json"))
+            || (name.starts_with("watchdog-diag-") && name.ends_with(".md"));
+        if !dominated {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age {
+            continue;
+        }
+        if std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+            bytes += md.len();
+        }
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %logs_dir.display(), removed = n, freed_bytes = bytes,
+            retain_days = days,
+            knob = "AMUX_ROTATED_LOG_RETAIN_DAYS",
+            "storage sweep pruned rotated/stale logs"
+        );
+    }
+    (n, bytes)
+}
+
+/// Delete stale build-target directories that are not the canonical shared one.
+/// `rust-build-target-pr199` (615 MB on 2026-09-09) is the kind of sediment
+/// this removes: one-off PR worktree build dirs that outlive their PR.
+///
+/// Retention: `AMUX_STALE_BUILD_TARGET_RETAIN_DAYS` (default 3).
+pub fn prune_stale_build_targets(home: &Path) -> (usize, u64) {
+    let days = env_u64("AMUX_STALE_BUILD_TARGET_RETAIN_DAYS", 3);
+    if days == 0 {
+        return (0, 0);
+    }
+    let max_age = days * 86_400;
+    let canonical = home.join("rust-build-target");
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(home) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("rust-build-target-") {
+            continue;
+        }
+        if e.path() == canonical {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age {
+            continue;
+        }
+        let size = dir_size_fast(&e.path());
+        if crate::cargo_target_guard::purge_build_target(&e.path()).is_ok() {
+            // Cargo lock ancestors may remain; report actual bytes reclaimed,
+            // not the pre-clear size of a directory that still owns lock files.
+            let freed = size.saturating_sub(dir_size_fast(&e.path()));
+            n += usize::from(!e.path().exists());
+            bytes += freed;
+            tracing::info!(
+                path = %e.path().display(), freed_bytes = freed,
+                knob = "AMUX_STALE_BUILD_TARGET_RETAIN_DAYS",
+                "storage sweep reclaimed stale build target artifacts"
+            );
+        }
+    }
+    (n, bytes)
+}
+
+/// Delete temporary browser session directories in `playwright-auth/`.
+/// These are the numbered dirs like `bb-1784387451210` created by one-off
+/// browser runs. They are distinct from PROFILES (which live in `profiles/`)
+/// and the browser_reaper already manages those.
+///
+/// Retention: `AMUX_BROWSER_TEMP_RETAIN_DAYS` (default 7).
+pub fn prune_temp_browser_dirs(home: &Path) -> (usize, u64) {
+    let days = env_u64("AMUX_BROWSER_TEMP_RETAIN_DAYS", 7);
+    if days == 0 {
+        return (0, 0);
+    }
+    let max_age = days * 86_400;
+    let pw_dir = home.join("playwright-auth");
+    let now = std::time::SystemTime::now();
+    let Ok(rd) = std::fs::read_dir(&pw_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        // Skip the persistent directories: `profiles/`, `profile/`, `peek-measure/`
+        if name == "profiles" || name == "profile" || name == "peek-measure" {
+            continue;
+        }
+        // Temp dirs contain a timestamp suffix like `bb-1784387451210`
+        let has_timestamp = name.contains('-')
+            && name.rsplit('-').next().is_some_and(|s| s.len() >= 10 && s.chars().all(|c| c.is_ascii_digit()));
+        if !has_timestamp {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age <= max_age {
+            continue;
+        }
+        let size = dir_size_fast(&e.path());
+        if std::fs::remove_dir_all(e.path()).is_ok() {
+            n += 1;
+            bytes += size;
+        }
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %pw_dir.display(), removed = n, freed_bytes = bytes,
+            retain_days = days,
+            knob = "AMUX_BROWSER_TEMP_RETAIN_DAYS",
+            "storage sweep pruned temp browser dirs"
+        );
+    }
+    (n, bytes)
+}
+
+/// Cap individual session logs by copy-truncate.
+///
+/// Each of the ~50 sessions writes a `<name>.log` in `logs/`. These grow
+/// without bound: 4.5 GB measured on 2026-09-09, with the largest at 56 MB.
+/// The server-rs.log has its own rotation (above), so this skips it.
+///
+/// Copy-truncate is safe here for the same reason it works on server-rs.log:
+/// tmux's pipe-pane opens the file O_APPEND, and truncating in place just
+/// moves the write offset to 0. The race window (bytes between copy and
+/// truncate) is the standard logrotate copytruncate cost.
+///
+/// `AMUX_SESSION_LOG_MAX_MB` (default 20, 0 disables). Returns (files
+/// rotated, total bytes rolled).
+pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
+    let max_mb = env_u64("AMUX_SESSION_LOG_MAX_MB", 20);
+    if max_mb == 0 {
+        return (0, 0);
+    }
+    let max_bytes = max_mb * 1024 * 1024;
+    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".log") || name == "server-rs.log" {
+            continue;
+        }
+        if md.len() < max_bytes {
+            continue;
+        }
+        let path = e.path();
+        let prev = path.with_extension("log.1");
+        if std::fs::copy(&path, &prev).is_err() {
+            continue;
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .is_err()
+        {
+            continue;
+        }
+        n += 1;
+        bytes += md.len();
+    }
+    if n > 0 {
+        tracing::info!(
+            dir = %logs_dir.display(), rotated = n, rolled_bytes = bytes,
+            max_mb = max_mb,
+            knob = "AMUX_SESSION_LOG_MAX_MB",
+            "storage sweep rotated oversized session logs"
+        );
+    }
+    (n, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Periodic VACUUM
+// ---------------------------------------------------------------------------
+
+/// VACUUM at most once per day, when the storage sweep actually deleted rows.
+/// Returns true if a VACUUM ran.
+///
+/// SQLite DELETE frees pages internally but does not shrink the file. Without
+/// VACUUM, the DB file on disk grows monotonically even while the retention
+/// sweep dutifully removes aged rows. Measured 2026-09-09: 2.8 GB on disk,
+/// ~2.1 GB of live data, 82 free pages (essentially zero reclaimable space
+/// because the freelist is continuously reused for new writes). The gap
+/// between the two numbers is what VACUUM recovers.
+///
+/// Full VACUUM rewrites the entire file, so it is expensive. Once per day is a
+/// compromise: frequent enough that a single day's deletions are reclaimed
+/// before the next day's writes fill the freed pages, infrequent enough that
+/// the ~3 GB rewrite cost is negligible.
+/// Truncate the WAL on EVERY tick, independent of VACUUM (AMUX-4811).
+///
+/// The only `wal_checkpoint(TRUNCATE)` used to live inside `maybe_vacuum`,
+/// which the caller invokes only when `total_deleted > 0` and which then
+/// refuses unless 24h have passed. So on any tick where retention deleted
+/// nothing, the WAL was never truncated at all. The comment at that call site
+/// already said "the WAL checkpoint is cheap, full VACUUM is not"; this splits
+/// them so the cheap half runs on the cheap schedule.
+///
+/// It matters because the default 1000-page autocheckpoint runs in PASSIVE
+/// mode: it gives up immediately when any reader is active and does not shrink
+/// the file even when it succeeds. With ~42 lanes polling the API there is
+/// nearly always a reader, so passive checkpoints rarely complete. Measured on
+/// this box 2026-09-18: a 4.16 GB database carrying a 150,025,712 B WAL, grown
+/// in the 16.5 hours since the last VACUUM, about 9 MB/hour that autocheckpoint
+/// never reclaimed.
+///
+/// Returns (before, after) so the caller can publish both. A checkpoint that
+/// ran and freed nothing is a different fact from one that never ran, and only
+/// reporting both tells them apart (ethos rule 4).
+async fn checkpoint_wal(store: &crate::db::SharedStore, home: &Path) -> (Option<u64>, Option<u64>) {
+    let wal = home.join("amux.db-wal");
+    let size = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
+    let before = size(&wal);
+    let t0 = std::time::Instant::now();
+    // `read_async`, NOT `write_async`, and that is the whole fix.
+    //
+    // Every write_async closure runs inside an Immediate transaction
+    // (db/mod.rs:612), and SQLite refuses a checkpoint inside one. The first
+    // version of this function used write_async and the log said so on the
+    // very first tick: `wal_checkpoint(TRUNCATE) failed error=database table
+    // is locked`. read_async hands out a POOLED connection that is not in a
+    // transaction, and those are opened read-write
+    // (SqliteConnectionManager::file with no read-only flag), so the pragma
+    // can actually do its work. The "read-only" in that pool's docstring is a
+    // convention about intent, not an enforced flag.
+    let res = store
+        .read_async(move |conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })
+        .await;
+    let after = size(&wal);
+    match res {
+        Ok(_) => {
+            // Two-fix rule: when this regresses, the log says so without
+            // anyone comparing sizes by hand. A TRUNCATE that leaves the file
+            // large means a reader held the checkpoint off, which is the
+            // failure mode worth seeing.
+            if let (Some(b), Some(a)) = (before, after) {
+                if a > 8 * 1024 * 1024 && a > b / 2 {
+                    tracing::warn!(
+                        before_bytes = b, after_bytes = a,
+                        took_ms = t0.elapsed().as_millis() as u64,
+                        "storage sweep: wal_checkpoint(TRUNCATE) did not shrink the WAL — a \
+                         long-lived reader is holding the checkpoint off (AMUX-4811)"
+                    );
+                } else {
+                    tracing::info!(
+                        before_bytes = b, after_bytes = a,
+                        took_ms = t0.elapsed().as_millis() as u64,
+                        "storage sweep: WAL checkpointed"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "storage sweep: wal_checkpoint(TRUNCATE) failed"),
+    }
+    (before, after)
+}
+
+async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
+    let marker = home.join(".last-vacuum");
+    let min_interval = env_u64("AMUX_VACUUM_INTERVAL_SECS", 86_400);
+    if min_interval == 0 {
+        return false;
+    }
+    if let Ok(md) = std::fs::metadata(&marker) {
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age < min_interval {
+            return false;
+        }
+    }
+    let t0 = std::time::Instant::now();
+    // Same correction as checkpoint_wal above (AMUX-4811): VACUUM, like a
+    // checkpoint, cannot run inside a transaction, and write_async wraps every
+    // closure in an Immediate one (db/mod.rs:612). This path has therefore been
+    // failing for as long as it has existed. Nobody saw it because the marker
+    // below was written whether or not the work succeeded, so the next attempt
+    // was suppressed for another 24 hours and the log line said "VACUUM
+    // completed" only on a branch that never ran.
+    let res = store
+        .read_async(move |conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            conn.execute_batch("VACUUM;")?;
+            Ok(())
+        })
+        .await;
+    // ONLY on success. Writing it unconditionally turned a failure into a
+    // 24-hour silence, which is how a 4.16 GB database ended up carrying a
+    // 143 MB WAL with nothing in the log to explain it.
+    if res.is_ok() {
+        let _ = std::fs::write(&marker, format!("{}", unix_now() as i64));
+    }
+    match res {
+        Ok(_) => {
+            tracing::info!(
+                took_ms = t0.elapsed().as_millis() as u64,
+                knob = "AMUX_VACUUM_INTERVAL_SECS",
+                "storage sweep: VACUUM completed"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "storage sweep: VACUUM failed");
+            false
+        }
+    }
+}
+
 /// Free bytes on the volume holding `path`.
 pub fn disk_free_bytes(path: &Path) -> Option<u64> {
     let df = ["/bin/df", "/usr/bin/df"].iter().find(|c| Path::new(c).is_file())?;
@@ -613,12 +1182,28 @@ pub struct StorageReport {
     pub at: f64,
     pub tables: Vec<(String, String)>,
     pub rotated_bytes: u64,
+    pub session_logs_rotated: usize,
+    pub session_logs_rolled_bytes: u64,
     pub files_removed: usize,
     pub bytes_freed: u64,
     /// Aged-out uploads NOT deleted because a live card points at them. Reported
     /// beside `files_removed` so "deleted nothing" and "deleted nothing because
     /// everything was still referenced" are different readings (ethos rule 4).
     pub kept_card_referenced: usize,
+    pub upload_refs_error: Option<String>,
+    pub memory_entries_removed: usize,
+    pub run_logs: super::log_retention::Report,
+    pub diagnostic_dirs: Vec<(String, super::log_retention::Report)>,
+    pub dirs_removed: usize,
+    pub dir_bytes_freed: u64,
+    pub vacuumed: bool,
+    /// WAL size either side of this tick's checkpoint (AMUX-4811). Both are
+    /// reported so "the WAL is small" and "the checkpoint did not run" are
+    /// different readings, which is the distinction that hid this for a month.
+    pub wal_before_bytes: Option<u64>,
+    pub wal_after_bytes: Option<u64>,
+    pub rotated_logs_removed: usize,
+    pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
     pub took_ms: f64,
 }
@@ -643,6 +1228,9 @@ pub const AGE_PRUNED_DIRS: &[(&str, &str, u64)] = &[
     ("media-cache", "AMUX_MEDIA_CACHE_RETAIN_DAYS", 30),
     ("uploads", "AMUX_UPLOADS_RETAIN_DAYS", 7),
     ("spin-dumps", "AMUX_SPIN_DUMPS_RETAIN_DAYS", 14),
+    ("browser-screenshots", "AMUX_BROWSER_SCREENSHOTS_RETAIN_DAYS", 14),
+    ("email-attachments", "AMUX_EMAIL_ATTACHMENTS_RETAIN_DAYS", 30),
+    ("transcripts", "AMUX_TRANSCRIPTS_RETAIN_DAYS", 30),
 ];
 
 pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
@@ -680,6 +1268,16 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
 
     let logs = home.join("logs");
     rep.rotated_bytes = rotate_server_log(&logs).unwrap_or(0);
+    let (rl_n, rl_b) = prune_rotated_logs(&logs);
+    rep.rotated_logs_removed = rl_n;
+    rep.rotated_logs_freed = rl_b;
+
+    // Session log capping: each of ~50 sessions writes a .log that grows
+    // without bound. At 20 MB default cap this keeps the logs/ dir under ~1 GB
+    // steady state instead of the 4.5 GB measured on 2026-09-09.
+    let (slr, slb) = rotate_session_logs(&logs);
+    rep.session_logs_rotated = slr;
+    rep.session_logs_rolled_bytes = slb;
 
     // Age-reaped dirs, driven by the AGE_PRUNED_DIRS authority (above) so the
     // prune and settings::is_ephemeral_path read ONE list. media-cache/uploads
@@ -687,24 +1285,24 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     // incident holding areas nothing had ever removed. Running them on a timer is
     // the whole fix.
     //
-    // `uploads` additionally consults the BOARD: a card is durable and this
-    // directory is reaped by age, so without this the reaper deletes the very
-    // screenshot a card is about (AMUX-3937 — 109 of 113 references were already
-    // dead when this was found). The other dirs are not referenced by cards and
-    // pass an empty keep-set, which is also the positive control: if the keep-set
-    // silently came back empty for `uploads` too, `kept_card_referenced` would
-    // read 0 and say so rather than looking like a clean sweep.
-    let keep = state
-        .store
-        .read()
-        .ok()
-        .map(|conn| card_referenced_uploads(&conn))
-        .unwrap_or_default();
+    // Upload references must be complete before deletion. Other flat cache
+    // directories retain their existing age policy.
+    let store = state.store.clone();
+    let uploads = home.join("uploads");
+    let keep = tokio::task::spawn_blocking(move || store.read().and_then(|conn| card_referenced_uploads(&conn, &uploads)))
+        .await.unwrap_or_else(|error| Err(error.into()));
+    if let Err(error) = &keep {
+        rep.upload_refs_error = Some(error.to_string());
+        tracing::warn!(%error, "upload retention deferred: references unavailable");
+    }
     let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (mut files, mut bytes, mut kept) = (0usize, 0u64, 0usize);
     for (name, env_key, default_days) in AGE_PRUNED_DIRS {
         let days = env_u64(env_key, *default_days);
-        let keeping = if *name == "uploads" { &keep } else { &empty };
+        let keeping = if *name == "uploads" {
+            let Ok(keep) = &keep else { continue };
+            keep
+        } else { &empty };
         let (n, b, k) =
             prune_dir_by_age_keeping(&home.join(name), days * 86_400, env_key, keeping);
         files += n;
@@ -714,6 +1312,54 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     rep.files_removed = files;
     rep.bytes_freed = bytes;
     rep.kept_card_referenced = kept;
+
+    let log_refs = super::log_retention::references(state, "/logs/").await;
+    rep.run_logs = super::log_retention::sweep(home, "logs", env_u64("AMUX_RUN_LOG_RETAIN_DAYS", 30), log_refs).await;
+    rep.memory_entries_removed = crate::api::session_verbs::sweep_transcript_evidence();
+
+    // Directory-level pruning (evidence captures, etc.).
+    let (mut dirs, mut dir_bytes) = (0usize, 0u64);
+    for (name, env_key, default_days) in AGE_PRUNED_SUBDIRS {
+        let days = env_u64(env_key, *default_days);
+        let refs = super::log_retention::references(state, &format!("/{name}/")).await;
+        let report = super::log_retention::sweep(home, name, days, refs).await;
+        dirs += report.removed;
+        dir_bytes += report.bytes_freed;
+        rep.diagnostic_dirs.push((name.to_string(), report));
+    }
+
+    // Stale one-off build target directories.
+    let (bn, bb) = prune_stale_build_targets(home);
+    dirs += bn;
+    dir_bytes += bb;
+
+    // Temp browser session directories in playwright-auth/.
+    let (pn, pb) = prune_temp_browser_dirs(home);
+    dirs += pn;
+    dir_bytes += pb;
+
+    rep.dirs_removed = dirs;
+    rep.dir_bytes_freed = dir_bytes;
+
+    // The cheap half, every tick and unconditionally (AMUX-4811). This used to
+    // be reachable only through maybe_vacuum below, so a tick that deleted
+    // nothing never truncated the WAL and it grew until some later tick both
+    // deleted something AND cleared the 24h vacuum interval.
+    let (wal_before, wal_after) = checkpoint_wal(&state.store, home).await;
+    rep.wal_before_bytes = wal_before;
+    rep.wal_after_bytes = wal_after;
+
+    // VACUUM reclaims disk space that DELETE freed inside SQLite but did not
+    // return to the OS. Only run when something was actually deleted, and at
+    // most once per day. Full VACUUM is expensive and stays gated; the WAL
+    // checkpoint it used to carry now runs above on its own schedule.
+    let total_deleted: usize = rep.tables.iter()
+        .filter(|(_, v)| v.contains("Deleted { rows:") && !v.contains("rows: 0"))
+        .count();
+    if total_deleted > 0 {
+        rep.vacuumed = maybe_vacuum(&state.store, home).await;
+    }
+
     rep.free_bytes = disk_free_bytes(home);
     rep.took_ms = t0.elapsed().as_secs_f64() * 1000.0;
     *last_report_cell().write().unwrap() = Some(rep.clone());
@@ -735,12 +1381,31 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // `kept_card_referenced` is in the guard as well as the payload:
             // a tick whose only action was DECLINING to delete a card's
             // attachment is an action, and it was previously silent.
-            if r.rotated_bytes > 0 || r.files_removed > 0 || r.kept_card_referenced > 0 {
+            let any_work = r.rotated_bytes > 0
+                || r.session_logs_rotated > 0
+                || r.files_removed > 0
+                || r.kept_card_referenced > 0
+                || r.dirs_removed > 0
+                || r.vacuumed
+                || r.rotated_logs_removed > 0
+                || r.memory_entries_removed > 0
+                || r.run_logs.removed > 0;
+            if any_work {
                 tracing::info!(
                     rotated_bytes = r.rotated_bytes,
+                    session_logs_rotated = r.session_logs_rotated,
+                    session_logs_rolled_bytes = r.session_logs_rolled_bytes,
                     files_removed = r.files_removed,
                     bytes_freed = r.bytes_freed,
                     kept_card_referenced = r.kept_card_referenced,
+                    dirs_removed = r.dirs_removed,
+                    dir_bytes_freed = r.dir_bytes_freed,
+                    vacuumed = r.vacuumed,
+                    rotated_logs_removed = r.rotated_logs_removed,
+                    rotated_logs_freed = r.rotated_logs_freed,
+                    memory_entries_removed = r.memory_entries_removed,
+                    run_log_dirs_removed = r.run_logs.removed,
+                    run_log_bytes_freed = r.run_logs.bytes_freed,
                     "storage sweep tick"
                 );
             }
@@ -765,14 +1430,27 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "ts_col": s.ts_col, "unit": format!("{:?}", s.unit),
         })).collect::<Vec<_>>(),
         "server_log_max_mb": server_log_max_bytes() / 1024 / 1024,
+        "session_log_max_mb": env_u64("AMUX_SESSION_LOG_MAX_MB", 20),
+        "rotated_log_retain_days": env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3),
+        "run_log_retain_days": env_u64("AMUX_RUN_LOG_RETAIN_DAYS", 30),
         "sweep_secs": env_u64("AMUX_STORAGE_SWEEP_SECS", STORAGE_TICK_SECS),
+        "dir_pruning": AGE_PRUNED_SUBDIRS.iter().map(|(name, env, default)| json!({
+            "dir": name, "env": env, "retain_days": env_u64(env, *default),
+        })).collect::<Vec<_>>(),
         "last": r.map(|r| json!({
             "at": r.at, "tables": r.tables, "rotated_bytes": r.rotated_bytes,
+            "session_logs_rotated": r.session_logs_rotated,
+            "session_logs_rolled_bytes": r.session_logs_rolled_bytes,
             "files_removed": r.files_removed, "bytes_freed": r.bytes_freed,
-            // Beside files_removed, never instead of it: "freed nothing" and
-            // "freed nothing because a live card still points at all of it" are
-            // different answers and the endpoint has to be able to say which.
             "kept_card_referenced": r.kept_card_referenced,
+            "upload_references": {"measured": r.upload_refs_error.is_none(), "why_unmeasured": r.upload_refs_error},
+            "memory_entries_removed": r.memory_entries_removed,
+            "run_logs": r.run_logs,
+            "diagnostic_dirs": r.diagnostic_dirs,
+            "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
+            "vacuumed": r.vacuumed,
+            "rotated_logs_removed": r.rotated_logs_removed,
+            "rotated_logs_freed": r.rotated_logs_freed,
             "took_ms": r.took_ms,
         })),
     });
@@ -794,6 +1472,77 @@ pub fn routes() -> axum::Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_snapshot_probe_logs_unknown_and_positive_control_logs_measured() {
+        // Tracing callsite interest is process-wide. Other tests concurrently
+        // installing subscribers must not decide whether this control logs.
+        if std::env::var_os("AMUX_TEST_SNAPSHOT_LOG_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime_jobs::storage::tests::failed_snapshot_probe_logs_unknown_and_positive_control_logs_measured", "--nocapture"])
+                .env("AMUX_TEST_SNAPSHOT_LOG_CHILD", "1")
+                .output().unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for (script, measured) in [("exit 0", false), ("echo 'Snapshots for disk /:'", true)] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(bytes.clone());
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_writer(move || writer.clone()).finish();
+            let result = tracing::subscriber::with_default(subscriber, ||
+                super::probe_local_snapshots("/bin/sh", &["-c", script], std::time::Duration::from_secs(1)));
+            assert_eq!(result.is_some(), measured);
+            let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("storage_snapshot_probe"), "{logs}");
+            assert!(logs.contains(&format!("measured={measured}")), "{logs}");
+            assert!(logs.contains("n_considered=0"), "{logs}");
+            if !measured {
+                assert!(logs.contains("WARN") && logs.contains("why_unmeasured="), "{logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_snapshot_probe_preserves_zero_unknown_and_positive() {
+        let budget = std::time::Duration::from_secs(2);
+        assert_eq!(super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:"], budget), Some(vec![]));
+        assert_eq!(super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:\ncom.apple.TimeMachine.example.local"], budget), Some(vec!["com.apple.TimeMachine.example.local".into()]));
+        for script in ["exit 0", "echo 'Snapshots for disk /:'; exit 1", "echo diagnostic"] {
+            assert_eq!(super::probe_local_snapshots("/bin/sh", &["-c", script], budget), None, "{script}");
+        }
+        assert_eq!(super::probe_local_snapshots("/no/such/amux-probe", &[], budget), None);
+    }
+
+    #[test]
+    fn snapshot_probe_bounds_running_child_and_inherited_stdout() {
+        for script in ["exec /bin/sleep 5", "/bin/sleep 1 & exit 0"] {
+            let start = std::time::Instant::now();
+            assert_eq!(super::probe_local_snapshots("/bin/sh", &["-c", script], std::time::Duration::from_millis(150)), None);
+            assert!(start.elapsed() < std::time::Duration::from_millis(900), "probe outlived its own deadline: {script}");
+        }
+    }
+
+    #[test]
+    fn bounded_probe_drains_more_than_a_pipe_buffer_and_limits_output() {
+        let budget = std::time::Duration::from_secs(5);
+        // Finite deterministic byte streams. Without the ceiling the second
+        // command succeeds with 2 MiB, rather than hitting a separate timeout.
+        let bytes = super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=2"], budget).unwrap();
+        assert_eq!(bytes.len(), 131072);
+        assert_eq!(super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=32"], budget), None);
+    }
+
     use super::*;
 
     fn mem() -> Connection {
@@ -849,7 +1598,7 @@ mod tests {
         aged_file(dir.path(), "referenced.png", 10 * 86_400);
         aged_file(dir.path(), "orphan.png", 10 * 86_400);
         let conn = board(&[("AMUX-1", "see /Users/ethan/.amux/uploads/referenced.png", 0)]);
-        let keep = card_referenced_uploads(&conn);
+        let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
         assert!(keep.contains("referenced.png"), "keep-set must find the reference: {keep:?}");
 
         let (removed, _, kept) =
@@ -865,12 +1614,14 @@ mod tests {
     /// is a worse bug than the one it fixes and would never show up as a failure.
     #[test]
     fn a_discarded_or_archived_card_does_not_pin_its_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["discarded.png", "archived.png", "live.png"] { aged_file(dir.path(), name, 0); }
         let conn = board(&[
             ("DISC-1", "/Users/ethan/.amux/uploads/discarded.png", 0),
             ("AMUX-2", "/Users/ethan/.amux/uploads/archived.png", 1),
             ("AMUX-3", "/Users/ethan/.amux/uploads/live.png", 0),
         ]);
-        let keep = card_referenced_uploads(&conn);
+        let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
         assert!(keep.contains("live.png"), "positive control: a live card still pins");
         assert!(!keep.contains("discarded.png"), "a discarded card must not pin its upload");
         assert!(!keep.contains("archived.png"), "an archived card must not pin its upload");
@@ -882,18 +1633,69 @@ mod tests {
     /// most cards unprotected while the cells above still passed.
     #[test]
     fn the_reference_is_found_in_every_form_a_card_carries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["at-form.png", "url-form.png", "md-form.png"] { aged_file(dir.path(), name, 0); }
         let conn = board(&[
             ("A", "make it automatic @/Users/ethan/.amux/uploads/at-form.png", 0),
             ("B", "screenshot: /api/uploads/url-form.png", 0),
             ("C", "![shot](/api/uploads/md-form.png) and text after", 0),
         ]);
-        let keep = card_referenced_uploads(&conn);
+        let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
         for want in ["at-form.png", "url-form.png", "md-form.png"] {
             assert!(keep.contains(want), "{want} not found in {keep:?}");
         }
         // Trailing punctuation must not become part of the filename, or the
         // keep-set silently misses and the file is reaped anyway.
         assert!(!keep.iter().any(|k| k.ends_with(')') || k.ends_with(',')));
+    }
+
+    #[test]
+    fn upload_retention_references_include_artifacts_saved_messages_and_pending_steering() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["artifact.png", "saved.png", "pending.png"] { aged_file(dir.path(), name, 0); }
+        let conn = board(&[]);
+        conn.execute_batch("INSERT INTO _amux_task_artifacts(id,task_id,kind,ref_value,created_at,updated_at) VALUES('a','t','file','/uploads/artifact.png',0,0);
+            INSERT INTO saved_messages(label,text,created) VALUES('saved','/uploads/saved.png',0);
+            INSERT INTO steering_queue(session,text,queued_at) VALUES('worker','/uploads/pending.png',0);").unwrap();
+        let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
+        for file in ["artifact.png", "saved.png", "pending.png"] { assert!(keep.contains(file), "{file}"); }
+        conn.execute_batch("DROP TABLE saved_messages").unwrap();
+        assert!(card_referenced_uploads(&conn, dir.path()).is_err(), "partial reference data is not a safe keep-set");
+    }
+
+    #[test]
+    fn upload_retention_protects_spaces_unicode_and_percent_encoded_file_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["naïve café.txt", "report final.pdf", "unused final.pdf"] { aged_file(dir.path(), name, 40 * 86_400); }
+        let conn = board(&[
+            ("A", "Review file:///tmp/uploads/na%C3%AFve%20caf%C3%A9.txt and then reply", 0),
+            ("B", "See /uploads/report final.pdf for evidence", 0),
+        ]);
+        let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
+        let (removed, _, kept) = prune_dir_by_age_keeping(dir.path(), 7 * 86_400, "TEST", &keep);
+        assert_eq!((removed, kept), (1, 2));
+        assert!(dir.path().join("naïve café.txt").exists());
+        assert!(dir.path().join("report final.pdf").exists());
+        assert!(!dir.path().join("unused final.pdf").exists());
+    }
+
+    #[tokio::test]
+    async fn upload_retention_defers_deletion_when_reference_probe_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&home.path().join("test.db")).unwrap());
+        store.write_async(|conn| {
+            conn.execute_batch("DROP TABLE saved_messages")?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        }).await.unwrap();
+        let state = AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let uploads = home.path().join("uploads");
+        std::fs::create_dir(&uploads).unwrap();
+        aged_file(&uploads, "saved.png", 40 * 86_400);
+        let report = storage_tick(&state, home.path()).await;
+        assert!(uploads.join("saved.png").exists(), "probe failure must never mean no references");
+        assert!(report.upload_refs_error.as_deref().unwrap().contains("saved_messages"));
+        assert_eq!(report.files_removed, 0);
     }
 
     #[test]
@@ -921,6 +1723,21 @@ mod tests {
     /// GUARD 1, in the direction that actually destroys data: a SECONDS table
     /// mis-declared as `Millis` builds a cutoff 1000x too large, so every row
     /// looks ancient and the sweep would empty the table.
+    #[test]
+    fn age_retention_keeps_pending_capture_but_prunes_completed_history() {
+        let dir=tempfile::tempdir().unwrap();
+        let store=crate::db::Store::open(&dir.path().join("retention.db")).unwrap();
+        store.write(|conn| {
+            let now=unix_now();
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,capture_pending) VALUES (1,'unfinished task','user','fixture',1,1),(2,'old completed','user','fixture',2,0),(3,'recent','user','fixture',?1,0)",[(now*1000.0) as i64])?;
+            let spec=SweepSpec {table:"cmd_history",ts_col:"ts",unit:TsUnit::Millis,env:"AMUX_TEST_CAPTURE_RETAIN_DAYS_UNUSED",default_days:90.0};
+            assert!(matches!(sweep_one(conn,&spec,now),SweepResult::Deleted {rows:1,kept:2}));
+            assert_eq!(conn.query_row("SELECT capture_pending FROM cmd_history WHERE id=1",[],|r| r.get::<_,i64>(0))?,1);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history WHERE id=2",[],|r| r.get::<_,i64>(0))?,0);
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+    }
+
     #[test]
     fn a_cutoff_that_would_empty_the_table_is_refused() {
         let c = mem();
@@ -1094,6 +1911,45 @@ mod tests {
     }
 
     #[test]
+    fn prune_rotated_logs_skips_fresh_and_server_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path();
+        // Fresh .log.1 should survive
+        std::fs::write(logs.join("session-a.log.1"), b"recent").unwrap();
+        // server-rs.log.1 should always survive (owned by rotate_server_log)
+        std::fs::write(logs.join("server-rs.log.1"), b"server").unwrap();
+        // Non-.log.1 files should survive
+        std::fs::write(logs.join("session-b.log"), b"active").unwrap();
+
+        std::env::set_var("AMUX_ROTATED_LOG_RETAIN_DAYS", "3");
+        let (n, _) = prune_rotated_logs(logs);
+        assert_eq!(n, 0, "nothing is old enough to prune");
+        assert!(logs.join("session-a.log.1").exists());
+        assert!(logs.join("server-rs.log.1").exists());
+        assert!(logs.join("session-b.log").exists());
+
+        // AGE EVERYTHING PAST THE CUTOFF. Without this the assertions above
+        // pass because nothing was eligible, so they prove the age check and
+        // say NOTHING about the server-log exclusion — the one rule this test
+        // is named for. Retain 0 disables the sweep entirely, so drive it with
+        // a real cutoff and backdated mtimes instead.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        for f in ["session-a.log.1", "server-rs.log.1", "session-b.log"] {
+            let h = std::fs::File::options().write(true).open(logs.join(f)).unwrap();
+            h.set_modified(old).unwrap();
+        }
+        let (n, _) = prune_rotated_logs(logs);
+        assert_eq!(n, 1, "only the aged session rotation is eligible");
+        assert!(!logs.join("session-a.log.1").exists(), "an aged rotation is pruned");
+        assert!(
+            logs.join("server-rs.log.1").exists(),
+            "server-rs.log.1 belongs to rotate_server_log and must survive at any age"
+        );
+        assert!(logs.join("session-b.log").exists(), "a live .log is never a rotation");
+        std::env::remove_var("AMUX_ROTATED_LOG_RETAIN_DAYS");
+    }
+
+    #[test]
     fn prune_removes_only_files_older_than_the_age() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("fresh.mp4"), b"12345").unwrap();
@@ -1102,5 +1958,93 @@ mod tests {
         let (n, _) = prune_dir_by_age(dir.path(), 0, "AMUX_TEST");
         assert_eq!(n, 0, "0 disables the sweep entirely rather than deleting everything");
         assert!(dir.path().join("fresh.mp4").exists());
+    }
+
+    /// The WAL only shrinks when the checkpoint runs OUTSIDE a transaction,
+    /// which is why `checkpoint_wal` and `maybe_vacuum` use `read_async` rather
+    /// than `write_async` (AMUX-4811).
+    ///
+    /// This is the shape that shipped broken for as long as the job existed:
+    /// `write_async` wraps every closure in an Immediate transaction
+    /// (db/mod.rs:612), SQLite refuses to checkpoint inside one, and the only
+    /// evidence was a WARN nobody had written yet. A 4.16 GB production
+    /// database was carrying a 143 MB WAL when this was found.
+    ///
+    /// Both arms are asserted on purpose. Without the in-transaction arm this
+    /// test would still pass if someone moved the pragma back under
+    /// `write_async`, because the out-of-transaction arm alone proves only that
+    /// SQLite can truncate, never that the caller lets it.
+    #[test]
+    fn a_wal_checkpoint_only_truncates_outside_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE t(v BLOB);").unwrap();
+        let blob = vec![b'x'; 8192];
+        for _ in 0..400 {
+            conn.execute("INSERT INTO t(v) VALUES (?1)", [&blob]).unwrap();
+        }
+        let wal = dir.path().join("t.db-wal");
+        let size = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        let grown = size();
+        assert!(grown > 0, "the fixture must actually produce a WAL to truncate");
+
+        // INSIDE a transaction: refused, exactly as the shipped bug was.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let refused = tx.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        assert!(
+            refused.is_err(),
+            "a checkpoint inside a transaction must fail; if SQLite ever allows it, the \
+             comments on checkpoint_wal and maybe_vacuum are wrong and should be corrected"
+        );
+        drop(tx);
+
+        // OUTSIDE one: it truncates.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        assert!(
+            size() < grown,
+            "checkpoint outside a transaction must shrink the WAL: {} -> {}",
+            grown,
+            size()
+        );
+    }
+
+    /// The test above proves SQLITE's rule. It does NOT prove this module obeys
+    /// it: both functions could be moved back under `write_async` and it would
+    /// still pass, because it never touches our call sites. That gap is the
+    /// whole defect (a checkpoint that silently never ran), so pin the callers
+    /// too.
+    ///
+    /// Comment lines are excluded deliberately: the fix's own comments say the
+    /// words "write_async" while explaining why not to use it, and a naive grep
+    /// would fail on the corrected code.
+    #[test]
+    fn the_maintenance_paths_call_read_async_not_write_async() {
+        let src = include_str!("storage.rs");
+        for func in ["async fn checkpoint_wal", "async fn maybe_vacuum"] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} not found"));
+            let body = &src[start..];
+            let end = body.find("\n}\n").map(|i| i + 2).unwrap_or(body.len());
+            let code: String = body[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains(".write_async("),
+                "{func} must not run its pragma through write_async: that wraps the closure in \
+                 an Immediate transaction (db/mod.rs) and SQLite refuses a checkpoint or a \
+                 VACUUM inside one. The failure is silent unless someone reads the WARN."
+            );
+            assert!(
+                code.contains(".read_async("),
+                "{func} should take a pooled, non-transactional connection via read_async"
+            );
+        }
     }
 }

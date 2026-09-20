@@ -45,6 +45,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -52,9 +53,99 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_history).post(append_history).delete(clear_history))
         .route("/import", axum::routing::post(import_history))
+        // AMUX-4664: ask a question of these messages. A literal POST, like
+        // `/import`, so the `/{id}` capture below does not take it.
+        .route("/ask", axum::routing::post(super::history_ask::ask))
         // Look up ONE message by its id. `/import` is a literal POST above, so
         // this GET capture never swallows it.
         .route("/{id}", get(get_history_item))
+        .route("/{id}/card", axum::routing::put(link_card))
+}
+
+/// Attach every non-deleted task in the message card's durable epic lineage.
+///
+/// `cmd_history.card_id` predates decomposition and can name only one task. A
+/// source prompt can later become an epic plus several child cards, though,
+/// and each child deliberately inherits that same source message. Returning
+/// only the old scalar made card -> message work while message -> card lost all
+/// but the original epic (TUBES-2474 / TUBES-2501). Keep the scalar for API
+/// compatibility and add the complete lineage as `linked_cards`.
+///
+/// This is one batched query for the whole history page, not one query per
+/// message. The CTE also resolves a scalar that already names a child back to
+/// its epic root, so both old and new writers produce the same answer.
+/// The lineage query for `n` message cards. One function so the handler and the
+/// query-plan test run the same SQL (AMUX-4590). Its `linked.epic = root` arm
+/// relies on idx_issues_epic (migration 0071); without that index SQLite scans
+/// every issue once per card, which cost 9.8 s on a 500-row page.
+fn linked_cards_sql(n: usize) -> String {
+    let placeholders = (0..n).map(|_| "(?)").collect::<Vec<_>>().join(",");
+    format!(
+        "WITH message_cards(card_id) AS (VALUES {placeholders}), \
+         roots(card_id, root_id) AS ( \
+           SELECT mc.card_id, COALESCE(NULLIF(source.epic,''), mc.card_id) \
+           FROM message_cards mc LEFT JOIN issues source ON source.id=mc.card_id \
+         ) \
+         SELECT roots.card_id, linked.id, linked.title, linked.status, \
+                COALESCE(linked.archived,0), linked.session, roots.root_id \
+         FROM roots JOIN issues linked \
+           ON linked.id=roots.root_id OR linked.epic=roots.root_id \
+         WHERE COALESCE(linked.deleted,0)=0 \
+         ORDER BY roots.card_id, CASE WHEN linked.id=roots.root_id THEN 0 ELSE 1 END, linked.id"
+    )
+}
+
+fn attach_linked_cards(
+    conn: &rusqlite::Connection,
+    rows: &mut [Value],
+) -> rusqlite::Result<()> {
+    let card_ids: BTreeSet<String> = rows
+        .iter()
+        .filter_map(|row| row.get("card_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .collect();
+    if card_ids.is_empty() {
+        for row in rows {
+            row["linked_cards"] = json!([]);
+        }
+        return Ok(());
+    }
+
+    let sql = linked_cards_sql(card_ids.len());
+    let values: Vec<rusqlite::types::Value> =
+        card_ids.iter().cloned().map(rusqlite::types::Value::Text).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> =
+        values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let mut linked_by_card: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut stmt = conn.prepare(&sql)?;
+    let linked = stmt.query_map(refs.as_slice(), |r| {
+        let message_card: String = r.get(0)?;
+        let card = json!({
+            "id": r.get::<_, String>(1)?,
+            "title": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            "status": r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "todo".into()),
+            "archived": r.get::<_, i64>(4)? != 0,
+            "session": r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            "lineage_root": r.get::<_, String>(6)?,
+        });
+        Ok((message_card, card))
+    })?;
+    for result in linked {
+        let (message_card, card) = result?;
+        linked_by_card.entry(message_card).or_default().push(card);
+    }
+    for row in rows {
+        let cards = row
+            .get("card_id")
+            .and_then(Value::as_str)
+            .and_then(|id| linked_by_card.get(id))
+            .cloned()
+            .unwrap_or_default();
+        row["linked_cards"] = Value::Array(cards);
+    }
+    Ok(())
 }
 
 /// GET /api/history/{id} — look up ONE message by its id, accepting either a
@@ -77,10 +168,10 @@ async fn get_history_item(
         );
     };
     let store = state.store.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = store.read()?;
         let sql = "SELECT id, text, type, session, ts, origin, card_id, \
-                   delivery, queued_at, delivered_at, submit_verdict, \
+                   delivery, queued_at, delivered_at, submit_verdict, capture_pending, \
                    (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
                    (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
                    (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -111,13 +202,20 @@ async fn get_history_item(
                 )
                 .ok()
             };
-            let (verdict, source) = delivery_truth(&delivery, steering);
+            let submit_verdict = d.get("submit_verdict").and_then(Value::as_str);
+            let (verdict, source) = delivery_truth(&delivery, submit_verdict, steering);
+            if delivery == "direct" && verdict != "delivered" {
+                tracing::warn!(message_id = nid, ?submit_verdict, delivered = verdict,
+                    measured = true, n_considered = 1,
+                    "history_delivery_not_confirmed: direct record does not prove submission");
+            }
             d["delivered"] = json!(verdict);
             d["delivered_source"] = json!(source);
             if let Some(Some(t)) = steering {
                 d["delivered_at_actual"] = json!((t * 1000.0) as i64);
             }
         }
+        attach_linked_cards(&conn, &mut rows)?;
         Ok(rows.into_iter().next())
     })
     .await;
@@ -150,12 +248,15 @@ async fn get_history_item(
 /// `steering` encodes THREE input states, because collapsing the last two is the
 /// whole defect: None = no matching row; Some(None) = row found, unstamped;
 /// Some(Some(t)) = row found, delivered at t.
-fn delivery_truth(cmd_delivery: &str, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
-    // A DIRECT send really was delivered when it was recorded — AMUX-3541 kept
-    // `now_ms` there for exactly that reason, so cmd_history is authoritative
-    // for this case and no join is needed.
+fn delivery_truth(cmd_delivery: &str, submit_verdict: Option<&str>, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
+    // Direct is a transport choice. The same durable record can say its
+    // submission stuck, was unverified, or has no outcome evidence at all.
     if cmd_delivery == "direct" {
-        return ("delivered", "cmd_history — a direct send is delivered when it is recorded");
+        return match submit_verdict {
+            Some("confirmed" | "retried") => ("delivered", "cmd_history.submit_verdict — submission confirmed"),
+            Some("stuck") => ("not delivered", "cmd_history.submit_verdict — submission remained stuck"),
+            _ => ("unknown", "cmd_history.submit_verdict — submission is not confirmed; direct alone is not evidence"),
+        };
     }
     match steering {
         Some(Some(_)) => ("delivered", "steering_history — stamped by the deliverer when it landed"),
@@ -376,6 +477,18 @@ pub struct ListParams {
     group: Option<String>,
     #[serde(default)]
     q: Option<String>,
+    /// Context filters (AMUX-4695), read out of `client_meta`.
+    ///
+    /// SERVER-SIDE, beside `kind`, for the reason AMUX-4666 already paid for: a
+    /// client-side filter runs over ONE PAGE and then reports "1 message" when
+    /// the real population is 207. Every predicate here lands in SQL before the
+    /// LIMIT, and the `x-amux-total` count is built from the SAME WHERE and the
+    /// SAME params, so the number beside the list is a count of the filtered
+    /// population rather than of the page.
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    place: Option<String>,
 }
 
 /// Python-truthy query flag: present with any non-empty value.
@@ -427,7 +540,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
              page with &offset= instead"
         );
     }
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<(Value, Option<i64>)> {
         let conn = store.read()?;
         let offset: i64 = p.offset.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
         let session = p.session.clone().unwrap_or_default();
@@ -442,7 +555,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             let rows = stmt.query_map([], |r| {
                 Ok(json!({ "session": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? }))
             })?;
-            return Ok(Value::Array(rows.flatten().collect()));
+            return Ok((Value::Array(rows.flatten().collect()), None));
         }
 
         // ?counts=1 — true totals per kind (respecting ?session=), ignoring
@@ -475,7 +588,45 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             }
             let all: i64 = MSG_KINDS.iter().map(|k| out[*k].as_i64().unwrap_or(0)).sum();
             out.insert("all".into(), json!(all));
-            return Ok(Value::Object(out));
+
+            // CONTEXT FACETS (AMUX-4695): which devices and places actually
+            // occur, with their counts, scoped by the same session filter.
+            //
+            // DERIVED FROM THE DATA, NEVER A FIXED LIST. The UI builds its
+            // filter options from this, so it can only ever offer a value that
+            // selects at least one message. A hardcoded menu would offer
+            // "Place" on a fleet where no message has ever carried one, which
+            // is a control that looks broken to whoever clicks it, and it would
+            // go stale the day a new device appears.
+            //
+            // The key is OMITTED when nothing has that field, rather than sent
+            // as an empty object, so the client's "is there anything to filter
+            // by" test is the presence of the key. Same rule as the row
+            // renderer: an absence is not a value.
+            for field in ["device", "place"] {
+                let mut sql = format!(
+                    "SELECT json_extract(client_meta,'$.{field}') v, COUNT(*) c FROM cmd_history \
+                     WHERE json_extract(client_meta,'$.{field}') IS NOT NULL"
+                );
+                if !session.is_empty() {
+                    sql.push_str(" AND session=?1");
+                }
+                sql.push_str(" GROUP BY v ORDER BY c DESC, v ASC");
+                let mut stmt = conn.prepare(&sql)?;
+                let map_row =
+                    |r: &rusqlite::Row| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
+                let rows: Vec<(String, i64)> = if session.is_empty() {
+                    stmt.query_map([], map_row)?.flatten().collect()
+                } else {
+                    stmt.query_map([&session], map_row)?.flatten().collect()
+                };
+                if !rows.is_empty() {
+                    let facet: Map<String, Value> =
+                        rows.into_iter().map(|(v, c)| (v, json!(c))).collect();
+                    out.insert(format!("{field}s"), Value::Object(facet));
+                }
+            }
+            return Ok((Value::Object(out), None));
         }
 
         // The list window. Every predicate lands in SQL, before the LIMIT.
@@ -510,6 +661,28 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
                 params.push(rusqlite::types::Value::Text(format!("%{escaped}%")));
             }
+        }
+        // CONTEXT FILTERS (AMUX-4695). `client_meta` is JSON text, so the
+        // predicate is a json_extract, which this database already relies on in
+        // 24 other places.
+        //
+        // AN EXACT MATCH, not a LIKE. "Mac" must not also select a device
+        // called "Mac mini", because the filter's whole job is to answer "which
+        // of these" and a substring match silently merges two answers into one.
+        //
+        // A filter for a value nothing has returns NOTHING, deliberately. No
+        // row currently carries `$.place` (measured: 0 of 11,591), so
+        // `?place=Office` is an empty list today rather than an error or a
+        // silent no-op. An empty list is the truthful answer to "messages sent
+        // from the office" when the place was never recorded; ignoring the
+        // parameter would answer a different question than the one asked.
+        for (field, raw) in [("device", p.device.as_deref()), ("place", p.place.as_deref())] {
+            let v = raw.unwrap_or("").trim();
+            if v.is_empty() {
+                continue;
+            }
+            where_cl.push(format!("json_extract(client_meta,'$.{field}')=?"));
+            params.push(rusqlite::types::Value::Text(v.to_string()));
         }
         let want: Vec<String> = p
             .kind
@@ -571,7 +744,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             // NULL — the UI distinguishes "not recorded" from "direct", and
             // coalescing here would assert a delivery path nobody observed.
             "SELECT id, text, type, session, ts, origin, card_id, \
-             delivery, queued_at, delivered_at, submit_verdict, \
+             delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, \
              (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
              (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
              (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -582,6 +755,21 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             sql.push_str(" WHERE ");
             sql.push_str(&where_cl.join(" AND "));
         }
+        // AMUX-4666: the size of the population this page came from, counted
+        // with the same WHERE and the same params the rows use. Counting with
+        // anything else is the trap this codebase already records: a number
+        // that measures the query rather than the thing.
+        let mut count_sql = String::from("SELECT COUNT(*) FROM cmd_history");
+        if !where_cl.is_empty() {
+            count_sql.push_str(" WHERE ");
+            count_sql.push_str(&where_cl.join(" AND "));
+        }
+        let total: i64 = {
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            conn.query_row(&count_sql, refs.as_slice(), |r| r.get(0))?
+        };
+
         sql.push_str(" ORDER BY ts DESC LIMIT ? OFFSET ?");
         params.push(rusqlite::types::Value::Integer(limit));
         params.push(rusqlite::types::Value::Integer(offset));
@@ -597,6 +785,29 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             // row classifiable, the recorded value is authoritative when
             // present, and the client prefers it. Where they disagree on a NEW
             // row that is a contradiction worth seeing, not one to smooth over.
+            // `client_meta` is stored as a JSON STRING. Hand the client a parsed
+            // object, and when there is nothing to hand over REMOVE THE KEY.
+            //
+            // Absence is not a value here (AMUX-4694). 11,526 of 11,591 rows
+            // predate the capture and every client that sends none will add
+            // more, so this is the common case, not the edge. A `null` would
+            // reach the renderer as a present-but-empty field and tempt a
+            // placeholder chip; a missing key cannot. `d.get("client_meta")` is
+            // then falsy in JS for exactly one reason.
+            let parsed = d
+                .get("client_meta")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(Value::is_object);
+            match parsed {
+                Some(obj) => d["client_meta"] = obj,
+                None => {
+                    if let Some(map) = d.as_object_mut() {
+                        map.remove("client_meta");
+                    }
+                }
+            }
             if let Some(q) = d.get("queued_at").and_then(Value::as_i64) {
                 if let Some(dl) = d.get("delivered_at").and_then(Value::as_i64) {
                     if dl > q {
@@ -605,12 +816,21 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 }
             }
         }
-        Ok(Value::Array(rows))
+        attach_linked_cards(&conn, &mut rows)?;
+        Ok((Value::Array(rows), Some(total)))
     })
     .await;
     match joined {
-        Ok(Ok(v)) => {
+        Ok(Ok((v, total))) => {
             let mut resp = Json(v).into_response();
+            // The body is a bare array, so the total rides beside it. A pager
+            // that guessed the count from a short page would show the wrong
+            // number of pages on every filter.
+            if let Some(total) = total {
+                if let Ok(hv) = HeaderValue::from_str(&total.to_string()) {
+                    resp.headers_mut().insert("x-amux-total", hv);
+                }
+            }
             if was_clamped {
                 if let Ok(hv) = HeaderValue::from_str(&limit.to_string()) {
                     resp.headers_mut().insert("x-amux-limit-clamped", hv);
@@ -620,6 +840,108 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
         }
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
+    }
+}
+
+/// Attribute one reviewed original message to an existing card without
+/// delivering a command or claiming historical work as newly active.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageCardLink {
+    session: String,
+    card_id: String,
+    reason: String,
+}
+
+async fn link_card(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<MessageCardLink>,
+) -> Response {
+    use crate::db::board_store as bs;
+    use rusqlite::OptionalExtension;
+    let raw = id
+        .trim()
+        .strip_prefix("MSG-")
+        .or_else(|| id.trim().strip_prefix("msg-"))
+        .unwrap_or(id.trim());
+    let Some(nid) = raw.parse::<i64>().ok().filter(|id| *id > 0) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"expected a positive message ID or MSG-<id>"}),
+        );
+    };
+    let session = body.session.trim().to_owned();
+    let card_id = body.card_id.trim().to_owned();
+    let reason = body.reason.trim().to_owned();
+    if session.is_empty()
+        || card_id.is_empty()
+        || reason.is_empty()
+        || reason.chars().count() > 2000
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"session, card_id and a nonempty reason (at most 2000 characters) are required"}),
+        );
+    }
+    let actor = super::request_log::caller_from_headers(&headers);
+    let (expected_session, target, why, who) = (
+        session.clone(),
+        card_id.clone(),
+        reason.clone(),
+        actor.clone(),
+    );
+    let reply = Arc::new(Mutex::new(None));
+    let reply_w = reply.clone();
+    let result=state.store.write_async(move |conn| {
+        let source=conn.query_row("SELECT session,card_id FROM cmd_history WHERE id=?1",[nid],
+            |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()?;
+        let mut events=vec![];
+        let (status,value)=match source {
+            None => (StatusCode::NOT_FOUND,json!({"error":"message not found","message_id":nid})),
+            Some((actual,_)) if actual!=expected_session =>
+                (StatusCode::CONFLICT,json!({"error":"message session does not match the reviewed request","message_id":nid})),
+            Some((_,Some(existing))) if existing!=target =>
+                (StatusCode::CONFLICT,json!({"error":"message already has a different card; reconcile that existing work first","message_id":nid,"card_id":existing})),
+            Some((_,Some(existing))) =>
+                (StatusCode::OK,json!({"message_id":nid,"card_id":existing,"changed":false,"applied":false,"command_resent":false})),
+            Some((_,None)) => match bs::get_issue(conn,&target)? {
+                None => (StatusCode::NOT_FOUND,json!({"error":"card not found","card_id":target})),
+                Some(card) if card.archived!=0 =>
+                    (StatusCode::CONFLICT,json!({"error":"card must be unarchived; reconcile archived work through the board first","card_id":target})),
+                Some(mut card) => {
+                    conn.execute("UPDATE cmd_history SET card_id=?1,capture_pending=0 WHERE id=?2 AND card_id IS NULL",rusqlite::params![target,nid])?;
+                    card.log=Some(bs::append_log(card.log.as_deref(),&chrono::Local::now().format("%H:%M").to_string(),
+                        &format!("Original MSG-{nid} linked by {}: {why}",if who.is_empty() {"api"} else {&who})));
+                    card.updated=chrono::Utc::now().timestamp(); card.rev+=1; card.version+=1;
+                    bs::save_patched(conn,&mut card)?;
+                    events.push(ev(&nid.to_string(),MutationKind::Updated));
+                    events.push(PendingEvent {entity_type:EntityType::Task,entity_id:card.id.clone(),mutation:MutationKind::Updated,payload:Some(card.snapshot())});
+                    (StatusCode::OK,json!({"message_id":nid,"card_id":card.id,"changed":true,"applied":true,"command_resent":false}))
+                }
+            }
+        };
+        *reply_w.lock().expect("message link reply")=Some((status,value));
+        Ok(WriteOutcome {applied:!events.is_empty(),events})
+    }).await;
+    match result {
+        Ok(_) => {
+            let (status, value) = reply
+                .lock()
+                .expect("message link reply")
+                .take()
+                .expect("message link result");
+            tracing::info!(message_id=nid, %session, %card_id, %actor, %reason, status=status.as_u16(),
+                measured=true, n_considered=1, verdict="explicit_message_card_link",
+                "reviewed original message attribution handled without delivery or task status change");
+            (status, Json(value)).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(message_id=nid, %card_id, %error, measured=false, n_considered=0,
+                verdict="message_card_link_failed", "original message attribution transaction failed");
+            internal(error)
+        }
     }
 }
 
@@ -763,6 +1085,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> (axum::Router, tempfile::TempDir) {
+        let (router, _, dir) = app_with_state();
+        (router, dir)
+    }
+
+    fn app_with_state() -> (axum::Router, AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("history-test.db")).unwrap();
         let state = AppState {
@@ -772,8 +1099,8 @@ mod tests {
             auth_token: None,
             reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
-        let router = Router::new().nest("/api/history", routes()).with_state(state);
-        (router, dir)
+        let router = Router::new().nest("/api/history", routes()).with_state(state.clone());
+        (router, state, dir)
     }
 
     async fn send(
@@ -796,6 +1123,306 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
+    }
+
+    fn capture_log() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        #[derive(Clone)]
+        struct LogBytes(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBytes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogBytes(bytes.clone());
+        // Avoid tracing-core's single-dispatch first-use cache across parallel tests.
+        let _registration_peer =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let scope = tracing::subscriber::set_default(subscriber);
+        (bytes, scope, _registration_peer)
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_preserves_history_and_does_not_claim_or_resend() {
+        let (app, state, _dir) = app_with_state();
+        state.store.write(|conn| {
+            super::super::session_verbs::ensure_fleet_tables(conn)?;
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,delivery,delivered_at,submit_verdict) VALUES (1,'Implement missing parser validation','user','old-capture',1000,'direct',1000,'confirmed')",[])?;
+            conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type) VALUES ('FIX-1','Parser validation','Reviewed original work','backlog','existing-owner','test',1,1,'agent','code')",[])?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let request = json!({"session":"old-capture","card_id":"FIX-1","reason":"Reviewed original unlinked assignment"});
+        let (status, body) = send(
+            &app,
+            "PUT",
+            "/api/history/MSG-1/card",
+            Some(request.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["command_resent"], false);
+        let (status, body) = send(&app, "PUT", "/api/history/1/card", Some(request)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], false);
+        let (_, message) = send(&app, "GET", "/api/history/MSG-1", None).await;
+        assert_eq!(message["card_id"], "FIX-1");
+        assert_eq!(message["text"], "Implement missing parser validation");
+        assert_eq!(message["ts"], 1000);
+        assert_eq!(message["capture_pending"], 0);
+        let conn = state.store.read().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM cmd_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let (status, desc, log): (String, String, String) = conn
+            .query_row(
+                "SELECT status,desc,log FROM issues WHERE id='FIX-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "backlog");
+        assert_eq!(conn.query_row("SELECT session FROM issues WHERE id='FIX-1'", [], |r| r.get::<_,String>(0)).unwrap(), "existing-owner", "linking source context must not reassign work");
+        assert_eq!(desc, "Reviewed original work");
+        assert_eq!(log.matches("Original MSG-1 linked").count(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE type='task.claimed'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_refuses_mistargeting_and_rolls_back_on_failure() {
+        let (app, state, _dir) = app_with_state();
+        let (bytes, _scope, _peer) = capture_log();
+        state.store.write(|conn| {
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts) VALUES (1,'original context','user','source-lane',1000)",[])?;
+            for (id,session,archived) in [("FIX-1","source-lane",0),("FIX-2","source-lane",0),("OLD-1","source-lane",1)] {
+                conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type,archived) VALUES (?1,'Reviewed work','Scope unchanged','todo',?2,'test',1,1,'agent','code',?3)",rusqlite::params![id,session,archived])?;
+            }
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        for (path, session, card, reason, status) in [
+            (
+                "/api/history/999/card",
+                "source-lane",
+                "FIX-1",
+                "reviewed",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/history/nope/card",
+                "source-lane",
+                "FIX-1",
+                "reviewed",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/history/1/card",
+                "wrong-lane",
+                "FIX-1",
+                "reviewed",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/api/history/1/card",
+                "source-lane",
+                "OLD-1",
+                "reviewed",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/api/history/1/card",
+                "source-lane",
+                "ABSENT-1",
+                "reviewed",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/history/1/card",
+                "source-lane",
+                "FIX-1",
+                "",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (got, body) = send(
+                &app,
+                "PUT",
+                path,
+                Some(json!({"session":session,"card_id":card,"reason":reason})),
+            )
+            .await;
+            assert_eq!(got, status, "{path} {card}: {body}");
+            assert_eq!(
+                state
+                    .store
+                    .read()
+                    .unwrap()
+                    .query_row("SELECT card_id FROM cmd_history WHERE id=1", [], |r| r
+                        .get::<_, Option<
+                        String,
+                    >>(
+                        0
+                    ))
+                    .unwrap(),
+                None
+            );
+        }
+        state.store.write(|conn| {
+            conn.execute_batch("CREATE TRIGGER refuse_link_audit BEFORE UPDATE ON issues BEGIN SELECT RAISE(ABORT,'fixture audit write unavailable'); END;")?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let request = json!({"session":"source-lane","card_id":"FIX-1","reason":"Review complete"});
+        let (status, body) = send(&app, "PUT", "/api/history/1/card", Some(request.clone())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let failure = log
+            .lines()
+            .find(|line| line.contains("message_card_link_failed"))
+            .expect("failed transaction must announce itself in amux logs");
+        assert!(
+            failure.contains("message_id=1")
+                && failure.contains("card_id=FIX-1")
+                && failure.contains("measured=false"),
+            "{failure}"
+        );
+        assert_eq!(
+            state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT card_id FROM cmd_history WHERE id=1", [], |r| r
+                    .get::<_, Option<
+                    String,
+                >>(
+                    0
+                ))
+                .unwrap(),
+            None,
+            "card link must roll back with its audit write"
+        );
+        state
+            .store
+            .write(|conn| {
+                conn.execute_batch("DROP TRIGGER refuse_link_audit")?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            send(&app, "PUT", "/api/history/1/card", Some(request))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status,body)=send(&app,"PUT","/api/history/1/card",Some(json!({"session":"source-lane","card_id":"FIX-2","reason":"Try overwriting original attribution"}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT card_id FROM cmd_history WHERE id=1", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "FIX-1"
+        );
+        let (_, row) = send(&app, "GET", "/api/history/1", None).await;
+        assert_eq!(row["card_id"], "FIX-1");
+    }
+
+    #[tokio::test]
+    async fn explicit_card_link_has_known_receipts_through_the_full_router() {
+        let (_, state, _dir) = app_with_state();
+        let (bytes, _scope, _peer) = capture_log();
+        state.store.write(|conn| {
+            conn.execute("INSERT INTO cmd_history(id,text,type,session,ts) VALUES (1,'reviewed original','user','source-lane',1000)", [])?;
+            conn.execute("INSERT INTO issues(id,title,desc,status,session,creator,created,updated,owner_type,type) VALUES ('LINK-1','Existing work','Scope unchanged','todo','existing-owner','test',1,1,'agent','code')", [])?;
+            Ok(WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let app = crate::api::router(state.clone());
+        for (id, target, expected_status, expected_phase) in [
+            ("link-first", "LINK-1", StatusCode::OK, "applied"),
+            ("link-repeat", "LINK-1", StatusCode::OK, "noop"),
+            ("link-refused", "OTHER-1", StatusCode::CONFLICT, "refused"),
+        ] {
+            let request = axum::http::Request::builder().method("PUT").uri("/api/history/MSG-1/card")
+                .header("content-type", "application/json").header("x-amux-interaction-id", id)
+                .body(Body::from(json!({"session":"source-lane","card_id":target,"reason":"Reviewed original request"}).to_string())).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()["x-amux-interaction-id"], id);
+            let (status, receipt) = send(&app, "GET", &format!("/api/interactions/{id}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            assert_eq!(receipt["phase"], expected_phase, "the full middleware must classify the actual endpoint response: {receipt}");
+            assert_eq!(receipt["measured"], true, "{receipt}");
+        }
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!log.lines().any(|line| line.contains("interaction_outcome") && (line.contains("link-first") || line.contains("link-repeat"))), "successful calls must not emit unknown-outcome warnings: {log}");
+        assert!(log.lines().any(|line| line.contains("interaction_outcome") && line.contains("link-refused") && line.contains("refused")), "positive control: the real refusal must reach the same collector: {log}");
+    }
+
+    /// Rows carrying `client_meta`, written through the store because
+    /// `POST /api/history` has no field for it: the capture path that sets it
+    /// is the session send, not the history append. Seeding through the real
+    /// column is the point, since the filter reads it with json_extract.
+    async fn seed_context(state: &AppState) {
+        for (text, session, ts, meta) in [
+            ("from the mac", "ctx", 6000i64,
+             r#"{"device":"Mac","platform":"MacIntel","app_ver":"0.9.971","tz":"America/New_York"}"#),
+            ("from the mac again", "ctx", 7000,
+             r#"{"device":"Mac","platform":"MacIntel","app_ver":"0.9.971","tz":"America/New_York"}"#),
+            ("from the phone", "other", 8000,
+             r#"{"device":"iPhone","platform":"iPhone","app_ver":"0.9.971","tz":"America/New_York"}"#),
+            ("from the mac mini", "other", 9000, r#"{"device":"Mac mini"}"#),
+        ] {
+            let (t, se, m) = (text.to_string(), session.to_string(), meta.to_string());
+            state
+                .store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "INSERT INTO cmd_history (text, type, session, ts, origin, client_meta) \
+                         VALUES (?1, 'direct', ?2, ?3, '', ?4)",
+                        rusqlite::params![t, se, ts, m],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await
+                .unwrap();
+        }
     }
 
     async fn seed(app: &axum::Router) {
@@ -957,6 +1584,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn direct_history_delivery_obeys_recorded_submission_verdict() {
+        let (app, state, _dir) = app_with_state();
+        state.store.write_async(|conn| {
+            for (id, verdict) in [(1, Some("confirmed")), (2, Some("stuck")),
+                (3, Some("retried")), (4, Some("unverified")), (5, None),
+                (6, Some("future-state"))] {
+                conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,delivery,submit_verdict) VALUES(?1,'fixture','user','direct-verdict-fixture',1000,'direct',?2)", rusqlite::params![id,verdict])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        for (id, expected) in [(1,"delivered"),(2,"not delivered"),(3,"delivered"),
+            (4,"unknown"),(5,"unknown"),(6,"unknown")] {
+            let (status, value) = send(&app,"GET",&format!("/api/history/{id}"),None).await;
+            assert_eq!(status,StatusCode::OK,"{value}");
+            assert_eq!(value["delivered"],expected,"actual history endpoint row {id}: {value}");
+        }
+    }
+
     /// The sweep instrument that misled in both directions must now be unable to.
     ///
     /// Both historical misreadings were of the SAME column and pointed opposite
@@ -968,17 +1614,17 @@ mod tests {
     fn an_unstamped_column_is_never_read_as_a_delivery_verdict() {
         // The case that nearly produced a false finding: queued, cmd_history
         // silent, and the deliverer's own table says it landed in 2 seconds.
-        let (v, src) = delivery_truth("queued", Some(Some(1_787_779_179.0)));
+        let (v, src) = delivery_truth("queued", None, Some(Some(1_787_779_179.0)));
         assert_eq!(v, "delivered");
         assert!(src.contains("steering_history"), "must name the instrument that answered: {src}");
 
         // A row the deliverer HOLDS and has not stamped is real evidence of
         // non-delivery, and must not be flattened into the unknown case.
-        assert_eq!(delivery_truth("queued", Some(None)).0, "not delivered");
+        assert_eq!(delivery_truth("queued", None, Some(None)).0, "not delivered");
 
         // NO ROW IS NOT A NEGATIVE. This is the assertion that stops the whole
         // class: absence of a lookup result is a fact about the lookup.
-        let (v3, src3) = delivery_truth("queued", None);
+        let (v3, src3) = delivery_truth("queued", None, None);
         assert_eq!(v3, "unknown", "no steering row means we cannot tell, not that it failed");
         assert_ne!(v3, "not delivered");
         assert!(
@@ -990,19 +1636,18 @@ mod tests {
         // The three inputs must not collapse into two outputs — if any pair
         // renders alike, the join has bought nothing over reading the column.
         let all = [
-            delivery_truth("queued", Some(Some(1.0))).0,
-            delivery_truth("queued", Some(None)).0,
-            delivery_truth("queued", None).0,
+            delivery_truth("queued", None, Some(Some(1.0))).0,
+            delivery_truth("queued", None, Some(None)).0,
+            delivery_truth("queued", None, None).0,
         ];
         let mut uniq = all.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), 3, "three input states must yield three verdicts: {all:?}");
 
-        // A direct send is honestly answerable from cmd_history alone (AMUX-3541
-        // kept `now_ms` there deliberately), so it must NOT be reported as
-        // unknown merely because no steering row was looked up.
-        let (v4, src4) = delivery_truth("direct", None);
+        // A confirmed direct submission is answerable from its durable verdict,
+        // without requiring an unrelated steering-history record.
+        let (v4, src4) = delivery_truth("direct", Some("confirmed"), None);
         assert_eq!(v4, "delivered");
         assert!(src4.contains("cmd_history"), "and it must say which instrument: {src4}");
     }
@@ -1038,15 +1683,32 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO issues (id, title, desc, status, created, updated, archived) \
-                 VALUES ('AMUX-9', 'Fix parser', '', 'done', 1, 1, 1)",
+                "INSERT INTO issues (id, title, desc, status, created, updated, archived, epic) \
+                 VALUES ('AMUX-9', 'Fix parser', '', 'done', 1, 1, 0, NULL)",
                 [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO issues
+                   (id,title,desc,status,created,updated,archived,epic,deleted)
+                 VALUES
+                   ('AMUX-10','Live child','', 'doing',1,1,0,'AMUX-9',0),
+                   ('AMUX-11','Deleted child','', 'todo',1,1,0,'AMUX-9',1),
+                   ('AMUX-12','Archived child','', 'verified',1,1,1,'AMUX-9',0),
+                   ('AMUX-20','Empty epic root','', 'backlog',1,1,0,'',0);
+                 INSERT INTO cmd_history (text,type,session,ts,origin,card_id)
+                 VALUES ('standalone source','direct','mg',1,'orch','AMUX-20');",
             )
             .unwrap();
         }
         let (st, list) = send(&app, "GET", "/api/history", None).await;
         assert_eq!(st, StatusCode::OK, "{list}");
-        let row = &list.as_array().unwrap()[0];
+        let row = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["card_id"] == json!("AMUX-9"))
+            .unwrap();
         assert_eq!(row["id"], json!(1));
         assert_eq!(row["text"], json!("fix the parser"));
         assert_eq!(row["type"], json!("steering"));
@@ -1056,16 +1718,156 @@ mod tests {
         assert_eq!(row["card_id"], json!("AMUX-9"));
         assert_eq!(row["card_title"], json!("Fix parser"));
         assert_eq!(row["card_status"], json!("done"));
-        assert_eq!(row["card_archived"], json!(1));
+        assert_eq!(row["card_archived"], json!(0));
         assert!(row["card_deleted"].is_null());
         assert_eq!(row["kind"], json!("human"), "steering displays as human");
         assert_eq!(row["queued"], json!(true), "steering is the queued delivery detail");
+        let linked = row["linked_cards"].as_array().unwrap();
+        assert_eq!(
+            linked.iter().map(|c| c["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["AMUX-9", "AMUX-10", "AMUX-12"],
+            "the root and both live children are returned; deleted=1 is excluded"
+        );
+        assert_eq!(linked[1]["archived"], json!(false), "deleted=0 is a live card");
+        assert_eq!(linked[2]["archived"], json!(true), "archived lineage stays navigable");
+        assert!(linked.iter().all(|c| c["id"] != json!("AMUX-11")));
+
+        let standalone = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["card_id"] == json!("AMUX-20"))
+            .unwrap();
+        assert_eq!(
+            standalone["linked_cards"],
+            json!([{
+                "id": "AMUX-20", "title": "Empty epic root", "status": "backlog",
+                "archived": false, "session": "", "lineage_root": "AMUX-20"
+            }]),
+            "both NULL and empty epic values resolve the source card as the lineage root"
+        );
 
         let (st, one) = send(&app, "GET", "/api/history/MSG-1", None).await;
         assert_eq!(st, StatusCode::OK, "{one}");
         assert_eq!(one["card_title"], json!("Fix parser"));
         assert_eq!(one["card_status"], json!("done"));
-        assert_eq!(one["card_archived"], json!(1));
+        assert_eq!(one["card_archived"], json!(0));
+        assert_eq!(one["linked_cards"], row["linked_cards"]);
+    }
+
+    /// AMUX-4695: filter the Messages list by the context a message was sent
+    /// from, SERVER-SIDE.
+    ///
+    /// The card names the reason: a client-side filter runs over one page and
+    /// then reports "1 message" when the population is 207. So the total is
+    /// asserted here beside the rows, because a correct list with a wrong count
+    /// is the exact failure AMUX-4666 already paid for once.
+    #[tokio::test]
+    async fn the_context_filter_selects_server_side_and_the_total_follows_it() {
+        let (app, state, _dir) = app_with_state();
+        seed(&app).await;
+        seed_context(&state).await;
+
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter()
+                .map(|r| r["text"].as_str().unwrap_or("").to_string()).collect()
+        };
+        let total_for = |app: axum::Router, uri: String| async move {
+            let req = axum::http::Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            res.headers().get("x-amux-total").and_then(|v| v.to_str().ok()).map(str::to_string)
+        };
+
+        let (_, mac) = send(&app, "GET", "/api/history?device=Mac", None).await;
+        assert_eq!(texts(&mac), vec!["from the mac again", "from the mac"]);
+        let (_, iph) = send(&app, "GET", "/api/history?device=iPhone", None).await;
+        assert_eq!(texts(&iph), vec!["from the phone"]);
+
+        // THE COUNT IS OF THE FILTERED POPULATION, not of the page. With
+        // limit=1 the page holds one row and the total must still say two.
+        assert_eq!(total_for(app.clone(), "/api/history?device=Mac&limit=1".into()).await, Some("2".into()));
+        let (_, one) = send(&app, "GET", "/api/history?device=Mac&limit=1", None).await;
+        assert_eq!(one.as_array().unwrap().len(), 1, "the page really is short");
+
+        // A message with NO metadata is under no device, which is the whole
+        // point: 11,526 of 11,591 real rows are in this state, so a filter that
+        // swept them into some default bucket would be wrong about almost
+        // everything.
+        for uri in ["/api/history?device=Mac", "/api/history?device=iPhone"] {
+            let (_, v) = send(&app, "GET", uri, None).await;
+            assert!(!texts(&v).iter().any(|t| t == "hello from me"),
+                "{uri} must not return a message that carries no metadata");
+        }
+
+        // A VALUE NOTHING HAS RETURNS NOTHING. No row carries `$.place`, so
+        // this is an empty list rather than an ignored parameter. Ignoring it
+        // would answer a different question than the one asked.
+        let (st, none) = send(&app, "GET", "/api/history?place=Office", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(none.as_array().unwrap().len(), 0);
+        assert_eq!(total_for(app.clone(), "/api/history?place=Office".into()).await, Some("0".into()));
+
+        // EXACT MATCH, not a prefix: "Mac" must not also select "Mac mini", or
+        // the filter silently merges two answers into one.
+        let (_, mini) = send(&app, "GET", "/api/history?device=Mac%20mini", None).await;
+        assert_eq!(texts(&mini), vec!["from the mac mini"]);
+    }
+
+    /// The filter's options come from the DATA, so the UI can only offer a
+    /// value that selects something.
+    #[tokio::test]
+    async fn context_facets_report_what_exists_and_omit_what_does_not() {
+        let (app, state, _dir) = app_with_state();
+        seed(&app).await;
+        seed_context(&state).await;
+
+        let (_, counts) = send(&app, "GET", "/api/history?counts=1", None).await;
+        assert_eq!(counts["devices"]["Mac"], json!(2));
+        assert_eq!(counts["devices"]["iPhone"], json!(1));
+        assert_eq!(counts["devices"]["Mac mini"], json!(1));
+
+        // THE KEY IS ABSENT, not an empty object. Nothing carries a place, and
+        // a `places: {}` would render as a filter control with no options.
+        assert!(counts.get("places").is_none(),
+            "a facet nothing has must be omitted, not sent empty: {counts}");
+
+        // Scoped by session, like the kind counts beside it.
+        let (_, scoped) = send(&app, "GET", "/api/history?counts=1&session=ctx", None).await;
+        assert_eq!(scoped["devices"]["Mac"], json!(2));
+        assert!(scoped["devices"].get("iPhone").is_none(),
+            "the iPhone row belongs to another session: {scoped}");
+    }
+
+    /// AMUX-4666: paging by PAGE NUMBER needs a page count, and a page count is
+    /// only right if it counts the population the page came from. A total that
+    /// ignored the active filter would show pages that do not exist, and the
+    /// last page would come back empty.
+    #[tokio::test]
+    async fn the_page_total_counts_the_same_population_the_page_came_from() {
+        let (app, _dir) = app();
+        seed(&app).await;
+
+        let total_for = |app: axum::Router, uri: &'static str| async move {
+            let req = axum::http::Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            res.headers().get("x-amux-total").and_then(|v| v.to_str().ok()).map(str::to_string)
+        };
+
+        // A short page still reports the whole population.
+        assert_eq!(total_for(app.clone(), "/api/history?limit=2").await, Some("5".into()));
+        // ...and every filter moves it, because it is the SAME predicate.
+        assert_eq!(total_for(app.clone(), "/api/history?kind=human&limit=1").await, Some("2".into()));
+        assert_eq!(total_for(app.clone(), "/api/history?session=alpha&limit=1").await, Some("3".into()));
+        assert_eq!(total_for(app.clone(), "/api/history?q=steer&limit=1").await, Some("1".into()));
+        // A page past the end is empty and still says how many exist, so a
+        // pager can send the reader back rather than showing a blank list.
+        let (_, past) = send(&app, "GET", "/api/history?limit=2&offset=99", None).await;
+        assert_eq!(past.as_array().unwrap().len(), 0);
+        assert_eq!(total_for(app.clone(), "/api/history?limit=2&offset=99").await, Some("5".into()));
+
+        // CONTROL: the answers that are not pages do not claim a page total.
+        assert_eq!(total_for(app.clone(), "/api/history?counts=1").await, None);
+        assert_eq!(total_for(app.clone(), "/api/history?sessions=1").await, None);
     }
 
     #[tokio::test]
@@ -1273,5 +2075,26 @@ mod tests {
         // ?session= wins over ?group= (Python: group applies only without session).
         let (_, beta) = send(&app, "GET", "/api/history?group=sales&session=beta", None).await;
         assert_eq!(beta.as_array().unwrap().len(), 2);
+    }
+
+    /// AMUX-4590. The linked-cards join must look children up through
+    /// idx_issues_epic. Without it the plan scans every issue once per message
+    /// card, which cost 9.8 s on a 500-row page and 30 to 99 s on Ethan's phone.
+    #[tokio::test]
+    async fn linked_cards_lineage_uses_the_epic_index_instead_of_scanning_issues() {
+        let (_app, state, _dir) = app_with_state();
+        let conn = state.store.read().unwrap();
+        let sql = linked_cards_sql(3);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(["A-1", "A-2", "A-3"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|d| d.contains("idx_issues_epic")), "the epic arm must use idx_issues_epic: {plan:#?}");
+        assert!(
+            !plan.iter().any(|d| d.trim_start().starts_with("SCAN linked")),
+            "no full scan of issues per message card: {plan:#?}"
+        );
     }
 }

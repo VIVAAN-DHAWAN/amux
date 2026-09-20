@@ -173,6 +173,23 @@ impl RunOutcome {
         matches!(self, RunOutcome::Delivered { .. } | RunOutcome::ShellOk { .. })
     }
 
+    /// The reason a run did not land, for surfacing beside `last_delivery` on
+    /// the SCHEDULE object itself (AF-648) — `None` for `Delivered`/`Queued`/
+    /// `ShellOk`, which have nothing to explain. Strips the `status()`-derived
+    /// prefix `note()` already adds ("refused: ", "delivery failed: ") since
+    /// the field name itself carries that context there.
+    pub fn refusal_reason(&self) -> Option<String> {
+        match self {
+            RunOutcome::Refused { reason } | RunOutcome::Failed { reason } => {
+                Some(reason.clone())
+            }
+            RunOutcome::ShellError { note } => Some(note.clone()),
+            RunOutcome::Delivered { .. } | RunOutcome::Queued { .. } | RunOutcome::ShellOk { .. } => {
+                None
+            }
+        }
+    }
+
     /// Is the command GONE — nothing arrived and nothing is pending?
     ///
     /// The inverse of `landed()` is not this. `!landed()` is true for `Queued`,
@@ -915,30 +932,65 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
 }
 
 /// INSERT with Python's exact column list (create parity).
+///
+/// A COLUMN THE CALLER DID NOT SET IS OMITTED, NOT WRITTEN AS NULL (AMUX-4769).
+/// This listed all 27 columns unconditionally and filled each with
+/// `to_sql(raw.get(col))`, which maps a missing key to SQL NULL — and a DEFAULT
+/// only applies to a column left OUT of the INSERT. So any `DurableSchedule`
+/// built without a key hit `NOT NULL constraint failed` on that column.
+///
+/// That went red on main when migration 0079 added `worktree INTEGER NOT NULL
+/// DEFAULT 0` and `fan_out` likewise: 17 of 34 scheduler tests failed, in
+/// isolation rather than under load, because the fixtures do not set the new
+/// keys. Production was unaffected only because the HTTP create path fills both
+/// in before calling here (api/schedules.rs, `body.worktree.unwrap_or(0)`).
+///
+/// FIXED AT THE SEAM RATHER THAN AT THE CALLERS, because this is a class and
+/// not two columns. `schedules` has TEN `NOT NULL DEFAULT` columns — sched_type,
+/// enabled, run_count, watch, watch_timeout, done_action, kind,
+/// trigger_cooldown, worktree, fan_out — and every one of them breaks exactly
+/// this way for a caller that omits it. Defaulting the two newest at each
+/// construction site would fix today's red and leave the next `ALTER TABLE ...
+/// NOT NULL DEFAULT` to do it again.
+///
+/// An explicit JSON `null` is treated as absent for the same reason: for a
+/// nullable column omitting it still stores NULL, and for a defaulted one the
+/// default is what "no value" means.
+///
+/// Parity is on the stored ROW, which is unchanged: every column the caller set
+/// is still written, and the only behavioural difference is that an unset
+/// defaulted column now gets its default instead of failing the insert.
 pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<()> {
-    const COLS: [&str; 24] = [
+    const COLS: [&str; 27] = [
         "id", "title", "session", "command", "kind", "sched_type", "recurrence", "run_at",
         "next_run", "last_run", "enabled", "run_count", "schedule_expr", "watch", "watch_timeout",
         "done_pattern", "done_action", "trigger_on", "trigger_cooldown", "trigger_sessions",
-        "exit_actions", "created", "updated", "deleted",
+        "exit_actions", "created", "updated", "deleted", "worktree", "fan_out", "fan_out_model",
     ];
-    let placeholders: Vec<String> = (1..=COLS.len()).map(|i| format!("?{i}")).collect();
+    let present: Vec<&str> = COLS
+        .iter()
+        .copied()
+        .filter(|c| !matches!(s.raw.get(*c), None | Some(Value::Null)))
+        .collect();
+    let placeholders: Vec<String> = (1..=present.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "INSERT INTO schedules ({}) VALUES ({})",
-        COLS.join(","),
+        present.join(","),
         placeholders.join(",")
     );
-    let vals: Vec<rusqlite::types::Value> = COLS.iter().map(|c| to_sql(s.raw.get(*c))).collect();
+    let vals: Vec<rusqlite::types::Value> =
+        present.iter().map(|c| to_sql(s.raw.get(*c))).collect();
     conn.execute(&sql, rusqlite::params_from_iter(vals))?;
     Ok(())
 }
 
 /// Full-row UPDATE with Python's PATCH column list.
 pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<usize> {
-    const COLS: [&str; 19] = [
+    const COLS: [&str; 22] = [
         "title", "session", "command", "kind", "sched_type", "recurrence", "run_at", "next_run",
         "enabled", "schedule_expr", "watch", "watch_timeout", "done_pattern", "done_action",
         "trigger_on", "trigger_cooldown", "trigger_sessions", "exit_actions", "updated",
+        "worktree", "fan_out", "fan_out_model",
     ];
     let sets: Vec<String> = COLS.iter().enumerate().map(|(i, c)| format!("{c}=?{}", i + 1)).collect();
     let sql = format!("UPDATE schedules SET {} WHERE id=?{}", sets.join(","), COLS.len() + 1);
@@ -980,6 +1032,13 @@ pub fn insert_audit(
     source: &str,
     by_who: &str,
 ) -> rusqlite::Result<()> {
+    // SEC-104: a schedule command that inlined a secret (e.g. CLERK_SECRET_KEY=sk_live_…)
+    // left the raw key in old_value/new_value here. cmd_history is redacted at ingestion
+    // but this audit table was NOT, so the value persisted in cleartext in a
+    // fleet-readable, B2-backed store. Run the same redaction over both values, at the
+    // one choke point every schedule_audit write passes through.
+    let (old_r, _) = crate::api::history::redact_secrets(old);
+    let (new_r, _) = crate::api::history::redact_secrets(new);
     conn.execute(
         "INSERT INTO schedule_audit (schedule_id, ts, field, old_value, new_value, source, by_who)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -987,8 +1046,8 @@ pub fn insert_audit(
             schedule_id,
             chrono::Utc::now().timestamp(),
             field,
-            old,
-            new,
+            old_r,
+            new_r,
             source,
             by_who
         ],
@@ -1044,6 +1103,10 @@ pub fn insert_run(
 /// scheduler last acted on this row", and leaving it stale after a refused fire
 /// would make a broken schedule look untouched. What the run DID is in the run
 /// row, which is where a reader who cares must look.
+///
+/// AF-648: `last_delivery`/`last_refusal_reason` are stamped alongside it so a
+/// reader of the SCHEDULE object (not the run row) can also see it — without
+/// changing when or whether `last_run`/`run_count` themselves advance.
 pub fn record_run(
     conn: &Connection,
     schedule_id: &str,
@@ -1053,9 +1116,10 @@ pub fn record_run(
     let now_ts = chrono::Utc::now().timestamp();
     insert_run(conn, schedule_id, now_ts, outcome, source, None)?;
     conn.execute(
-        "UPDATE schedules SET run_count = COALESCE(run_count,0) + 1, last_run=?1, updated=?1
-         WHERE id=?2",
-        rusqlite::params![now_ts, schedule_id],
+        "UPDATE schedules SET run_count = COALESCE(run_count,0) + 1, last_run=?1, updated=?1,
+         last_delivery=?2, last_refusal_reason=?3
+         WHERE id=?4",
+        rusqlite::params![now_ts, outcome.status(), outcome.refusal_reason(), schedule_id],
     )?;
     Ok(())
 }
@@ -1321,6 +1385,56 @@ pub fn finish_manual_shell_run(
     )
 }
 
+/// Replace a cron fire's provisional row with what delivery actually did (AF-515).
+///
+/// Guarded on `status='running'` so it cannot overwrite a row a reconciler has
+/// already failed, and cannot resurrect one another path finished. Returns the
+/// rows updated: 0 means the provisional row is gone and the caller must insert,
+/// rather than drop the outcome.
+pub fn finish_cron_run(
+    conn: &Connection,
+    run_id: i64,
+    outcome: &RunOutcome,
+    extra_note: Option<&str>,
+) -> rusqlite::Result<usize> {
+    let note: Option<String> = match (extra_note.filter(|s| !s.is_empty()), outcome.note()) {
+        (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, b) => b,
+    }
+    .map(|s| s.chars().take(500).collect());
+    conn.execute(
+        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4 \
+         WHERE id=?5 AND status='running'",
+        rusqlite::params![
+            outcome.status(),
+            note,
+            outcome.delivery(),
+            outcome.submission(),
+            run_id,
+        ],
+    )
+}
+
+/// A cron fire's provisional row cannot survive the process that was delivering
+/// it (AF-515). Reconcile on startup, so a restart mid-delivery leaves a row
+/// saying what is actually known — the fire happened, the outcome is not — and
+/// never a permanent `running`.
+///
+/// Distinguished from the shell reconciler by `delivery IS NULL`: a provisional
+/// cron row has no delivery verdict yet, a shell row is stamped `'shell'` at
+/// insert. Without that, one reconciler would claim the other's rows.
+pub fn fail_orphaned_cron_runs(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE schedule_runs \
+         SET status='error', \
+             note='server restarted before this fire recorded a delivery outcome', \
+             delivery='unknown', submission=NULL \
+         WHERE status='running' AND delivery IS NULL",
+        [],
+    )
+}
+
 /// A provisional manual shell row cannot survive the server process that owns
 /// its child. Reconcile those rows on scheduler startup so a restart never
 /// leaves a permanent yellow "running" dot.
@@ -1460,6 +1574,101 @@ impl LiveDeliverer {
         )
         .await;
     }
+
+    async fn deliver_fan_out(&self, sched: &DurableSchedule, command: &str) -> RunOutcome {
+        use crate::api::session_verbs::env_path;
+
+        let session = sched.str_field("session").to_string();
+        let model = {
+            let m = sched.str_field("fan_out_model");
+            if m.is_empty() { "haiku" } else { m }
+        };
+
+        let priorities: Vec<String> = command
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if priorities.is_empty() {
+            return RunOutcome::Refused {
+                reason: "fan-out schedule has no parseable priorities in command".into(),
+            };
+        }
+
+        let ep = env_path(&session);
+        if !ep.exists() {
+            return RunOutcome::Failed {
+                reason: format!("fan-out parent session {session} has no env file"),
+            };
+        }
+
+        let launch_body = serde_json::json!({
+            "title": sched.str_field("title"),
+            "priorities": priorities,
+            "parent_session": session,
+            "model": model,
+            "provider": "claude",
+        });
+
+        let port = crate::config::canonical_port();
+        let base = format!("https://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+        let r = client
+            .post(format!("{base}/api/board/launch"))
+            .header("Content-Type", "application/json")
+            .header("X-Amux-Session", format!("sched:{}", sched.id()))
+            .json(&launch_body)
+            .send()
+            .await;
+
+        match r {
+            Ok(resp) if resp.status().is_success() => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let started = body.get("workers_started").and_then(|v| v.as_u64()).unwrap_or(0);
+                let epic_id = body.get("epic").and_then(|v| v.as_str()).unwrap_or("?");
+                let detail = format!("fan-out: epic {epic_id}, {started} workers ({model})");
+                tracing::info!(
+                    target: "amux::scheduler",
+                    schedule = %sched.id(),
+                    epic = %epic_id,
+                    workers = started,
+                    model = %model,
+                    verdict = "fan_out_delivered",
+                    measured = true,
+                    "scheduler fan-out delivered"
+                );
+                let origin = schedule_message_origin(
+                    sched.str_field("title"),
+                    sched.id(),
+                    "cron-rs",
+                );
+                crate::api::session_verbs::cmd_hist_record_schedule(
+                    &self.state,
+                    &session,
+                    &format!("[fan-out] {detail}\n\n{command}"),
+                    &origin,
+                )
+                .await;
+                RunOutcome::Delivered {
+                    submission: "confirmed".into(),
+                    detail,
+                }
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                RunOutcome::Failed {
+                    reason: format!("fan-out launch returned {status}: {text}"),
+                }
+            }
+            Err(e) => RunOutcome::Failed {
+                reason: format!("fan-out launch request failed: {e}"),
+            },
+        }
+    }
 }
 
 /// The text a session actually receives.
@@ -1568,11 +1777,14 @@ impl Deliverer for LiveDeliverer {
         }
         let command = sched.str_field("command").trim().to_string();
         if command.is_empty() {
-            // Not an error and not a success: there is nothing to deliver, and
-            // a row claiming otherwise is the whole defect (rule 3 — the honest
-            // exit has to exist).
             return RunOutcome::Refused { reason: "schedule has no command to deliver".into() };
         }
+
+        // Fan-out path: treat the command as priorities and call the launch endpoint
+        if sched.i64_field("fan_out", 0) != 0 {
+            return self.deliver_fan_out(sched, &command).await;
+        }
+
         let session = sched.str_field("session").to_string();
         let text = delivered_text(&command, source);
         let d = crate::api::session_verbs::deliver_automated(
@@ -1747,6 +1959,10 @@ pub async fn scheduler_tick(
 struct Claim {
     sched: DurableSchedule,
     notes: Vec<Option<String>>,
+    /// AF-515: the `schedule_runs` row inserted for each occurrence INSIDE the
+    /// claim transaction, so the fire is on record before delivery is
+    /// attempted. RECORD updates these by id instead of inserting.
+    run_ids: Vec<i64>,
 }
 
 /// Fire one due schedule: CLAIM the occurrence, DELIVER outside the write
@@ -1888,7 +2104,43 @@ async fn fire_one(
                     payload: None,
                 });
             }
-            *slot_w.lock().expect("claim slot poisoned") = Some(Claim { sched, notes });
+            // AF-515: RECORD THE FIRE BEFORE ATTEMPTING DELIVERY.
+            //
+            // `last_run`/`next_run`/`run_count` are advanced above, in THIS
+            // transaction. The run row used to be inserted in a SECOND
+            // transaction after delivery, so anything between the two — a lost
+            // delivery, a panic, a restart — left the clock advanced and the
+            // ledger silent, and every readable surface then said the schedule
+            // ran. Measured on SCHED-321, 2026-09-05: last_run advanced to
+            // 10:26:23Z, zero run rows for that schedule that day, 192 rows for
+            // other schedules the same day. Nothing was lost; the row was never
+            // written.
+            //
+            // A schedule that never fires goes visibly stale. One that fires and
+            // drops its turn looked HEALTHIER than one that refused, which is
+            // why it took a human noticing a missing daily doc to catch it.
+            //
+            // Provisional first, updated in place after — the exact protocol
+            // `claim_manual_shell_run` / `finish_manual_shell_run` already use
+            // for shell runs, applied to the cron path that lacked it. Status
+            // `running` reuses the vocabulary the runs endpoint already renders
+            // distinctly from `delivered`, and `fail_orphaned_cron_runs` below
+            // reconciles rows whose process died mid-delivery.
+            let mut run_ids = Vec::with_capacity(notes.len());
+            for note in &notes {
+                conn.execute(
+                    "INSERT INTO schedule_runs \
+                         (schedule_id, ran_at, status, note, source, delivery, submission) \
+                     VALUES (?1, ?2, 'running', ?3, 'cron-rs', NULL, NULL)",
+                    rusqlite::params![
+                        sched.id(),
+                        now_ts,
+                        note.clone().unwrap_or_else(|| "fired; delivery pending".into()),
+                    ],
+                )?;
+                run_ids.push(conn.last_insert_rowid());
+            }
+            *slot_w.lock().expect("claim slot poisoned") = Some(Claim { sched, notes, run_ids });
             Ok(WriteOutcome { applied: true, events })
         })
         .await?;
@@ -1910,13 +2162,43 @@ async fn fire_one(
     // ---- RECORD what actually happened ----
     let sid = claim.sched.id().to_string();
     let notes = claim.notes;
+    let run_ids = claim.run_ids;
     let all_lost = should_warn_undelivered(&outcomes);
     let statuses: Vec<&'static str> = outcomes.iter().map(|o| o.status()).collect();
     store
         .write_async(move |conn| {
             let now_ts = chrono::Utc::now().timestamp();
-            for (outcome, note) in outcomes.iter().zip(notes.iter()) {
-                insert_run(conn, &sid, now_ts, outcome, "cron-rs", note.as_deref())?;
+            for (i, (outcome, note)) in outcomes.iter().zip(notes.iter()).enumerate() {
+                // UPDATE the provisional row this fire already wrote. Guarded on
+                // `status='running'` so a reconciler that already failed the row
+                // is not overwritten, and so this cannot resurrect a row some
+                // other path finished.
+                let updated = match run_ids.get(i) {
+                    Some(id) => finish_cron_run(conn, *id, outcome, note.as_deref())?,
+                    None => 0,
+                };
+                // Fall back to an INSERT only if the provisional row is gone —
+                // never silently drop the outcome. Without this a reconciled row
+                // would leave the real verdict unrecorded, which is the same
+                // silence one layer along.
+                if updated == 0 {
+                    insert_run(conn, &sid, now_ts, outcome, "cron-rs", note.as_deref())?;
+                }
+            }
+            // AF-648: last_run/run_count already advanced in the CLAIM phase
+            // above (deliberately, AF-515) and are NOT touched here. This
+            // stamps the MOST RECENT occurrence's outcome so a reader of the
+            // schedule object itself — not the run history — can see a
+            // refusal/failure without last_run masquerading as health.
+            if let Some(last_outcome) = outcomes.last() {
+                conn.execute(
+                    "UPDATE schedules SET last_delivery=?1, last_refusal_reason=?2 WHERE id=?3",
+                    rusqlite::params![
+                        last_outcome.status(),
+                        last_outcome.refusal_reason(),
+                        sid
+                    ],
+                )?;
             }
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
@@ -1947,14 +2229,40 @@ pub async fn run_scheduler(
     let reconciled = store
         .write_async(|conn| {
             let n = fail_orphaned_manual_shell_runs(conn)?;
-            Ok(WriteOutcome { applied: n > 0, events: vec![] })
+            // AF-515: cron fires now write a provisional row too, so a restart
+            // mid-delivery can orphan one of those as well. Counted separately
+            // because the two mean different things: a shell orphan lost a child
+            // process, a cron orphan lost a DELIVERY, and only the second says a
+            // lane may not have received its turn.
+            let c = fail_orphaned_cron_runs(conn)?;
+            if c > 0 {
+                tracing::warn!(
+                    orphaned_cron_runs = c,
+                    "scheduler startup: fires whose delivery outcome was never recorded — \
+                     each is a turn that may not have reached its lane (AF-515)"
+                );
+            }
+            // AF-678: unrelated to scheduling, but this is the one reliable
+            // "runs once at boot regardless of shadow/firing mode" moment
+            // this file already establishes for exactly this class of
+            // orphan (a manual shell run is a different subsystem too, and
+            // shares this same block).
+            let s = crate::api::session_verbs::reconcile_orphaned_steering_claims(conn)?;
+            if s > 0 {
+                tracing::warn!(
+                    orphaned_steering_claims = s,
+                    "startup: steering messages claimed but never finalized before a restart — \
+                     moved to steering_history as interrupted rather than retried (AF-678)"
+                );
+            }
+            Ok(WriteOutcome { applied: n > 0 || c > 0 || s > 0, events: vec![] })
         })
         .await;
     match reconciled {
         Ok(r) if r.applied => {
-            tracing::warn!("scheduler startup marked orphaned manual shell runs as failed")
+            tracing::warn!("scheduler startup marked orphaned provisional runs as failed")
         }
-        Err(e) => tracing::error!(error = %e, "scheduler could not reconcile manual shell runs"),
+        Err(e) => tracing::error!(error = %e, "scheduler could not reconcile orphaned runs"),
         _ => {}
     }
     let policy = missed_policy_from_env();
@@ -2123,6 +2431,32 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.outcome.clone()
         }
+    }
+
+    #[test]
+    fn refusal_reason_is_none_for_landed_or_pending_outcomes_only() {
+        assert_eq!(
+            RunOutcome::Refused { reason: "target archived".into() }.refusal_reason(),
+            Some("target archived".to_string())
+        );
+        assert_eq!(
+            RunOutcome::Failed { reason: "tmux send failed".into() }.refusal_reason(),
+            Some("tmux send failed".to_string())
+        );
+        assert_eq!(
+            RunOutcome::ShellError { note: "exit 1".into() }.refusal_reason(),
+            Some("exit 1".to_string())
+        );
+        assert_eq!(
+            RunOutcome::Delivered { submission: "confirmed".into(), detail: "sent".into() }
+                .refusal_reason(),
+            None
+        );
+        assert_eq!(
+            RunOutcome::Queued { queue_id: "q1".into(), detail: "queued".into() }.refusal_reason(),
+            None
+        );
+        assert_eq!(RunOutcome::ShellOk { note: None }.refusal_reason(), None);
     }
 
     fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
@@ -2326,6 +2660,63 @@ mod tests {
         DurableSchedule::from_map(m)
     }
 
+    /// AMUX-4769. A column the caller did not set gets its DB DEFAULT; a column
+    /// the caller DID set is stored as given.
+    ///
+    /// Both directions, because they fail in opposite ways and only one of them
+    /// is loud. Omitting a `NOT NULL DEFAULT` column used to abort the insert —
+    /// that is the 17 red tests this card was filed for, and any fixture here
+    /// would catch it. Dropping a column the caller SET would be silent: a
+    /// schedule created with `worktree: 1` would quietly store 0 and simply
+    /// never run in a worktree, with nothing to notice. Nothing tested that
+    /// direction before, and the fix moved exactly the code that decides it.
+    #[tokio::test]
+    async fn an_unset_column_takes_its_default_and_a_set_one_is_stored_as_given() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                // Built WITHOUT worktree/fan_out, like every fixture here and
+                // like any caller written before migration 0079.
+                let unset = make_row("SCHED-4769A", "amux", None, "2026-09-18T04:00");
+                assert!(unset.raw.get("worktree").is_none(), "fixture must not set it");
+                insert_schedule(conn, &unset)?;
+
+                // Set explicitly, like the HTTP create path.
+                let mut set = make_row("SCHED-4769B", "amux", None, "2026-09-18T04:00");
+                set.raw.insert("worktree".into(), Value::from(1));
+                set.raw.insert("fan_out".into(), Value::from(1));
+                insert_schedule(conn, &set)?;
+
+                // And explicitly null, which means "no value" and so the default.
+                let mut nulled = make_row("SCHED-4769C", "amux", None, "2026-09-18T04:00");
+                nulled.raw.insert("worktree".into(), Value::Null);
+                insert_schedule(conn, &nulled)?;
+
+                let read = |id: &str, col: &str| -> rusqlite::Result<i64> {
+                    conn.query_row(
+                        &format!("SELECT {col} FROM schedules WHERE id=?1"),
+                        [id],
+                        |r| r.get(0),
+                    )
+                };
+                assert_eq!(read("SCHED-4769A", "worktree")?, 0, "unset must take the default");
+                assert_eq!(read("SCHED-4769A", "fan_out")?, 0);
+                // THE SILENT DIRECTION: a value the caller set must survive.
+                assert_eq!(read("SCHED-4769B", "worktree")?, 1, "a set value was dropped");
+                assert_eq!(read("SCHED-4769B", "fan_out")?, 1, "a set value was dropped");
+                assert_eq!(read("SCHED-4769C", "worktree")?, 0, "explicit null means the default");
+
+                // The same rule covers every other NOT NULL DEFAULT column on
+                // this table, which is why the fix is at the seam: these were
+                // one `ALTER TABLE` away from the identical failure.
+                assert_eq!(read("SCHED-4769A", "watch_timeout")?, 120);
+                assert_eq!(read("SCHED-4769A", "trigger_cooldown")?, 120);
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn manual_shell_claim_is_visible_immediately_and_dedupes_overlap() {
         let (store, _dir) = store();
@@ -2492,6 +2883,219 @@ mod tests {
         assert_eq!(audit_n, 3); // created + enabled + deleted
     }
 
+    /// A deliverer that looks at `schedule_runs` FROM INSIDE `deliver()` — the
+    /// window between CLAIM and RECORD, which is the only place the claim-time
+    /// insert is observable and the exact window a lost delivery falls into.
+    struct ObservingDeliverer {
+        store: SharedStore,
+        seen: std::sync::Mutex<Vec<(i64, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Deliverer for ObservingDeliverer {
+        async fn deliver(&self, _sched: &DurableSchedule, _source: &str) -> RunOutcome {
+            let conn = self.store.read().unwrap();
+            let rows: Vec<(i64, String)> = conn
+                .prepare("SELECT id, status FROM schedule_runs WHERE schedule_id='SCHED-2'")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            *self.seen.lock().unwrap() = rows;
+            RunOutcome::Delivered { submission: "confirmed".into(), detail: "sent".into() }
+        }
+    }
+
+    /// THE WIRING, not the wording. Every other cell here passes with the
+    /// claim-time insert DELETED, because RECORD falls back to an insert and the
+    /// end state is identical — measured: removing the provisional insert left
+    /// 29/29 green. The whole change is about WHEN the row appears, so the only
+    /// cell that can prove it looks during delivery.
+    #[tokio::test]
+    async fn the_fire_is_on_record_before_delivery_is_attempted() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-2", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let obs = ObservingDeliverer { store: store.clone(), seen: std::sync::Mutex::new(vec![]) };
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &obs).await.unwrap();
+
+        let during = obs.seen.lock().unwrap().clone();
+        assert_eq!(
+            during.len(),
+            1,
+            "at delivery time the fire had {} row(s); a delivery lost here would leave \
+             last_run advanced and the ledger silent, which is AF-515 exactly",
+            during.len()
+        );
+        assert_eq!(during[0].1, "running", "the row must be provisional during delivery");
+
+        // And afterwards it is the SAME row, updated — not a second one.
+        let conn = store.read().unwrap();
+        let after: Vec<(i64, String)> = conn
+            .prepare("SELECT id, status FROM schedule_runs WHERE schedule_id='SCHED-2'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(after.len(), 1, "record inserted a second row instead of updating");
+        assert_eq!(after[0].0, during[0].0, "record wrote a DIFFERENT row than the claim");
+        assert_eq!(after[0].1, "delivered");
+    }
+
+    /// AF-515 — THE REGRESSION THIS CHANGE RISKS. The fire now writes a
+    /// provisional row at CLAIM and updates it at RECORD. If RECORD inserted
+    /// instead of updating, every fire would leave TWO rows and every count
+    /// built on this table would double. One fire, one row.
+    #[tokio::test]
+    async fn a_delivered_fire_leaves_exactly_one_row_not_two() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed())
+            .await
+            .unwrap();
+
+        let conn = store.read().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "the fire left {n} rows; claim-insert + record-insert double-writes");
+        let (status, delivery): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, delivery FROM schedule_runs WHERE schedule_id='SCHED-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "delivered", "the provisional row was never updated");
+        assert_eq!(delivery.as_deref(), Some("direct"));
+    }
+
+    /// THE CELL THIS CARD EXISTS FOR. A fire whose delivery outcome is never
+    /// recorded — the process dies between DELIVER and RECORD — must leave a row
+    /// saying so. Before this change `last_run` advanced and the ledger stayed
+    /// silent, so the schedule read as having run: measured on SCHED-321,
+    /// 2026-09-05, last_run at 10:26:23Z with zero rows for that schedule and
+    /// 192 rows for others the same day.
+    ///
+    /// The crash is simulated the only honest way available in-process: the
+    /// provisional row is what the claim leaves behind, and the startup
+    /// reconciler is what a restart runs.
+    #[tokio::test]
+    async fn a_fire_whose_delivery_is_never_recorded_is_visible_afterwards() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-9", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                // Exactly what the claim transaction writes, with RECORD never
+                // reached.
+                conn.execute(
+                    "INSERT INTO schedule_runs \
+                        (schedule_id, ran_at, status, note, source, delivery, submission) \
+                     VALUES ('SCHED-9', 1000, 'running', 'fired; delivery pending', \
+                             'cron-rs', NULL, NULL)",
+                    [],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        // BEFORE the reconciler: the fire is already on record, which is the
+        // whole point — it is no longer indistinguishable from "never fired".
+        {
+            let conn = store.read().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-9'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the fire left no trace at all — this is the bug");
+        }
+
+        let fixed = store
+            .write_async(|conn| {
+                let n = fail_orphaned_cron_runs(conn)?;
+                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+            })
+            .await
+            .unwrap();
+        assert!(fixed.applied, "the reconciler did not claim the orphaned cron row");
+
+        let conn = store.read().unwrap();
+        let (status, note, delivery): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT status, note, delivery FROM schedule_runs WHERE schedule_id='SCHED-9'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "error", "an unrecorded fire must not read as delivered");
+        assert_ne!(status, "running", "it must not sit provisional forever");
+        assert!(note.contains("restarted"), "the row does not say what happened: {note}");
+        assert_eq!(delivery.as_deref(), Some("unknown"), "delivery must not read as achieved");
+    }
+
+    /// The two reconcilers must not claim each other's rows. A shell run is
+    /// stamped `delivery='shell'` at insert and a provisional cron row has NULL,
+    /// which is the only thing separating them; without that predicate the cron
+    /// reconciler would rewrite live shell runs on every startup.
+    #[tokio::test]
+    async fn the_cron_reconciler_leaves_running_shell_rows_alone() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-5", "alpha", Some("every 10m"), "2020-01-01T00:00");
+                insert_schedule(conn, &row)?;
+                conn.execute(
+                    "INSERT INTO schedule_runs \
+                        (schedule_id, ran_at, status, note, source, delivery, submission) \
+                     VALUES ('SCHED-5', 1000, 'running', 'started on host', 'manual:x', \
+                             'shell', NULL)",
+                    [],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let n = store
+            .write_async(|conn| {
+                let n = fail_orphaned_cron_runs(conn)?;
+                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+            })
+            .await
+            .unwrap();
+        assert!(!n.applied, "the cron reconciler claimed a shell row");
+        let conn = store.read().unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM schedule_runs WHERE schedule_id='SCHED-5'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "running", "a live shell run was failed by the wrong reconciler");
+    }
+
     #[tokio::test]
     async fn run_now_records_manual_source() {
         let (store, _dir) = store();
@@ -2521,6 +3125,38 @@ mod tests {
             .query_row("SELECT run_count FROM schedules WHERE id='SCHED-77'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rc, 1);
+    }
+
+    #[tokio::test]
+    async fn run_now_stamps_last_delivery_and_reason_the_same_way_the_cron_path_does() {
+        // AF-648's second RECORD site: manual run-now goes through
+        // `record_run`, not `fire_one`. Both must agree on what the schedule
+        // object reports afterward.
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                let row = make_row("SCHED-78", "alpha", Some("every 1h"), "2026-08-10T09:00");
+                insert_schedule(conn, &row)?;
+                record_run(
+                    conn,
+                    "SCHED-78",
+                    &RunOutcome::Refused { reason: "target 'alpha' is archived".into() },
+                    "manual:tester",
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let conn = store.read().unwrap();
+        let (last_delivery, last_refusal_reason): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_delivery, last_refusal_reason FROM schedules WHERE id='SCHED-78'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_delivery.as_deref(), Some("refused"));
+        assert_eq!(last_refusal_reason.as_deref(), Some("target 'alpha' is archived"));
     }
 
     // ---- dual-scheduler: shadow mode fires NOTHING -----------------------
@@ -2794,6 +3430,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_delivery_stamps_last_delivery_and_reason_on_the_schedule() {
+        // AF-648 / ts-gke's SCHED-419 report: `last_run`/`run_count` advancing
+        // on a refusal is deliberate (AF-515, asserted above) and untouched
+        // here. What was missing is a way to read the refusal off the
+        // SCHEDULE object itself, without opening the run history.
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-419", "tubescience", Some("0 * * * *"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let stub = StubDeliverer::new(RunOutcome::Refused {
+            reason: "schedule PAUSED: the plan window is 99% used and 30% is reserved for the human (AMUX_BACKGROUND_RESERVE_PCT)".into(),
+        });
+        let mut seen = HashMap::new();
+        let before_count: i64 = store
+            .read()
+            .unwrap()
+            .query_row("SELECT run_count FROM schedules WHERE id='SCHED-419'", [], |r| r.get(0))
+            .unwrap();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+
+        let conn = store.read().unwrap();
+        let (last_run, run_count, last_delivery, last_refusal_reason): (
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT last_run, run_count, last_delivery, last_refusal_reason \
+                 FROM schedules WHERE id='SCHED-419'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        // The CLAIM-phase clock still advances exactly as before (AF-515) —
+        // this fix is additive, not a change to when last_run/run_count bump.
+        assert!(last_run.is_some(), "last_run must still advance on a refusal");
+        assert_eq!(run_count, before_count + 1, "run_count must still advance on a refusal");
+        // The new fields are what makes the refusal visible on the object.
+        assert_eq!(last_delivery.as_deref(), Some("refused"));
+        assert!(
+            last_refusal_reason.unwrap().contains("plan window is 99% used"),
+            "the schedule object must carry WHY, not just THAT"
+        );
+    }
+
+    #[tokio::test]
     async fn a_queued_delivery_records_the_queue_id_not_success() {
         let (store, _dir) = store();
         store
@@ -2870,6 +3557,34 @@ mod tests {
             .unwrap();
         assert_eq!(status, "delivered");
         assert_eq!(submission, "unverified", "a verdict of 'unverified' must survive to the row");
+    }
+
+    #[tokio::test]
+    async fn a_successful_fire_stamps_last_delivery_with_no_refusal_reason() {
+        // Control for a_refused_delivery_stamps_last_delivery_and_reason_on_the_schedule:
+        // a healthy fire must not leave a stale reason behind, and must read
+        // as delivered on the schedule object, not just in the run row.
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-9", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let stub = StubDeliverer::confirmed();
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        let conn = store.read().unwrap();
+        let (last_delivery, last_refusal_reason): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_delivery, last_refusal_reason FROM schedules WHERE id='SCHED-9'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_delivery.as_deref(), Some("delivered"));
+        assert_eq!(last_refusal_reason, None, "a landed delivery has nothing to explain");
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //  5  Offline scrollback-limit select          POST /api/prefs offline_cache_cap  TESTED
 //  6  Device name input                        localStorage amux_device_name TESTED (client-side by design)
 //  7  Subscription usage meter                 GET /api/usage                TESTED (ported in api/usage.rs)
-//  8  Auto-compact toggle                      POST /api/prefs auto_compact_enabled  TESTED
+//  8  Native context management explanation    provider-owned; no ineffective toggle
 //  9  Auto-resume-dialog toggle                POST /api/prefs auto_resume_summary   TESTED
 // 10  Auto-file-as-task toggle                 POST /api/prefs board_autotask        TESTED
 // 11  Alerts: push cb / SMS cb / phone         GET+PATCH /api/alert/config   FIXME — needs porting (py:65602)
@@ -57,6 +57,7 @@
 // - Toggle inputs (.theme-toggle input) are opacity:0/size:0 — the USER
 //   clicks the visible .theme-track sibling, so the tests do too.
 import { test, expect } from './fixtures';
+import { E2E_ANTHROPIC_KEY } from './test-env';
 import type { Page, APIRequestContext } from '@playwright/test';
 
 // Deterministic theme baseline: initTheme falls back to prefers-color-scheme
@@ -64,15 +65,8 @@ import type { Page, APIRequestContext } from '@playwright/test';
 // the theme test asserts the product's default aesthetic instead of branching.
 test.use({ colorScheme: 'dark' });
 
-// ---- desktop scope ----------------------------------------------------------
-// No control in the panel is mobile-specific; the mobile project re-running
-// identical pref writes would only race the desktop worker.
-test.beforeEach(async ({}, testInfo) => {
-  test.skip(
-    testInfo.project.name === 'mobile',
-    'settings panel controls are desktop-scoped (no mobile-specific control)',
-  );
-});
+// Each project owns a separate server/home, so settings writes are isolated.
+// Exercise the same visible controls at phone widths as well as desktop.
 
 // ---- helpers (settle/token idioms shared with golden.spec.ts) ---------------
 
@@ -166,9 +160,8 @@ function waitForPrefWrite(page: Page, key: string) {
 // ============================================================================
 
 const AUTOMATION_TOGGLES = [
-  // All three default ON; the flow is: uncheck → wire 200 → pref '0' →
+  // Both default ON; the flow is: uncheck → wire 200 → pref '0' →
   // reload survives → re-check (restore) → pref '1'.
-  { name: 'auto_compact', input: '#auto-compact-checkbox', key: 'auto_compact_enabled' },
   { name: 'auto_resume_dialog', input: '#auto-resume-checkbox', key: 'auto_resume_summary' },
   { name: 'autotask', input: '#autotask-checkbox', key: 'board_autotask' },
 ] as const;
@@ -314,11 +307,22 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   const sel = page.locator('#settings-default-model');
   await expect(sel).toHaveValue('sonnet'); // fallback default
 
+  // 322f76c8 turned this control from a <select> into an <input list=...> plus a
+  // <datalist>, so a newer exact model ID can be typed rather than only chosen —
+  // and `selectOption` only works on a <select>. The product change is right; this
+  // test was left behind and reddened main's e2e for six hours (AF-564).
+  //
+  // fill() ALONE IS NOT ENOUGH, and this is measured rather than read: against a
+  // real <input list> with an onchange handler, fill() dispatched `change` ZERO
+  // times and fill()+blur() dispatched it once. The handler here is
+  // onchange="saveDefaultModel(this.value)", so blur is the action that triggers
+  // the PATCH and must be the one inside Promise.all.
+  await sel.fill('haiku');
   const [res] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().includes('/api/settings/default-model') && r.request().method() === 'PATCH',
     ),
-    sel.selectOption('haiku'),
+    sel.blur(),
   ]);
   expect(res.status()).toBe(200);
   expect(await res.json()).toMatchObject({ ok: true, model: 'haiku' });
@@ -332,7 +336,7 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   await settle(page);
   const get2 = await request.get('/api/settings/default-model', { headers: authHeaders(token) });
   expect((await get2.json()).model).toBe('haiku');
-  // …but the select repopulates from window._AMUX_DEFAULT_MODEL, which
+  // …but the input repopulates from window._AMUX_DEFAULT_MODEL, which
   // static_files.rs currently injects as the hardcoded literal "sonnet"
   // (inject_bootstrap, jstr("sonnet")) instead of reading defaults.env the way
   // the Python server does. Recorded as an annotation, not an assertion, so
@@ -342,18 +346,20 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   testInfo.annotations.push({
     type: shown === 'haiku' ? 'note' : 'bootstrap-gap',
     description:
-      `after reload the API serves model=haiku but the select shows "${shown}" — ` +
+      `after reload the API serves model=haiku but the input shows "${shown}" — ` +
       'window._AMUX_DEFAULT_MODEL is hardcoded to "sonnet" in ' +
       'crates/amux-server/src/api/static_files.rs inject_bootstrap (Python injects the real default)',
   });
 
   // Restore through the UI. (Writes an explicit --model sonnet, observably
   // identical to the original fallback.)
+  const restore = page.locator('#settings-default-model');
+  await restore.fill('sonnet');
   const [res2] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().includes('/api/settings/default-model') && r.request().method() === 'PATCH',
     ),
-    page.locator('#settings-default-model').selectOption('sonnet'),
+    restore.blur(),
   ]);
   expect(res2.status()).toBe(200);
   const get3 = await request.get('/api/settings/default-model', { headers: authHeaders(token) });
@@ -412,16 +418,17 @@ test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
 
   // Restore: the UI has no "clear key" affordance (saveApiKey returns early on
   // empty input), so restoration goes through the same endpoint the Save
-  // button uses. An empty file value falls back to process env → the exact
-  // pre-test masked reading.
+  // button uses. An empty persisted value SHADOWS the process prerequisite;
+  // restore that known non-secret value explicitly so later specs retain the
+  // same configured-install state this test received.
   testInfo.annotations.push({
     type: 'restore-via-api',
     description:
-      'UI cannot clear a saved key (empty input is a no-op in saveApiKey); restored via PATCH /api/settings/env {"ANTHROPIC_API_KEY": ""}',
+      'UI cannot clear a saved key (empty input is a no-op in saveApiKey); restored the isolated harness baseline via PATCH /api/settings/env',
   });
   const restore = await request.patch('/api/settings/env', {
     headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: '' },
+    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
   });
   expect(restore.status()).toBe(200);
   const after = (await (
@@ -479,14 +486,23 @@ test('settings_api_key_survives_slow_env_refresh', async ({ page, request }) => 
   ]);
   expect(res.status()).toBe(200);
 
-  // Restore (same route as the sibling test; empty value falls back to
-  // process env).
+  // Restore the exact shared harness baseline. A present-but-empty value in
+  // server.env deliberately means CLEARED and shadows the process env; writing
+  // '' here used to remove the prerequisite for every later spec in this
+  // project's shared server. On a loaded CI runner settings finished before
+  // the terminal files, so one cleanup turned into 22 unrelated pointer-event
+  // timeouts behind the no-key banner. Keep the postcondition explicit so a
+  // future cleanup cannot silently poison the rest of the project again.
   await page.unroute('**/api/settings/env');
   const restore = await request.patch('/api/settings/env', {
     headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: '' },
+    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
   });
   expect(restore.status()).toBe(200);
+  const restored = (await (
+    await request.get('/api/settings/env', { headers: authHeaders(token) })
+  ).json()) as Record<string, string>;
+  expect(restored.ANTHROPIC_API_KEY).toMatch(/cret$/);
 });
 
 test('settings_commit_guard', async ({ page, request }) => {
@@ -763,14 +779,11 @@ test('settings_cloud_only_sections_stay_hidden', async ({ page }, testInfo) => {
 // Promoted from a fixme on 2026-08-09: /api/usage is ported (api/usage.rs) and
 // the probe below fired exactly as designed.
 //
-// This test is deliberately HOST-CONDITIONAL, and that is not a weakness. The
-// meter's content depends on a real macOS keychain credential and a live call
-// to api.anthropic.com, so asserting "bars are rendered" unconditionally would
-// be a check that fails on CI for a reason that has nothing to do with the
-// code. Instead it asserts the UI AGREES WITH THE WIRE — whichever branch the
-// host is in — and, on the degraded branch, that the reason is one of the
-// DISCRIMINATED causes rather than the old catch-all sentence that collapsed
-// no-token / expired / rate-limited into one useless string.
+// Provider probes are deliberately host-conditional: CI may have none of the
+// three subscription credentials. The invariant is wider than any one host:
+// every shipped provider has a compact row, and every number/reset the
+// API measured is reachable by expanding that row. Degradation belongs to one
+// provider and must never hide the others.
 test('settings_usage_meter', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);
@@ -783,6 +796,20 @@ test('settings_usage_meter', async ({ page, request }) => {
   // ask for is a reading you cannot trust (the meter is cached by design).
   expect(typeof wire.cache_age_s, 'usage response must state its own age').toBe('number');
   expect(typeof wire.cache_ttl_s).toBe('number');
+  expect(Array.isArray(wire.providers), 'usage response must enumerate providers').toBe(true);
+  expect(wire.provider_count).toBe(wire.providers.length);
+  // EXACT, not a subset, on purpose: a provider appearing or disappearing from
+  // the meter is a thing to notice, not to tolerate. The cost is that shipping
+  // one makes this cell red, which is how it got here — dd13d663 added the Muse
+  // Code provider (and its own spec) without this list, and settings_usage_meter
+  // failed on all three browser projects for it (AMUX-4865).
+  //
+  // So if you are here because you shipped a provider: add it, that is the
+  // intended maintenance. The comment above says "all shipped providers have a
+  // compact row", and this list is what makes that claim checkable.
+  expect(wire.providers.map((provider: any) => provider.id).sort()).toEqual([
+    'claude', 'codex', 'gemini', 'muse', 'ollama',
+  ]);
 
   await openSettings(page);
   const body = page.locator('#settings-usage-body');
@@ -795,42 +822,44 @@ test('settings_usage_meter', async ({ page, request }) => {
   // parse-failure message: that is what an unported endpoint produced.
   expect(text, 'the SPA could not parse /api/usage').not.toMatch(/Could not load usage/i);
 
-  if (wire.available) {
-    const limits = (wire.limits || []).filter((l: any) => typeof l.percent === 'number');
-    expect(limits.length, 'available:true with no numeric limits is a shape regression').toBeGreaterThan(0);
-    // One rendered row per limit, each with a bar and a "% left" readout.
-    await expect(body.locator('> div')).toHaveCount(limits.length);
-    expect(await body.locator('div[style*="width:"]').count()).toBeGreaterThanOrEqual(limits.length);
-    expect(text).toMatch(/%\s*left/);
-    expect(text).not.toMatch(/unavailable on this host/i);
-    // Per-model rows are why the endpoint passes Anthropic's body through
-    // instead of normalizing it: scope.model.display_name has no
-    // representation in a normalized usage window.
-    for (const l of limits) {
-      const model = l.scope?.model?.display_name;
-      if (model) expect(text).toContain(model);
+  await expect(body.locator('.usage-provider')).toHaveCount(wire.providers.length);
+  // Four summary lines fit without opening any detail; at most the provider
+  // with the least remaining quota opens automatically.
+  expect(await body.locator('.usage-provider[open]').count()).toBeLessThanOrEqual(1);
+
+  for (const provider of wire.providers) {
+    const row = body.locator(`.usage-provider[data-provider="${provider.id}"]`);
+    await expect(row, `missing ${provider.id} summary`).toHaveCount(1);
+    const summary = row.locator('summary');
+    await expect(summary).toContainText(provider.label);
+    if (!provider.available) await expect(summary).toContainText(provider.retry_at || ['rate_limited','probe_failed'].includes(provider.cause) ? 'Checking…' : provider.cause === 'account_quota_not_reported' ? 'Not reported' : 'Connect account');
+    if (provider.metered === false) await expect(summary).toContainText('Unlimited');
+
+    if (!(await row.evaluate((element) => element.hasAttribute('open')))) await summary.click();
+    if (!provider.available) {
+      expect(provider.cause, `${provider.id} degradation must name its cause`).toBeTruthy();
+      await expect(row).toContainText(provider.retry_at || ['rate_limited','probe_failed'].includes(provider.cause) ? 'Waiting for the provider’s usage report.' : String(provider.reason));
+      continue;
     }
-  } else {
-    // Honest degradation — but it must say WHICH failure, with a stable
-    // machine tag beside the sentence.
-    expect(wire.cause, 'a degraded usage response must name its cause').toBeTruthy();
-    expect(
-      ['no_token', 'expired_token', 'token_rejected', 'rate_limited', 'probe_failed', 'unexpected_shape'],
-      `unknown degraded cause "${wire.cause}"`,
-    ).toContain(wire.cause);
-    expect(
-      wire.reason,
-      'the collapsed catch-all reason is the defect this endpoint was fixed for',
-    ).not.toMatch(/no token, expired token, or probe failed/i);
-    // The reason reaches the user, not just the wire.
-    expect(text).toContain(String(wire.reason));
-    // Nothing invented on a degraded path.
-    expect(wire.limits, 'degraded responses must not carry limits').toBeUndefined();
+    const windows = (provider.windows || []).filter((window: any) =>
+      typeof window.remaining_percent === 'number');
+    await expect(row.locator('[data-usage-window]')).toHaveCount(windows.length);
+    for (const window of windows) {
+      await expect(row).toContainText(window.label);
+    }
+    if (windows.length) {
+      await expect(row).toContainText(/%\s*left/);
+      if (windows.some((window: any) => window.resets_at)) {
+        // Relative duration plus a local wall clock: "in 1d 6h · Sun, Sep 7,
+        // 10:00 PM". Either half alone is the coarse UI being replaced.
+        await expect(row).toContainText(/Resets (?:in \d+[dhms](?: \d+[hms])? ·|due now ·) /);
+      }
+    }
   }
 
   // No credential material may ever reach the client on any branch.
   const wireText = JSON.stringify(wire);
-  expect(wireText).not.toMatch(/sk-ant|Bearer /);
+  expect(wireText).not.toMatch(/sk-ant|Bearer |accountId/);
 });
 
 // UN-FIXME'd 2026-08-11 (AMUX-2621). Both fixmes asserted these endpoints were
@@ -907,12 +936,20 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   await openSettings(page);
   await expect(page.locator('#settings-org-name')).toHaveValue('E2E Workspace');
 
-  // "+ Invite" creates a real invite and shows the shareable link modal.
+  // "+ Invite" binds email and access scope before it creates the real link.
+  await page.locator('#settings-team-section button', { hasText: '+ Invite' }).click();
+  const emailPrompt = page.locator('#team-invite-email');
+  await expect(emailPrompt).toBeVisible();
+  await emailPrompt.fill('invitee@example.com');
+  await expect(page.locator('#invite-team-id')).toBeVisible();
+  await expect(page.locator('#invite-team-id')).toHaveValue('team_global');
+  const teams = await (await request.get('/api/org/teams', { headers: authHeaders(token) })).json();
+  expect(teams.some((team: any) => team.id === 'team_global')).toBe(true);
   const [invRes] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().endsWith('/api/org/invites') && r.request().method() === 'POST',
     ),
-    page.locator('#settings-team-section button', { hasText: '+ Invite' }).click(),
+    page.locator('#team-scope-submit').click(),
   ]);
   expect(invRes.status()).toBe(201); // create_invite answers 201 CREATED
   const linkInput = page.locator('#invite-link-input');
@@ -921,9 +958,7 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   expect(inviteUrl).toContain('/invite/');
   // Scope Done to the invite modal — the (hidden) filters modal also carries a
   // "Done" button, and an unscoped role query trips strict mode on it.
-  await linkInput
-    .locator('xpath=ancestor::div[contains(@style,"fixed")]//button[normalize-space()="Done"]')
-    .click();
+  await page.locator('#invite-done-button').click();
   await expect(linkInput).not.toBeAttached();
 
   // The invite is real server-side.
@@ -988,17 +1023,11 @@ test('settings_about_branding_editor', async ({ page, request }) => {
   await res.json();
 });
 
-test('settings_notes_folder_row', async ({}, testInfo) => {
-  testInfo.annotations.push({
-    type: 'not-relevant',
-    description:
-      'control: "Notes folder" row (#settings-notes-dir) — pure display div with NO populating code ' +
-      'in the extracted client (grep app.js: nothing writes it) and no notes-dir endpoint in the Rust ' +
-      'OR Python server (amux-server.py only carries the same dead markup at :32957). Vestigial UI ' +
-      'from the removed notes-sync feature → NOT RELEVANT ANYMORE; candidate for deletion from ' +
-      'index.html rather than porting.',
-  });
-  test.fixme(true, 'Notes folder row is dead UI in both servers (not relevant anymore — remove, do not port)');
+test('settings_notes_folder_row', async ({ page }) => {
+  await settle(page);
+  await openSettings(page);
+  await expect(page.locator('#settings-notes-section')).toHaveCount(0);
+  await expect(page.getByText('Notes sync (read + write) with this folder', { exact: false })).toHaveCount(0);
 });
 
 // ============================================================================

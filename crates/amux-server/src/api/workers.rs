@@ -13,6 +13,7 @@
 //! SSE/delta-sync consumers see it (Invariant 35).
 
 use super::aliases::{alias_fields, FieldStyle};
+use super::health::{Admission, AdmissionOverride};
 use super::AppState;
 use crate::db::queries::{self, SessionRow, WorkerRow};
 use crate::db::{PendingEvent, WriteOutcome};
@@ -22,13 +23,14 @@ use amux_core::revision::{EntityType, MutationKind};
 use amux_core::search::PagedResponse;
 use amux_core::session::{backend_ref, BackendId, ExitReason};
 use amux_core::worker::{
-    apply_config, ConfigChangeResult, Worker, WorkerCapabilities, WorkerConfig, WorkerState,
+    apply_config, ConfigChangeResult, Worker, WorkerCapabilities, WorkerConfig, WorkerLifecycle,
+    WorkerState,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -73,6 +75,8 @@ pub fn routes() -> Router<AppState> {
         // `steer` are deliberately absent: the classification calls them
         // load-bearing (D1's exit condition and turn-boundary delivery), and
         // they need their store-managed semantics decided rather than extracted.
+        .route("/{id}/pause", post(pause_worker))
+        .route("/{id}/resume", post(resume_worker))
         .route("/{id}/wake", post(wake_worker))
         .route("/{id}/reset", post(reset_worker))
         .route("/{id}/clear", post(clear_worker))
@@ -131,6 +135,48 @@ pub async fn ollama_models() -> impl IntoResponse {
     use crate::provider::ProviderAdapter;
     let models = OllamaAdapter::default().models().await;
     Json(json!({ "models": models }))
+}
+
+/// `GET /api/models` — the typed, provider-aware model catalog used by every
+/// dashboard picker. The age signal is intentional: static fallbacks are the
+/// honest answer for subscription CLIs without model-listing APIs, but a
+/// fallback that nobody revisits becomes silent drift. One WARN per process
+/// makes an overdue catalog visible to the ordinary log/autofix sweep.
+pub async fn model_catalog() -> impl IntoResponse {
+    use crate::provider::model_catalog::{catalog, CATALOG_UPDATED_AT};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let models = catalog();
+    let updated = chrono::NaiveDate::parse_from_str(CATALOG_UPDATED_AT, "%Y-%m-%d").ok();
+    let age_days = updated.map(|date| (chrono::Utc::now().date_naive() - date).num_days());
+    let review_due = age_days.is_none_or(|days| days > 45);
+    static WARNED_STALE: AtomicBool = AtomicBool::new(false);
+    if review_due && !WARNED_STALE.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            kind = "provider_model_catalog_stale",
+            verdict = "review_required",
+            measured = true,
+            n_considered = models.len(),
+            catalog_updated_at = CATALOG_UPDATED_AT,
+            age_days = age_days.unwrap_or(-1),
+            "provider model catalog is overdue for comparison with vendor catalogs"
+        );
+    }
+
+    Json(json!({
+        "models": models,
+        "catalog_updated_at": CATALOG_UPDATED_AT,
+        "custom_model_ids": true,
+        "review_due": review_due,
+        "measured": true,
+        "n_considered": models.len(),
+        "why_unmeasured": null,
+        "sources": {
+            "openai": "https://developers.openai.com/api/docs/models/all",
+            "anthropic": "https://platform.claude.com/docs/en/models/overview",
+            "google": "https://ai.google.dev/gemini-api/docs/models"
+        }
+    }))
 }
 
 // ---- shared helpers -----------------------------------------------------
@@ -236,6 +282,7 @@ fn worker_body(row: &WorkerRow) -> Value {
         "tokens": Value::Null,
         "last_activity": row.updated_at,
         "task_name": Value::Null,
+        "lifecycle": row.lifecycle.as_str(),
     })
 }
 
@@ -317,6 +364,8 @@ pub struct ListParams {
     pub offset: u64,
     #[serde(default = "default_limit")]
     pub limit: u64,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
 }
 
 fn default_limit() -> u64 {
@@ -325,16 +374,28 @@ fn default_limit() -> u64 {
 
 /// List workers, PagedResponse-shaped (Invariant 40: `total`/`truncated`
 /// announce what a page omits instead of silently capping).
+/// Optional `?lifecycle=active` (or comma-separated: `active,paused`) filter.
 pub async fn list_workers(
     State(state): State<AppState>,
     Query(p): Query<ListParams>,
 ) -> Response {
     let offset = p.offset;
     let limit = p.limit.clamp(1, 1000);
+    let lifecycles: Vec<WorkerLifecycle> = p
+        .lifecycle
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| WorkerLifecycle::parse(s.trim()))
+        .collect();
     let store = state.store.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
-        Ok(queries::list_workers(&conn, offset, limit)?)
+        if lifecycles.is_empty() {
+            Ok(queries::list_workers(&conn, offset, limit)?)
+        } else {
+            Ok(queries::list_workers_by_lifecycle(&conn, &lifecycles, offset, limit)?)
+        }
     })
     .await;
     let (rows, total) = match joined {
@@ -378,6 +439,73 @@ pub struct CreateWorkerBody {
     pub permissions: Option<Vec<String>>,
     #[serde(default)]
     pub group: Option<String>,
+}
+
+/// AF-651 (gh#202): `backend` was accepted as any string and answered
+/// `applied:true` with no enum validation, deferring the failure to spawn
+/// time — where `backend_of_cfg` (session_verbs.rs) silently falls through
+/// any value that is not `"herdr"`/`"tmux"` to the `tmux` default. The valid
+/// set is closed and known (that fallthrough IS the closure, empirically:
+/// there is no third arm), so this validates it the same way `group` already
+/// is a few lines below — parsed OUTSIDE the write closure, a clean 400
+/// before anything touches the writer thread, the accepted set named in the
+/// error body. Case-insensitive to match what `backend_of_cfg` itself
+/// normalizes at spawn time, so this never rejects a value that would
+/// actually have worked.
+///
+/// `permissions` is the OTHER half of gh#202; see `parse_permission` below,
+/// wired in at the same two call sites once AF-650 settled what the field's
+/// real vocabulary is.
+fn parse_backend_id(raw: &str) -> Result<BackendId, String> {
+    match raw.trim().to_lowercase().as_str() {
+        BackendId::HERDR => Ok(BackendId::herdr()),
+        BackendId::TMUX => Ok(BackendId::tmux()),
+        _ => Err(format!(
+            "backend must be one of: {}, {} — got {raw:?}",
+            BackendId::HERDR,
+            BackendId::TMUX,
+        )),
+    }
+}
+
+/// AF-650 (gh#203). Named backend's sibling ambiguity: aicodingND reported
+/// `permissions` as stored, echoed, and never read at spawn — six hits, all
+/// storage or serialization, so the field reads as an inert security control.
+/// That undersold it. There IS a consumer, and its narrowness is the real
+/// finding: api/policy.rs's `authorize_dispatch` denies task dispatch when an
+/// entry is exactly `"deny:*"` or `"deny:execute_task"`. Re-checked here
+/// rather than trusted from that report, and the re-check found a SECOND
+/// consumer the report missed entirely: backend/bootstrap.rs's spawn-command
+/// builder appends `--dangerously-skip-permissions` to a Claude invocation
+/// when an entry is exactly `"unsafe"` or `"claude:skip_permissions"`. Grepped
+/// the whole crate for all four literals to confirm there is no fifth: there
+/// is not. So the real vocabulary is these four, not the two originally
+/// reported, and getting it wrong in EITHER direction is a real cost —
+/// narrower silently disables a permission an operator is relying on, wider
+/// leaves the exact gh#203 gap open for the one this report missed, which
+/// gates a genuine safety bypass rather than a task-dispatch policy.
+///
+/// This is the smallest change that makes the field's promise equal its
+/// behaviour (its own recommended third option, over "wire into spawn" — a
+/// new permission model — or "remove from the API surface" — a breaking
+/// change to a field with a real, if narrow, consumer). It does not invent
+/// policy; it names the policy that already runs.
+const KNOWN_PERMISSIONS: [&str; 4] =
+    ["deny:*", "deny:execute_task", "unsafe", "claude:skip_permissions"];
+
+fn parse_permission(raw: &str) -> Result<String, String> {
+    if KNOWN_PERMISSIONS.contains(&raw) {
+        Ok(raw.to_string())
+    } else {
+        Err(format!(
+            "permissions entries must be one of: {} — got {raw:?}",
+            KNOWN_PERMISSIONS.join(", "),
+        ))
+    }
+}
+
+fn parse_permissions(raw: &[String]) -> Result<Vec<String>, String> {
+    raw.iter().map(|p| parse_permission(p)).collect()
 }
 
 /// Fleet-membership writes drop the legacy session-list cache (AMUX-2957).
@@ -427,15 +555,39 @@ async fn create_worker_inner(
         },
         None => None,
     };
+    let backend = match &body.backend {
+        Some(b) => match parse_backend_id(b) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": e, "backend": b }),
+                )
+            }
+        },
+        None => None,
+    };
+    let permissions = match &body.permissions {
+        Some(p) => match parse_permissions(p) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": e, "permissions": p }),
+                )
+            }
+        },
+        None => None,
+    };
     let config = WorkerConfig {
         display_name,
         name_aliases: Vec::new(),
         cwd: body.cwd.unwrap_or_default(),
         provider: ProviderId::new(body.provider.unwrap_or_else(|| "claude".into())),
         model: body.model,
-        backend: body.backend.map(BackendId::from).unwrap_or_default(),
+        backend: backend.unwrap_or_default(),
         environment: body.environment.unwrap_or_default(),
-        permissions: body.permissions.unwrap_or_default(),
+        permissions: permissions.unwrap_or_default(),
         group,
     };
 
@@ -472,7 +624,7 @@ async fn create_worker_inner(
 pub async fn get_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     let store = state.store.clone();
     let k = key.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         Ok(queries::get_worker(&conn, &k)?)
     })
@@ -551,6 +703,37 @@ pub async fn patch_worker(
         },
         None => None,
     };
+    // Same shape, same reason (AF-651 / gh#202): backend was PATCHable to any
+    // string, stored, and answered `applied:true` — a wrong answer that does
+    // not look wrong (ethos rule 4), since the value nothing will honour is
+    // echoed back exactly as sent.
+    let backend: Option<BackendId> = match &body.backend {
+        Some(b) => match parse_backend_id(b) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": e, "backend": b }),
+                )
+            }
+        },
+        None => None,
+    };
+    // AF-650 (gh#203): same boundary, the other half of the field pair.
+    // `permissions` is a Vec, so this validates every entry and reports the
+    // list back on refusal, not just the one that failed first.
+    let permissions: Option<Vec<String>> = match &body.permissions {
+        Some(p) => match parse_permissions(p) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": e, "permissions": p }),
+                )
+            }
+        },
+        None => None,
+    };
 
     let slot: Arc<Mutex<Option<PatchOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -588,13 +771,13 @@ pub async fn patch_worker(
             if let Some(v) = body.model {
                 new_cfg.model = Some(v);
             }
-            if let Some(v) = body.backend {
-                new_cfg.backend = BackendId::from(v);
+            if let Some(id) = backend.clone() {
+                new_cfg.backend = id;
             }
             if let Some(v) = body.environment {
                 new_cfg.environment = v;
             }
-            if let Some(v) = body.permissions {
+            if let Some(v) = permissions.clone() {
                 new_cfg.permissions = v;
             }
             if let Some(g) = group {
@@ -755,7 +938,20 @@ enum StepOutcome {
 /// the start (worker -> Starting, a live session row, events); the actual
 /// process spawn is the orchestrator's job (RR-0041) and lands there — this
 /// endpoint accepts the request, it does not pretend the process exists.
-pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+///
+/// `admission` is `None` in the server, which reads the live host. A test
+/// router pins it with `AdmissionOverride` (see health.rs for why).
+pub async fn start_worker(
+    State(state): State<AppState>,
+    admission: Option<Extension<AdmissionOverride>>,
+    Path(key): Path<String>,
+) -> Response {
+    // Lifecycle refusal is independent of host capacity and must remain stable.
+    match state.store.read().and_then(|conn| Ok(queries::get_worker(&conn, &key)?)) {
+        Ok(Some(row)) if !row.lifecycle.can_start() => return err(StatusCode::CONFLICT,
+            json!({"error":"worker must be active before starting; resume it first", "lifecycle":row.lifecycle.as_str()})),
+        Ok(_) => {}, Err(e) => return internal(e),
+    }
     // Host admission check BEFORE any state is written (AMUX-3396 follow-through).
     //
     // amux published memory pressure on /health for nine days and never acted on
@@ -768,12 +964,17 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
     // Deliberately a REFUSAL and not a kill. Draining someone's in-flight lane is
     // a decision about a human's work (ethos rule 8); declining to start a NEW one
     // costs nobody anything they had.
-    if crate::api::health::admission() == crate::api::health::Admission::Deny {
+    let (verdict, admission_source) = match admission {
+        Some(Extension(AdmissionOverride(fixed))) => (fixed, "override"),
+        None => (crate::api::health::admission(), "host"),
+    };
+    if verdict == Admission::Deny {
         let m = crate::api::health::mem_health();
         tracing::warn!(
             worker = %key,
             pressure = m.pressure,
             swap_used_mb = m.swap_used_mb,
+            admission_source,
             "REFUSED to start worker — the host is out of memory headroom. amux lanes were \
              the top holders in the 2026-08-24 jetsam, and starvation is what turns the \
              recurring WindowServer/tccd stall into a watchdog kill. Nothing was stopped; \
@@ -785,6 +986,7 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
                 "error": "host is out of memory headroom — refusing to start another worker",
                 "pressure": m.pressure,
                 "swap_used_mb": m.swap_used_mb,
+                "admission_source": admission_source,
                 "hint": "nothing was stopped. Free memory or stop a lane, then retry. \
                          Threshold: AMUX_MEM_SWAP_DENY_MB (default 8192).",
             }),
@@ -799,6 +1001,20 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
             let Some(row) = queries::get_worker(conn, &key_w)? else {
                 return finish(&slot_w, StepOutcome::NotFound, no_write());
             };
+            if !row.lifecycle.can_start() {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Refused {
+                        error: match row.lifecycle {
+                            WorkerLifecycle::Archived => "worker is archived; restore it first",
+                            WorkerLifecycle::Deleted => "worker is deleted",
+                            _ => "worker lifecycle does not permit starting",
+                        },
+                        state: row.lifecycle.as_str().to_string(),
+                    },
+                    no_write(),
+                );
+            }
             if !matches!(row.state, WorkerState::Stopped) {
                 return finish(
                     &slot_w,
@@ -852,6 +1068,30 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
             )
         })
         .await;
+    // A STORE MISS IS NOT A MISSING WORKER (AF-298), same shape as peek_worker:
+    // the fleet is ~125 env-file lanes and one of them is a row in this table,
+    // so 404ing every store miss answered "not found" for essentially every
+    // real lane's start. Checked AFTER `step_response` would have converted
+    // the outcome, not before, and — the point AF-398 raised — AFTER the
+    // admission check above already ran unconditionally for THIS request
+    // regardless of whether a row exists. So a fleet lane reaching this
+    // fallback is governed by the exact same memory-pressure refusal a
+    // store-row start already gets; this closes AF-398's gap for this route
+    // rather than routing around it, and does not touch session_verbs.rs's
+    // own separate dispatch of admission-free real starts.
+    if write.is_ok() {
+        let is_not_found =
+            matches!(*slot.lock().expect("outcome slot poisoned"), Some(StepOutcome::NotFound));
+        if is_not_found && crate::api::session_verbs::lane_env_exists(&key) {
+            let (ok, msg) = crate::api::session_verbs::start_session(&state, &key, "", false).await;
+            return if ok {
+                (StatusCode::ACCEPTED, Json(json!({ "ok": true, "message": msg, "worker_id": key })))
+                    .into_response()
+            } else {
+                err(StatusCode::CONFLICT, json!({ "ok": false, "error": msg, "worker_id": key }))
+            };
+        }
+    }
     step_response(write, slot, &key, StatusCode::ACCEPTED)
 }
 
@@ -905,6 +1145,26 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>)
             )
         })
         .await;
+    // Same fallback shape as start_worker/peek_worker (AF-298): a store miss
+    // that names a real fleet lane delegates to the dispatcher's own stop
+    // rather than 404ing. No admission gate applies to stopping (that only
+    // governs starting MORE load), so this is the caller's own request to
+    // stop a NAMED lane -- the same thing `amux stop <lane>` already does
+    // through a different path.
+    if write.is_ok() {
+        let is_not_found =
+            matches!(*slot.lock().expect("outcome slot poisoned"), Some(StepOutcome::NotFound));
+        if is_not_found && crate::api::session_verbs::lane_env_exists(&key) {
+            return match crate::api::session_verbs::stop_for_pause(&state, &key).await {
+                Ok(()) => (StatusCode::OK, Json(json!({ "applied": true, "state": "stopped", "worker_id": key })))
+                    .into_response(),
+                Err(e) => err(
+                    StatusCode::BAD_GATEWAY,
+                    json!({ "error": format!("stop failed: {e}"), "worker_id": key }),
+                ),
+            };
+        }
+    }
     step_response(write, slot, &key, StatusCode::OK)
 }
 
@@ -940,15 +1200,10 @@ async fn delete_worker_inner(State(state): State<AppState>, Path(key): Path<Stri
             let now_s = chrono::Utc::now().to_rfc3339();
             let n = queries::soft_delete_worker(conn, &row.id, &now_s)?;
             if n == 0 {
-                // Raced with another delete inside the same writer queue:
-                // already gone, report absence rather than a fresh change.
                 return finish(&slot_w, StepOutcome::NotFound, no_write());
             }
-            // Deletion is SOFT: the row survives with `deleted_at` set, and
-            // the Deleted event journals a snapshot of that surviving row —
-            // replay then knows both that it was deleted and what it was
-            // (RR-0111a).
             let mut after = row.clone();
+            after.lifecycle = WorkerLifecycle::Deleted;
             after.deleted_at = Some(now_s.clone());
             after.updated_at = now_s;
             finish(
@@ -990,6 +1245,231 @@ fn step_response(
     }
 }
 
+// ---- lifecycle transitions ------------------------------------------------
+
+/// Serialize lifecycle transitions by resolved worker name, including typed
+/// bootstrap, so an in-flight spawn cannot complete after Pause acknowledges.
+pub(crate) fn lifecycle_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Mutex::default).lock().unwrap().entry(name.to_owned()).or_default().clone()
+}
+
+pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    change_pause(state, key, true, None).await
+}
+
+pub async fn resume_worker(
+    State(state): State<AppState>,
+    admission: Option<Extension<AdmissionOverride>>,
+    Path(key): Path<String>,
+) -> Response {
+    change_pause(state, key, false, admission).await
+}
+
+/// `admission` only matters on Resume, which starts the worker through
+/// `start_worker` and must see the same verdict the router was built with.
+async fn change_pause(
+    state: AppState,
+    key: String,
+    paused: bool,
+    admission: Option<Extension<AdmissionOverride>>,
+) -> Response {
+    use crate::api::session_verbs as fleet;
+    let name = match resolve_key(&state, key.clone()).await {
+        Ok(n) => n, Err(r) => return r,
+    };
+    let lock = lifecycle_lock(&name);
+    let _guard = lock.lock().await;
+    let row = match state.store.read().and_then(|conn| Ok(queries::get_worker(&conn, &key)?)) {
+        Ok(row) => row, Err(e) => return internal(e),
+    };
+    let legacy = fleet::lane_env_exists(&name);
+    if row.is_none() && !legacy { return not_found(&key); }
+    let cfg = fleet::parse_env(&name);
+    let current = row.as_ref().map(|r| r.lifecycle).unwrap_or_else(|| {
+        if cfg.get("CC_ARCHIVED") == Some("1") { WorkerLifecycle::Archived }
+        else if cfg.get("CC_PAUSED") == Some("1") { WorkerLifecycle::Paused }
+        else { WorkerLifecycle::Active }
+    });
+    if !matches!(current, WorkerLifecycle::Active | WorkerLifecycle::Paused)
+        || cfg.get("CC_ARCHIVED") == Some("1") {
+        return err(StatusCode::CONFLICT, json!({"error":"restore the worker before pausing or resuming", "state":current.as_str()}));
+    }
+    let target = if paused { WorkerLifecycle::Paused } else { WorkerLifecycle::Active };
+    // A repeated Resume is a no-op, not a request to restart a manually stopped worker.
+    if !paused && current == target && cfg.get("CC_PAUSED") != Some("1") {
+        return (StatusCode::OK, Json(json!({"applied":false,"lifecycle":"active","name":name}))).into_response();
+    }
+    if let Some(row) = &row {
+        let response = lifecycle_transition(state.clone(), row.id.clone(),
+            &[WorkerLifecycle::Active, WorkerLifecycle::Paused], target,
+            if paused { "pause" } else { "resume" }).await;
+        if !response.status().is_success() { return response; }
+    }
+    let outcome: anyhow::Result<Value> = async {
+        fleet::set_legacy_paused(&name, paused)?;
+        if let (Some(row), Some(protocol)) = (&row, crate::opencode::process_protocol()) {
+            let worker = WorkerId::parse(&row.id)?;
+            let result = if paused { protocol.pause(&worker).await } else { protocol.resume(&worker).await };
+            if !matches!(result, Err(crate::opencode::ProtocolError::NoSession(_))) { result?; }
+        }
+        if legacy {
+            if paused {
+                fleet::stop_for_pause(&state, &name).await?;
+                Ok(json!({"running":false,"session":"stopped"}))
+            } else {
+                let (ok, detail) = fleet::start_session(&state, &name, "", false).await;
+                anyhow::ensure!(ok, "{detail}");
+                Ok(json!({"running":true,"session":"started"}))
+            }
+        } else if paused {
+            let row = row.as_ref().unwrap();
+            // End the durable session first so bootstrap cannot re-adopt it.
+            let response = stop_worker(State(state.clone()), Path(row.id.clone())).await;
+            anyhow::ensure!(response.status().is_success(), "could not end worker session");
+            let has_session = state.store.read()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM _amux_sessions WHERE worker_id=?1)", [&row.id], |r| r.get::<_, bool>(0))?;
+            if !has_session { return Ok(json!({"running":false,"session":"stopped"})); }
+            let backend = crate::backend::process_backend(&row.backend)
+                .ok_or_else(|| anyhow::anyhow!("backend '{}' is unavailable; shutdown cannot be verified", row.backend))?;
+            let process = crate::backend::ProcessRef {
+                backend_ref: backend_ref(&WorkerId::parse(&row.id)?), pid: None,
+            };
+            backend.terminate(&process).await?;
+            anyhow::ensure!(!matches!(backend.status(&process).await?, crate::backend::BackendStatus::Running), "worker is still running after pause");
+            Ok(json!({"running":false,"session":"stopped"}))
+        } else {
+            let response = start_worker(State(state.clone()), admission, Path(key.clone())).await;
+            if !response.status().is_success() {
+                let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                anyhow::bail!("{}", body["error"].as_str().unwrap_or("worker start was refused"));
+            }
+            Ok(json!({"session":"starting"}))
+        }
+    }.await;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    match outcome {
+        Ok(mut body) => {
+            body["applied"] = json!(current != target);
+            body["lifecycle"] = json!(target.as_str());
+            body["name"] = json!(name);
+            tracing::info!(session = name, lifecycle = target.as_str(), verdict = "worker_lifecycle_applied", "worker lifecycle and runtime transition completed");
+            (if body["session"] == "starting" { StatusCode::ACCEPTED } else { StatusCode::OK }, Json(body)).into_response()
+        }
+        Err(e) => {
+            // Fail closed: a failed Resume stays paused and can be retried.
+            if !paused {
+                if let Some(row) = &row {
+                    let _ = lifecycle_transition(state.clone(), row.id.clone(), &[WorkerLifecycle::Active, WorkerLifecycle::Paused], WorkerLifecycle::Paused, "resume_failed").await;
+                    if let Some(protocol) = crate::opencode::process_protocol() {
+                        if let Ok(worker) = WorkerId::parse(&row.id) {
+                            if let Err(rollback) = protocol.pause(&worker).await {
+                                if !matches!(rollback, crate::opencode::ProtocolError::NoSession(_)) {
+                                    tracing::error!(session = name, %rollback, "worker_protocol_rollback_failed");
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Err(rollback) = fleet::set_legacy_paused(&name, true) {
+                    tracing::error!(session = name, %rollback, "worker_lifecycle_rollback_failed");
+                }
+            }
+            tracing::warn!(session = name, %e, paused, verdict = "worker_lifecycle_failed", "worker lifecycle transition failed; completion was not acknowledged");
+            err(StatusCode::BAD_GATEWAY, json!({"error":e.to_string(),"applied":false,"name":name}))
+        }
+    }
+}
+
+/// Shared lifecycle transition logic.
+async fn lifecycle_transition(
+    state: AppState,
+    key: String,
+    from: &[WorkerLifecycle],
+    to: WorkerLifecycle,
+    verb: &'static str,
+) -> Response {
+    let slot: Arc<Mutex<Option<StepOutcome>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let key_w = key.clone();
+    let from_owned: Vec<WorkerLifecycle> = from.to_vec();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(row) = queries::get_worker(conn, &key_w)? else {
+                return finish(&slot_w, StepOutcome::NotFound, no_write());
+            };
+            if !from_owned.contains(&row.lifecycle) {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Refused {
+                        error: "lifecycle transition not permitted from current state",
+                        state: row.lifecycle.as_str().to_string(),
+                    },
+                    no_write(),
+                );
+            }
+            if row.lifecycle == to {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Noop {
+                        body: json!({
+                            "applied": false,
+                            "lifecycle": to.as_str(),
+                            "worker_id": row.id,
+                        }),
+                    },
+                    no_write(),
+                );
+            }
+            let now_s = chrono::Utc::now().to_rfc3339();
+            let n = queries::update_worker_lifecycle(
+                conn,
+                &row.id,
+                &from_owned,
+                to,
+                &now_s,
+            )?;
+            if n == 0 {
+                return finish(
+                    &slot_w,
+                    StepOutcome::Refused {
+                        error: "lifecycle transition failed (concurrent change)",
+                        state: row.lifecycle.as_str().to_string(),
+                    },
+                    no_write(),
+                );
+            }
+            let mut after = row.clone();
+            after.lifecycle = to;
+            after.updated_at = now_s;
+            if to == WorkerLifecycle::Deleted {
+                after.deleted_at = Some(after.updated_at.clone());
+            }
+            finish(
+                &slot_w,
+                StepOutcome::Applied {
+                    body: json!({
+                        "applied": true,
+                        "lifecycle": to.as_str(),
+                        "worker_id": after.id,
+                        "verb": verb,
+                    }),
+                },
+                WriteOutcome {
+                    applied: true,
+                    events: vec![ev_worker(
+                        &after,
+                        MutationKind::Updated,
+                    )],
+                },
+            )
+        })
+        .await;
+    step_response(write, slot, &key, StatusCode::OK)
+}
+
 // ---- GET /api/workers/{id}/peek -----------------------------------------
 
 #[derive(Deserialize)]
@@ -1018,7 +1498,7 @@ pub async fn peek_worker(
 ) -> Response {
     let store = state.store.clone();
     let k = key.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         let Some(row) = queries::get_worker(&conn, &k)? else {
             return Ok(None);
@@ -1154,7 +1634,7 @@ pub async fn send_worker(
 ) -> Response {
     let store = state.store.clone();
     let k = key.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         Ok(queries::get_worker(&conn, &k)?)
     })
@@ -1184,7 +1664,7 @@ pub async fn send_worker(
 async fn resolve_key(state: &AppState, key: String) -> Result<String, Response> {
     let store = state.store.clone();
     let k = key.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         Ok(queries::get_worker(&conn, &k)?)
     })
@@ -1531,7 +2011,7 @@ pub async fn duplicate_worker(
 ) -> Response {
     let store = state.store.clone();
     let k = key.clone();
-    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
         Ok(queries::get_worker(&conn, &k)?)
     })
@@ -1559,6 +2039,16 @@ mod tests {
     use tower::ServiceExt;
 
     fn app_with_token(token: Option<String>) -> (axum::Router, tempfile::TempDir) {
+        app_admitting(token, Admission::Allow)
+    }
+
+    /// Every router in this module pins host admission, so no test here passes
+    /// or fails with the memory state of the machine running it. The refusal
+    /// branch has its own `Deny` router.
+    fn app_admitting(
+        token: Option<String>,
+        verdict: Admission,
+    ) -> (axum::Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("amux-test.db")).unwrap();
         let state = AppState {
@@ -1568,7 +2058,7 @@ mod tests {
             auth_token: token,
         reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
-        (router(state), dir)
+        (router(state).layer(Extension(AdmissionOverride(verdict))), dir)
     }
 
     fn app() -> (axum::Router, tempfile::TempDir) {
@@ -1582,6 +2072,88 @@ mod tests {
         body: Option<Value>,
     ) -> (StatusCode, HeaderMap, Value) {
         send_with(app, method, path, body, &[]).await
+    }
+
+    /// Like `read_fixture_sessions`, but bounded by a DEADLINE instead of an
+    /// attempt count, for tests that read the REAL handler.
+    ///
+    /// AMUX-4647. `SESSIONS_EPOCH` is process-wide, 12 call sites bump it, and
+    /// cargo runs this binary's tests in parallel, so a sibling create or delete
+    /// invalidates this build. Measured on this host: 7 of 10 module runs failed,
+    /// every one of them `legacy_sessions_stores_do_not_share_cached_rows` at the
+    /// assert after its retry loop.
+    ///
+    /// SEPARATE FROM `read_fixture_sessions` ON PURPOSE. That helper's attempt
+    /// count is a pinned contract:
+    /// `fixture_session_reader_preserves_errors_and_bounds_epoch_churn` stands up
+    /// a stub router and asserts EXACTLY 5 reads for the race body and 1 for any
+    /// other error. Widening it in place made that test spin 722 times against a
+    /// stub that returns the same refusal by construction, which is how I learned
+    /// the count is load-bearing rather than incidental.
+    ///
+    /// Still fails closed: only the one explicit race body is retried, every
+    /// other status and body returns immediately, and an exhausted deadline
+    /// returns the last refusal for the caller to assert on.
+    async fn read_real_sessions_settled(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut attempts = 0u32;
+        loop {
+            let result = send(app, "GET", "/api/sessions", None).await;
+            attempts += 1;
+            let racing = result.0 == StatusCode::SERVICE_UNAVAILABLE
+                && result.2["error"].as_str() == Some("sessions list changed during discovery; retry");
+            if !racing || std::time::Instant::now() >= deadline {
+                if racing {
+                    eprintln!("{}", json!({"verdict":"discovery_deadline_exhausted", "stage":stage,
+                        "attempts":attempts, "measured":true, "n_considered":1}));
+                }
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    // The attempt-count policy has its own stub-router negative control below.
+    // Real-handler tests use the settled-read deadline above under epoch churn.
+    async fn read_fixture_sessions(app: &axum::Router, stage: &str) -> (StatusCode, HeaderMap, Value) {
+        for attempt in 0..5 {
+            let result = send(app, "GET", "/api/sessions", None).await;
+            if result.0 != StatusCode::SERVICE_UNAVAILABLE
+                || result.2["error"].as_str() != Some("sessions list changed during discovery; retry")
+                || attempt == 4
+            {
+                return result;
+            }
+            eprintln!("{}", json!({"verdict":"fixture_session_discovery_retry", "stage":stage,
+                "attempt":attempt + 1, "max_attempts":5, "measured":true, "n_considered":1}));
+            tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
+        }
+        unreachable!("the final attempt returns its actual response")
+    }
+
+    #[tokio::test]
+    async fn fixture_session_reader_preserves_errors_and_bounds_epoch_churn() {
+        // AMUX-4637: the race is served as 503. The reader retries that pair
+        // only; the same words on a 500 are an ordinary failure and read once.
+        for (error, served, expected_reads) in [
+            ("database query failed", StatusCode::INTERNAL_SERVER_ERROR, 1),
+            ("sessions list changed during discovery; retry", StatusCode::SERVICE_UNAVAILABLE, 5),
+            ("sessions list changed during discovery; retry", StatusCode::INTERNAL_SERVER_ERROR, 1),
+        ] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = axum::Router::new().route("/api/sessions", axum::routing::get(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (served, axum::Json(json!({"error":error})))
+                }
+            }));
+            let (status, _, body) = read_fixture_sessions(&app, "negative-control").await;
+            assert_eq!(status, served, "{body}");
+            assert_eq!(body["error"], error);
+            assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), expected_reads);
+        }
     }
 
     async fn send_with(
@@ -1633,7 +2205,99 @@ mod tests {
         body["rev"].as_u64().unwrap()
     }
 
+    /// AMUX-4018: the modern id route and legacy name route are two spellings
+    /// of the same persisted worker policy. Both must return the effective
+    /// composed source/reason, not just echo the value they wrote.
+    #[tokio::test]
+    async fn both_worker_config_routes_persist_and_explain_cross_group_policy() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("amux.env"), "CC_SEND_ALLOW=*\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _db) = app();
+        let id = create(&app, "policy-worker").await;
+        std::fs::write(
+            home.path().join("sessions/policy-worker.env"),
+            "CC_TAGS=customers\n",
+        )
+        .unwrap();
+
+        let (status, _, denied) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}/config"),
+            Some(json!({"spans_groups": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{denied}");
+        assert_eq!(denied["spans_groups"], json!(false), "{denied}");
+        assert_eq!(denied["source"], json!("worker"), "{denied}");
+        assert_eq!(denied["explicit_deny"], json!(true), "{denied}");
+
+        std::fs::write(
+            home.path().join("sessions/legacy-policy-worker.env"),
+            "CC_TAGS=customers\n",
+        )
+        .unwrap();
+        let (status, _, allowed) = send(
+            &app,
+            "PATCH",
+            "/api/sessions/legacy-policy-worker/config",
+            Some(json!({"send_allow": "ops"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{allowed}");
+        assert_eq!(allowed["spans_groups"], json!(true), "{allowed}");
+        assert_eq!(allowed["effective"], json!("*"), "{allowed}");
+        assert_eq!(allowed["source"], json!("global + worker"), "{allowed}");
+        assert!(
+            allowed["reason"].as_str().unwrap_or("").contains("additive"),
+            "{allowed}"
+        );
+        assert_eq!(
+            crate::config::parse_env_file(&home.path().join("sessions/legacy-policy-worker.env"))
+                .get("CC_SEND_ALLOW")
+                .map(String::as_str),
+            Some("ops"),
+            "legacy route must persist into the same worker env file"
+        );
+    }
+
     // ---- RR-0034 test list ----------------------------------------------
+
+    /// The UI contract for the shared catalog: the route is really mounted,
+    /// its population is measured, all three hosted providers are present,
+    /// and an incompatible modality is typed without being offered to a
+    /// coding worker. Removing `/api/models`, one provider, or the guard bit
+    /// makes a different assertion fail.
+    #[tokio::test]
+    async fn typed_model_catalog_route_is_complete_and_discriminating() {
+        let (app, _dir) = app();
+        let (status, _, body) = send(&app, "GET", "/api/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(body["measured"], true, "{body}");
+        assert_eq!(body["n_considered"], models.len(), "{body}");
+        assert_eq!(body["custom_model_ids"], true, "{body}");
+        for provider in ["codex", "claude", "gemini"] {
+            assert!(
+                models.iter().any(|model| model["provider"] == provider),
+                "provider {provider} missing from catalog"
+            );
+        }
+        let image = models
+            .iter()
+            .find(|model| model["id"] == "gpt-image-2")
+            .expect("OpenAI image model must be represented");
+        assert_eq!(image["model_type"], "image");
+        assert_eq!(image["worker_selectable"], false);
+        let flagship = models
+            .iter()
+            .find(|model| model["id"] == "gpt-6-astra")
+            .expect("current OpenAI flagship must be represented");
+        assert_eq!(flagship["model_type"], "flagship");
+        assert_eq!(flagship["worker_selectable"], true);
+    }
 
     /// A stored `display_name` cannot walk out of the sessions directory.
     ///
@@ -1911,6 +2575,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_lifecycle_validates_and_blocks_start() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+        for verb in ["pause", "resume"] {
+            let (st, _, body) = send(&app, "POST", &format!("/api/workers/ghost/{verb}"), None).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+        }
+        let id = create(&app, "pause-probe").await;
+        for applied in [true, false] {
+            let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/pause"), None).await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            assert_eq!(body["lifecycle"], "paused");
+            assert_eq!(body["running"], false);
+            assert_eq!(body["applied"], applied);
+        }
+        let (st, _, _) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        // Admission is pinned to Allow, so this always reaches the success path.
+        // The denied Resume is its own test below and no longer depends on the
+        // host being out of memory when the suite runs.
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["session"], "starting");
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], false);
+    }
+
+    /// The host-admission refusal, pinned instead of inherited from the machine.
+    /// Start answers 503 before writing anything, and Resume fails closed: the
+    /// worker stays paused and stopped. Until AdmissionOverride this branch ran
+    /// only on a host that happened to be out of memory, and on that host the
+    /// start tests went red instead.
+    #[tokio::test]
+    async fn host_admission_denial_refuses_start_and_resume_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app_admitting(None, Admission::Deny);
+        let id = create(&app, "admission-probe").await;
+
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("memory headroom"), "{body}");
+        assert_eq!(body["admission_source"], "override", "{body}");
+        let (_, _, worker) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(worker["state"]["state"], "stopped", "a refused start wrote state: {worker}");
+
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/pause"), None).await;
+        assert_eq!(st, StatusCode::OK, "pause does not consult admission: {body}");
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/resume"), None).await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("memory headroom"), "{body}");
+        let (_, _, worker) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(worker["lifecycle"], "paused", "{worker}");
+        assert_eq!(worker["state"]["state"], "stopped", "{worker}");
+    }
+
+    #[tokio::test]
+    async fn pause_legacy_failure_and_resume_failure_are_honest() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let env = home.path().join("sessions/pause-probe.env");
+        std::fs::write(&env, "CC_PAUSED=1\nCC_BACKEND=herdr\nCC_DIR=/tmp\n").unwrap();
+        let (app, _dir) = app();
+        // Unsupported startup cannot advertise an active worker or remove its gate.
+        let (st, _, body) = send(&app, "POST", "/api/workers/pause-probe/resume", None).await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["applied"], false);
+        assert_eq!(crate::api::session_verbs::parse_env("pause-probe").get("CC_PAUSED"), Some("1"));
+        std::fs::write(&env, "CC_ARCHIVED=1\n").unwrap();
+        for verb in ["pause", "resume"] {
+            let (st, _, body) = send(&app, "POST", &format!("/api/workers/pause-probe/{verb}"), None).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        }
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "CC_ARCHIVED=1\n");
+    }
+
+    #[tokio::test]
     async fn start_stop_delete_lifecycle() {
         let (app, _dir) = app();
         let id = create(&app, "w").await;
@@ -2009,8 +2753,9 @@ mod tests {
         // the legacy route merges the REAL fleet (env + tmux read at call
         // time) and the assertion below depends on how many live sessions
         // this box runs. See SUPPRESS_FLEET_FOR_TEST for the named deviation.
-        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Bound, so suppression ends with this test instead of leaking into
+        // every later one in this binary (AMUX-4703).
+        let _fleet = crate::api::sessions_legacy::suppress_fleet_for_test();
         let (app, _dir) = app();
         let id = create(&app, "w").await;
 
@@ -2023,8 +2768,8 @@ mod tests {
         // Bare /api/sessions now serves the PYTHON SHAPE (bare array from
         // the dedicated handler, no Deprecated header) — the SPA's
         // fetchSessions throws on anything else (browser-golden finding #3).
-        let (st, headers, legacy) = send(&app, "GET", "/api/sessions", None).await;
-        assert_eq!(st, StatusCode::OK);
+        let (st, headers, legacy) = read_real_sessions_settled(&app, "deprecated-header").await;
+        assert_eq!(st, StatusCode::OK, "legacy discovery response: {legacy}");
         assert!(headers.get("deprecated").is_none());
         let arr = legacy.as_array().expect("bare array");
         assert_eq!(arr.len(), 1);
@@ -2041,6 +2786,237 @@ mod tests {
         let (st, _h, detail) = send(&app, "GET", "/api/workers/w", None).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(detail["id"].as_str().unwrap(), id);
+    }
+
+    #[tokio::test]
+    async fn legacy_sessions_stores_do_not_share_cached_rows() {
+        // Bound, so suppression ends with this test instead of leaking into
+        // every later one in this binary (AMUX-4703).
+        let _fleet = crate::api::sessions_legacy::suppress_fleet_for_test();
+        let (first, _first_dir) = app();
+        let (second, _second_dir) = app();
+        create(&first, "first-store-worker").await;
+        create(&second, "second-store-worker").await;
+        // Both stores now have the same global epoch. Alternate reads without
+        // invalidating: a fresh snapshot from one must never answer the other.
+        for (app, name) in [
+            (&first, "first-store-worker"),
+            (&second, "second-store-worker"),
+            (&first, "first-store-worker"),
+        ] {
+            let (status, _, rows) = read_real_sessions_settled(app, "stores-do-not-share").await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            let rows = rows.as_array().expect("legacy rows");
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["name"], name, "{rows:?}");
+        }
+    }
+
+    /// ATE-92 acceptance contract: the HTTP session projection, not only a
+    /// helper test, must carry one measured runtime/board verdict. A client
+    /// may never have to reconstruct its WORKING badge from a separate board
+    /// poll. A later control prompt cannot erase a still-live claimed card.
+    #[tokio::test]
+    async fn legacy_sessions_http_serializes_sticky_runtime_board_truth() {
+        // Bound, so suppression ends with this test instead of leaking into
+        // every later one in this binary (AMUX-4703).
+        let _fleet = crate::api::sessions_legacy::suppress_fleet_for_test();
+        let (app, dir) = app();
+        // Deterministic counterpart of CI's shared discovery-epoch race: the
+        // idle read must retain the same retry policy as the initial read.
+        let idle_race = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let injected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (race, count) = (idle_race.clone(), injected.clone());
+        let app = app.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let (race, count) = (race.clone(), count.clone());
+            async move {
+                if request.uri().path() == "/api/sessions" && race.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error":"sessions list changed during discovery; retry"}))).into_response();
+                }
+                next.run(request).await
+            }
+        }));
+        let now = chrono::Utc::now().timestamp();
+        let marker_ts = now as f64 + 60.0;
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        for (worker, session) in [
+            ("linked", "ses-linked"),
+            ("multiple", "ses-multiple"),
+            ("sticky", "ses-sticky"),
+            ("tubescience", "ses-tubescience"),
+            ("released", "ses-released"),
+            ("conflict", "ses-conflict"),
+            ("decomposed", "ses-decomposed"),
+        ] {
+            conn.execute(
+                "INSERT INTO _amux_workers (id, display_name, state, created_at, updated_at) \
+                 VALUES (?1, ?2, '{\"state\":\"active\"}', 'now', 'now')",
+                rusqlite::params![format!("wrk-{worker}"), worker],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _amux_sessions (id, worker_id, backend, backend_ref, started_at) \
+                 VALUES (?1, ?2, 'tmux', ?3, 'now')",
+                rusqlite::params![session, format!("wrk-{worker}"), format!("amux-{worker}")],
+            )
+            .unwrap();
+        }
+        for (id, session) in [
+            ("LINKED-1", "linked"),
+            ("MULTI-1", "multiple"),
+            ("MULTI-2", "multiple"),
+            ("STICKY-1", "sticky"),
+            ("TUBES-2459", "tubescience"),
+            ("CONFLICT-1", "conflict"),
+            ("CONFLICT-2", "conflict"),
+            ("DECOMP-1", "decomposed"),
+            ("DECOMP-2", "decomposed"),
+        ] {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+                 VALUES (?1, ?2, 'doing', ?3, 'test', ?4, ?4)",
+                rusqlite::params![id, format!("title {id}"), session, now],
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE issues SET type='epic' WHERE id='DECOMP-1'", []).unwrap();
+        conn.execute("UPDATE issues SET epic='DECOMP-1' WHERE id='DECOMP-2'", []).unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+             VALUES ('RELEASED-1', 'released title', 'done', 'released', 'test', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, status, session, creator, created, updated) \
+             VALUES ('TUBES-2496', 'renewed clearance', 'backlog', 'tubescience', 'test', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE issues SET depends_on='[\"TUBES-2496\"]', \
+                    blocked_on='writer stopped at cursor 429000 pending renewed clearance' \
+             WHERE id='TUBES-2459'",
+            [],
+        )
+        .unwrap();
+        for (session, card) in [
+            ("linked", "LINKED-1"),
+            ("multiple", "MULTI-1"),
+            ("sticky", "STICKY-1"),
+            ("tubescience", "TUBES-2459"),
+            ("released", "RELEASED-1"),
+            ("conflict", "CONFLICT-1"),
+            ("conflict", "CONFLICT-2"),
+            ("decomposed", "DECOMP-1"),
+            ("decomposed", "DECOMP-2"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1, ?2, 'task.claimed', ?3, 'test')",
+                rusqlite::params![marker_ts + if card.ends_with("2") { 1.0 } else { 0.0 }, session, json!({"issue": card}).to_string()],
+            )
+            .unwrap();
+        }
+        for (session, reason) in [
+            ("sticky", "control-prompt"),
+            // The historical transport-only marker from the live specimen is
+            // deliberately invalid. It cannot make substantive work cardless.
+            ("tubescience", "explicit-no-board"),
+            ("released", "informational-query"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1, ?2, 'task.cardless', ?3, 'test')",
+                rusqlite::params![marker_ts + 2.0, session, json!({"reason": reason}).to_string()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+
+        let (status, _, payload) = read_real_sessions_settled(&app, "active").await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let rows = payload.as_array().expect("legacy session array");
+        let linked = rows.iter().find(|row| row["name"] == "linked").expect("linked row");
+        assert_eq!(linked["runtime_board"]["measured"], json!(true), "{linked}");
+        assert_eq!(linked["runtime_board"]["status"], json!("linked"), "{linked}");
+        assert_eq!(linked["runtime_board"]["card_id"], json!("LINKED-1"), "{linked}");
+        assert_eq!(linked["runtime_board"]["card_count"], json!(1), "{linked}");
+        assert_eq!(linked["task_board_id"], json!("LINKED-1"), "{linked}");
+
+        // Aggregate Doing count is diagnostic, not a substitute for causal
+        // ownership: MULTI-1 remains exact even with unrelated MULTI-2 live.
+        let multiple = rows.iter().find(|row| row["name"] == "multiple").expect("multiple row");
+        assert_eq!(multiple["status"], json!("active"), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["measured"], json!(true), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["status"], json!("linked"), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["card_count"], json!(2), "{multiple}");
+        assert_eq!(multiple["runtime_board"]["card_id"], json!("MULTI-1"), "{multiple}");
+        assert_eq!(multiple["task_board_id"], json!("MULTI-1"), "{multiple}");
+
+        let sticky = rows.iter().find(|row| row["name"] == "sticky").expect("sticky row");
+        assert_eq!(sticky["runtime_board"]["status"], json!("linked"), "{sticky}");
+        assert_eq!(sticky["runtime_board"]["card_id"], json!("STICKY-1"), "{sticky}");
+        assert_eq!(sticky["runtime_board"]["card_count"], json!(1), "{sticky}");
+        assert_eq!(sticky["runtime_board"]["cardless_suppressed_by_live_claim"], json!(true), "{sticky}");
+        assert_eq!(sticky["task_board_id"], json!("STICKY-1"), "{sticky}");
+
+        let tubescience = rows.iter().find(|row| row["name"] == "tubescience").expect("active TubeScience row");
+        assert_eq!(tubescience["status"], json!("unattributed"), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["status"], json!("active-card-invalid"), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["blocked_doing_count"], json!(1), "{tubescience}");
+        assert_eq!(tubescience["runtime_board"]["card_count"], json!(0), "{tubescience}");
+        assert!(tubescience["runtime_board"]["card_id"].is_null(), "{tubescience}");
+        assert!(tubescience["task_board_id"].as_str().unwrap_or_default().is_empty(), "{tubescience}");
+        assert_eq!(
+            tubescience["runtime_board"]["observed_card_id"],
+            json!("TUBES-2459"),
+            "the rejected stale claim remains diagnostic evidence, never current truth: {tubescience}"
+        );
+
+        let released = rows.iter().find(|row| row["name"] == "released").expect("released row");
+        assert_eq!(released["runtime_board"]["status"], json!("cardless-allowed"), "{released}");
+        assert_eq!(released["runtime_board"]["card_count"], json!(0), "{released}");
+        assert!(released["runtime_board"]["card_id"].is_null(), "{released}");
+        assert_eq!(released["runtime_board"]["cardless_suppressed_by_live_claim"], json!(false), "{released}");
+        assert!(released["task_board_id"].as_str().unwrap_or_default().is_empty(), "{released}");
+
+        let decomposed = rows.iter().find(|row| row["name"] == "decomposed").unwrap();
+        assert_eq!(decomposed["status"], json!("active"), "{decomposed}");
+        assert_eq!(decomposed["runtime_board"]["status"], json!("linked"));
+        assert_eq!(decomposed["runtime_board"]["card_id"], json!("DECOMP-2"));
+        assert_eq!(decomposed["runtime_board"]["card_count"], json!(1));
+        assert_eq!(decomposed["runtime_board"]["epic_container_count"], json!(1));
+
+        let conflict = rows.iter().find(|row| row["name"] == "conflict").expect("conflict row");
+        assert_eq!(conflict["status"], json!("unattributed"), "{conflict}");
+        assert_eq!(conflict["runtime_board"]["status"], json!("active-conflicting-claims"), "{conflict}");
+        assert_eq!(conflict["runtime_board"]["card_count"], json!(2), "{conflict}");
+        assert!(conflict["runtime_board"]["card_id"].is_null(), "{conflict}");
+
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        conn.execute(
+            "UPDATE _amux_workers SET state = '{\"state\":\"idle\"}' WHERE display_name = 'tubescience'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+        idle_race.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, _, idle_payload) = read_real_sessions_settled(&app, "idle").await;
+        assert_eq!(injected.load(std::sync::atomic::Ordering::SeqCst), 1, "idle discovery-race control must execute");
+        assert_eq!(status, StatusCode::OK, "{idle_payload}");
+        let idle_tubescience = idle_payload
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "tubescience"))
+            .expect("idle TubeScience row");
+        assert_eq!(idle_tubescience["status"], json!("idle"), "{idle_tubescience}");
+        assert_eq!(idle_tubescience["runtime_board"]["status"], json!("runtime-not-active"), "{idle_tubescience}");
+        assert!(idle_tubescience["runtime_board"]["card_id"].is_null(), "{idle_tubescience}");
+        assert!(idle_tubescience["task_board_id"].as_str().unwrap_or_default().is_empty(), "{idle_tubescience}");
+        assert_eq!(idle_tubescience["runtime_board"]["blocked_doing_count"], json!(1), "{idle_tubescience}");
     }
 
     #[tokio::test]
@@ -2363,6 +3339,95 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("socket timeout"));
     }
 
+    // ---- start/stop fall back to the fleet substrate (AF-298) -------------
+
+    /// AF-298: a store miss on `/api/workers/{id}/start` is not a missing
+    /// worker for the same reason peek's fix established -- the fleet is
+    /// ~125 env-file lanes and one of them is a store row. Falls back to
+    /// `start_session` for a name that IS a real lane, and a config the CLI
+    /// CLI never got to spawn (CC_PAUSED=1) proves delegation happened rather
+    /// than just getting lucky on a 404-shaped coincidence.
+    #[tokio::test]
+    async fn start_falls_back_to_a_real_fleet_lane_the_store_never_heard_of() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+
+        // Unknown name, no env file at all: still a clean 404, never a
+        // plausible-looking answer for a lane that does not exist -- the
+        // exact property peek's own fix test pins.
+        let (st, _, _) = send(&app, "POST", "/api/workers/zzz-nolane-af298/start", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // A real lane, not a store row: CC_PAUSED=1 makes start_session
+        // return a defined, non-spawning refusal, so this proves the
+        // fallback reached the fleet dispatcher rather than merely not
+        // 404ing by accident.
+        std::fs::write(
+            home.path().join("sessions/fleet-lane-af298.env"),
+            "CC_PAUSED=\"1\"\n",
+        )
+        .unwrap();
+        let (st, _, body) =
+            send(&app, "POST", "/api/workers/fleet-lane-af298/start", None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("paused"),
+            "must reach start_session's own refusal, not a generic 404: {body}"
+        );
+    }
+
+    /// AF-298/AF-398: the fallback above must not route a fleet lane's start
+    /// AROUND the host memory-pressure refusal every store-row start already
+    /// gets. Same lane, same request shape as the test above, Admission::Deny
+    /// this time -- must 503 with the SAME refusal shape start_worker's
+    /// store-row path uses, never reaching start_session at all.
+    #[tokio::test]
+    async fn start_fallback_is_still_refused_under_memory_pressure() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::write(
+            home.path().join("sessions/fleet-lane-af398.env"),
+            "CC_PAUSED=\"1\"\n",
+        )
+        .unwrap();
+        let (app, _dir) = app_admitting(None, Admission::Deny);
+
+        let (st, _, body) =
+            send(&app, "POST", "/api/workers/fleet-lane-af398/start", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("memory headroom"),
+            "must be the SAME admission refusal a store-row start gets, not a bypass: {body}"
+        );
+    }
+
+    /// AF-298: same fallback shape for stop. Unlike start, stop carries no
+    /// admission gate (it never adds load), so the caller's own request to
+    /// stop a NAMED real lane is delegated rather than 404ing. A lane with no
+    /// live process is `stop_for_pause`'s own honest no-op, which proves the
+    /// fallback reached the dispatcher (a truly unknown name never gets this
+    /// far at all).
+    #[tokio::test]
+    async fn stop_falls_back_to_a_real_fleet_lane_the_store_never_heard_of() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+
+        let (st, _, _) = send(&app, "POST", "/api/workers/zzz-nolane-af298/stop", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        std::fs::write(home.path().join("sessions/fleet-lane-stop-af298.env"), "").unwrap();
+        let (st, _, body) =
+            send(&app, "POST", "/api/workers/fleet-lane-stop-af298/stop", None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], json!(true), "{body}");
+        assert_eq!(body["worker_id"], json!("fleet-lane-stop-af298"));
+    }
+
     /// AF-288: the promoted `duplicate` route resolves a worker ID, and the
     /// twin it creates is registered in the store rather than left as a bare
     /// env file.
@@ -2633,4 +3698,177 @@ mod tests {
         );
     }
 
+    // AF-651 (gh#202). aicodingND reproduced this on a fresh install: PATCH
+    // /api/workers/<id> {"backend":"__probe__"} answered applied:true and stored
+    // it, deferring the failure to spawn time where it is silently swallowed
+    // (see backend_of_cfg's fallthrough in session_verbs.rs). These pin the
+    // boundary check at the API layer, matching the pattern already proven for
+    // `group` a few lines above it in the source.
+
+    #[tokio::test]
+    async fn create_worker_rejects_an_unknown_backend_string() {
+        let (app, _dir) = app();
+        let (st, _, body) = send(
+            &app,
+            "POST",
+            "/api/workers",
+            Some(json!({ "display_name": "x", "cwd": "/tmp/w", "backend": "__probe__" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "must refuse at creation, not at spawn: {body}");
+        assert_eq!(body["backend"], json!("__probe__"), "the refused value must be named back");
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("herdr") && msg.contains("tmux"), "must name the valid set: {msg}");
+    }
+
+    #[tokio::test]
+    async fn create_worker_accepts_both_real_backends_case_insensitively() {
+        let (app, _dir) = app();
+        for raw in ["herdr", "TMUX", " Tmux "] {
+            let (st, _, body) = send(
+                &app,
+                "POST",
+                "/api/workers",
+                Some(json!({ "display_name": raw, "cwd": "/tmp/w", "backend": raw })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED, "{raw:?} must be accepted: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_worker_rejects_an_unknown_backend_string_before_writing() {
+        let (app, _dir) = app();
+        let id = create(&app, "af651-patch").await;
+        let rev_before = health_rev(&app).await;
+
+        let (st, _, body) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}"),
+            Some(json!({ "backend": "__probe__" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["backend"], json!("__probe__"));
+
+        // THE CELL THAT MATTERS: no write happened. A 400 whose refusal is
+        // cosmetic (the closure already ran) is the exact `applied:true`-beside
+        // -a-value-nothing-honours shape this entry is about, one layer deeper.
+        assert_eq!(health_rev(&app).await, rev_before, "a refused PATCH must not bump revision");
+        let (_, _, got) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(got["backend"], json!("herdr"), "the stored backend must be untouched");
+    }
+
+    #[tokio::test]
+    async fn patch_worker_accepts_a_real_backend_and_applies_it() {
+        let (app, _dir) = app();
+        let id = create(&app, "af651-patch-ok").await;
+        let (st, _, body) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}"),
+            Some(json!({ "backend": "tmux" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let (_, _, got) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(got["backend"], json!("tmux"));
+    }
+
+    // AF-650 (gh#203). `permissions` is a Vec, and the real vocabulary is
+    // FOUR literals across two consumers this crate actually implements
+    // (api/policy.rs's task-dispatch deny, backend/bootstrap.rs's spawn-time
+    // --dangerously-skip-permissions bypass) -- not the two the original
+    // report named, since it missed the second consumer entirely.
+
+    #[tokio::test]
+    async fn create_worker_rejects_an_unknown_permission_string() {
+        let (app, _dir) = app();
+        let (st, _, body) = send(
+            &app,
+            "POST",
+            "/api/workers",
+            Some(json!({ "display_name": "x", "cwd": "/tmp/w", "permissions": ["deny:bash"] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "must refuse at creation, not at spawn: {body}");
+        assert_eq!(body["permissions"], json!(["deny:bash"]), "the refused list must be named back");
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("deny:*") && msg.contains("deny:execute_task")
+                && msg.contains("unsafe") && msg.contains("claude:skip_permissions"),
+            "must name all four real literals, not just the two the original report found: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_worker_accepts_every_real_permission_literal() {
+        let (app, _dir) = app();
+        for lit in ["deny:*", "deny:execute_task", "unsafe", "claude:skip_permissions"] {
+            let (st, _, body) = send(
+                &app,
+                "POST",
+                "/api/workers",
+                Some(json!({ "display_name": lit, "cwd": "/tmp/w", "permissions": [lit] })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED, "{lit:?} must be accepted: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_if_any_entry_in_the_list_is_unknown() {
+        // A mix of one real literal and one fake one must still refuse whole —
+        // partial application of a validated list is its own silent-drop bug.
+        let (app, _dir) = app();
+        let (st, _, body) = send(
+            &app,
+            "POST",
+            "/api/workers",
+            Some(json!({ "display_name": "x", "cwd": "/tmp/w",
+                         "permissions": ["deny:*", "__probe__"] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn patch_worker_rejects_an_unknown_permission_before_writing() {
+        let (app, _dir) = app();
+        let id = create(&app, "af650-patch").await;
+        let rev_before = health_rev(&app).await;
+
+        let (st, _, body) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}"),
+            Some(json!({ "permissions": ["deny:bash"] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+        // THE CELL THAT MATTERS, same shape as the backend test: no write
+        // happened. Composes directly with gh#202/AF-651's own finding --
+        // ["deny:bash"] must not become applied:true anywhere in this API.
+        assert_eq!(health_rev(&app).await, rev_before, "a refused PATCH must not bump revision");
+        let (_, _, got) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(got["permissions"], json!([]), "the stored permissions must be untouched");
+    }
+
+    #[tokio::test]
+    async fn patch_worker_accepts_a_real_permission_and_applies_it() {
+        let (app, _dir) = app();
+        let id = create(&app, "af650-patch-ok").await;
+        let (st, _, body) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}"),
+            Some(json!({ "permissions": ["unsafe"] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let (_, _, got) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+        assert_eq!(got["permissions"], json!(["unsafe"]));
+    }
 }

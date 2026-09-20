@@ -1,0 +1,781 @@
+// Execute shipped browser functions, with deterministic transport/storage seams.
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import vm from 'node:vm';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+const require = createRequire(import.meta.url);
+const { parse } = require('espree');
+const source = readFileSync(new URL('../crates/amux-dashboard/static/app.js', import.meta.url), 'utf8');
+const ast = parse(source, {ecmaVersion: 'latest', range: true});
+function code(name) {
+  const node = ast.body.find(n => n.type === 'FunctionDeclaration' && n.id.name === name);
+  assert.ok(node, 'shipped function exists: ' + name);
+  return source.slice(...node.range);
+}
+function declaration(name) {
+  const node = ast.body.find(n => n.type === 'VariableDeclaration' && n.declarations.some(d => d.id.name === name));
+  assert.ok(node, 'shipped declaration exists: ' + name);
+  return source.slice(...node.range);
+}
+function fixture(names = [], shared = {}) {
+  const stored = shared.stored || new Map();
+  const timers = new Map(); const timerDelays = new Map(); let tid = 0;
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, {value: '', textContent: '', innerHTML: '', style: {}, scrollHeight: 0, setAttribute() {}, classList: {add() {}, remove() {}, contains() {return false;}}});
+    return elements.get(id);
+  };
+  const sandbox = { Response, AbortController, AbortSignal, DOMException, crypto: globalThis.crypto,
+    console, Date, Promise, Set, Map, JSON, Math,
+    location: {origin: 'https://amux.test'}, navigator: {locks: shared.locks || sharedStorage().locks},
+    document: {getElementById: element},
+    localStorage: {setItem(k,v) { stored.set(k,v); }, getItem(k) { return stored.get(k) ?? null; },
+      removeItem(k) { stored.delete(k); }, key(i) { return [...stored.keys()][i] ?? null; }, get length() { return stored.size; }},
+    setTimeout(fn, delay) { timers.set(++tid, fn); timerDelays.set(tid, delay); return tid; }, clearTimeout(id) { timers.delete(id); timerDelays.delete(id); },
+    API: '', offlineQueue: [], drafts: [], online: true, _syncFlight: null, _syncRetryTimer: null, _syncBackoffMs: 0, _SYNC_MIN_MS: 2000, _SYNC_MAX_MS: 60000, _OUTBOX_STALLED_MS:600000,
+    _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _syncChecklist:[], _localWriteError: '', window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
+    _OUTBOX_SKIP: /\/api\/client-debug/, _OUTBOX_METHODS: {POST:1,PATCH:1,PUT:1,DELETE:1},
+    _getDeviceName: () => 'test device', _authHeaders: h => h, esc: s => s, escJs: s => s, describeOp: q => q.url,
+    showToast() {}, amuxTrack() {}, updateConnectionStatus() {}, fetchSessions() {}, fetchBoard() {},
+    _loadCmdHistoryFromServer: () => Promise.resolve(), _peekMessagesBadge() {}, _outboxBoardAcknowledged() {},
+    _waitForMessageReceipt: () => new Promise(() => {}),
+    _origFetch: async () => new Response('{"id":"TASK-1"}', {status:200}),
+    _apiErrText: async r => `${r.status}: ${await r.text()}`,
+  };
+  const ctx = vm.createContext(sandbox);
+  // Load production dependencies too: replay must execute, not fail on a stale fixture.
+  for (const name of ['_syncBannerShownAt', '_RECEIPT_TIMEOUT_MSG', '_geoFix', '_GEO_FIX_MAX_AGE_MS']) vm.runInContext(declaration(name), ctx);
+  for (const name of ['_syncBannerBeacon', '_sendContext', '_pendingStop', '_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_outboxLock', '_mutateQueue', '_outboxQueueable', '_outboxMessageId', '_outboxUncertainMessage', '_outboxConfirmMessage', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_clearSyncTransientToast', '_runSyncBanner', 'runSyncBanner', ...names]) vm.runInContext(code(name), ctx);
+  return {ctx, stored, timers, timerDelays, element};
+}
+const patch = {method:'PATCH', body:'{"title":"saved","expect_rev":1}'};
+async function enqueue(ctx) { assert.equal(await ctx._queueOp('/api/board/TASK-1', patch), true); }
+
+test('queue is durable throughout replay, and simultaneous flushes share one delivery', async () => {
+  const {ctx, stored} = fixture(); await enqueue(ctx);
+  let finish; let calls = 0;
+  ctx._origFetch = () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+  const first = ctx.runSyncBanner(); const second = ctx.runSyncBanner();
+  assert.equal(first, second);
+  await new Promise(setImmediate);
+  assert.equal(JSON.parse(stored.get('amux_offline_queue')).length, 1);
+  assert.equal(calls, 1);
+  finish(new Response('{"id":"TASK-1"}', {status:200}));
+  await first;
+  assert.equal(JSON.parse(stored.get('amux_offline_queue')).length, 0);
+});
+
+test('500 and restart retain exact intent; a later acknowledged retry drains it', async () => {
+  const first = fixture(); await enqueue(first.ctx);
+  first.ctx._origFetch = async () => new Response('timed out waiting for connection', {status:500});
+  await first.ctx.runSyncBanner();
+  const bytes = first.stored.get('amux_offline_queue');
+  assert.equal(JSON.parse(bytes)[0].options.body, patch.body);
+  assert.match(first.ctx._writeError, /timed out/);
+  const restarted = fixture(); restarted.ctx.offlineQueue = JSON.parse(bytes); restarted.stored.set('amux_offline_queue', bytes);
+  await restarted.ctx.runSyncBanner();
+  assert.equal(restarted.ctx.offlineQueue.length, 0);
+});
+
+test('a timeout ends replay without deleting intent and permits another attempt', async () => {
+  const {ctx, timers} = fixture(); await enqueue(ctx);
+  ctx._origFetch = (_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new DOMException('Timed out', 'AbortError')));
+  });
+  const first = ctx.runSyncBanner();
+  await new Promise(setImmediate);
+  // _queueOp scheduled the background retry first; fire only request timeout.
+  [...timers.values()].at(-1)();
+  await first;
+  assert.equal(ctx.offlineQueue.length, 1);
+  assert.equal(ctx._syncFlight, null);
+  ctx._origFetch = async () => new Response('{"id":"TASK-1"}', {status:200});
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 0);
+});
+
+test('409 retains a visible blocked intent and automatic retries do not overwrite peer work', async () => {
+  const {ctx} = fixture(); await enqueue(ctx); let calls = 0;
+  ctx._origFetch = async () => { calls++; return new Response('rev conflict', {status:409}); };
+  await ctx.runSyncBanner(); await ctx.runSyncBanner();
+  assert.equal(calls, 1);
+  assert.equal(ctx.offlineQueue[0].state, 'blocked');
+  assert.match(ctx.offlineQueue[0].error, /rev conflict/);
+});
+
+test('full device storage refuses a new queue entry without false acceptance', async () => {
+  const {ctx} = fixture();
+  ctx.localStorage.setItem = () => { throw new DOMException('ENOSPC', 'QuotaExceededError'); };
+  assert.equal(await ctx._queueOp('/api/board/TASK-1', patch), false);
+  assert.equal(ctx.offlineQueue.length, 0);
+  assert.match(ctx._writeError, /not safely queued/);
+});
+
+test('full queue preserves all older writes and refuses the new one', async () => {
+  const {ctx, stored} = fixture();
+  ctx.offlineQueue = Array.from({length:200}, (_,id) => ({id}));
+  stored.set('amux_offline_queue', JSON.stringify(ctx.offlineQueue));
+  assert.equal(await ctx._queueOp('/api/board/TASK-1', patch), false);
+  assert.equal(ctx.offlineQueue[0].id, 0);
+  assert.equal(ctx.offlineQueue.length, 200);
+});
+
+test('wrong-card acknowledgement retains the queued mutation', async () => {
+  const {ctx} = fixture(); await enqueue(ctx);
+  ctx._origFetch = async () => new Response('{"id":"OTHER-2"}', {status:200});
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 1);
+  assert.match(ctx._writeError, /exact card/);
+});
+
+test('editor refuses loading/stale identity and pins its target across asynchronous gate confirmation', async () => {
+  const {ctx, element} = fixture(['boardDetailSave']);
+  Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:2, _bdHydrated:true,
+    _bdLoadedIdentity:{id:'TASK-1',generation:1,rev:1}, _tagState:{bd:[]}, _boardDrafts:{},
+    boardItems:[{id:'TASK-1',status:'todo'}], boardDetailStatus:'doing', _boardDraftsPersist() {},
+    _bdAudit(kind, detail) {ctx.audit = {kind, detail};},
+    _boardDetailIdentityDiscard() { ctx.discarded = true; }, updateBoardItem() { throw new Error('must not save'); }});
+  element('bd-title').value = 'Old card content';
+  assert.equal(await ctx.boardDetailSave(), false);
+  assert.equal(ctx.audit.kind, 'card-save-refused');
+  assert.equal(ctx.audit.detail.verdict, 'card_identity_unloaded');
+  assert.equal(ctx.audit.detail.measured, true);
+  ctx._bdLoadedIdentity.generation = 2;
+  ctx._gateConfirm = async () => {ctx.boardDetailId='TASK-2'; ctx._boardDetailOpenGeneration++; return true;};
+  assert.equal(await ctx.boardDetailSave(), false);
+  assert.equal(ctx.discarded, true);
+  assert.equal(ctx._boardDrafts['TASK-1'].title, 'Old card content');
+  assert.equal(ctx._boardDrafts['TASK-2'], undefined);
+});
+
+
+test('message retry carries the same server deduplication ID as the first attempt', async () => {
+  const {ctx} = fixture(['_outboxRequestOptions']);
+  const first = ctx._outboxRequestOptions('/api/sessions/lane/send', {method:'POST', body:'{"text":"continue"}'});
+  const id = JSON.parse(first.body).msg_id;
+  assert.ok(id);
+  assert.equal(await ctx._queueOp('/api/sessions/lane/send', first), true);
+  assert.equal(JSON.parse(ctx.offlineQueue[0].options.body).msg_id, id);
+  assert.equal(ctx._outboxRequestOptions('/api/sessions/lane/send', first), first);
+});
+
+test('editor keeps its draft on failed save and reports Saved only after acknowledgement', async () => {
+  const {ctx, element} = fixture(['boardDetailSave']);
+  Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:2, _bdHydrated:true,
+    _bdLoadedIdentity:{id:'TASK-1',generation:2,rev:1}, _tagState:{bd:[]}, _boardDrafts:{},
+    boardItems:[{id:'TASK-1',status:'todo'}], boardDetailStatus:'todo', _boardDraftsPersist() {},
+    updateBoardItem: async () => false});
+  element('bd-title').value = 'Retained draft';
+  assert.equal(await ctx.boardDetailSave(), false);
+  assert.match(element('bd-save-status').textContent, /Not saved/);
+  assert.equal(ctx._boardDrafts['TASK-1'].title, 'Retained draft');
+  ctx.updateBoardItem = async (id, body) => ({id, ...body, rev:2});
+  await ctx.boardDetailSave();
+  assert.equal(element('bd-save-status').textContent, 'Saved');
+  assert.equal(ctx._boardDrafts['TASK-1'], undefined);
+  assert.equal(ctx._bdLoadedIdentity.rev, 2);
+});
+
+test('connection status follows reads while pending write errors remain visible on their operations', () => {
+  const {ctx, element} = fixture(['updateConnectionStatus']);
+  const connection = element('connection');
+  ctx.document.querySelectorAll = () => [connection];
+  Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'',
+    _liveSSE:true, _recordConnState() {}, _sessionReadNotice:() => ''});
+  ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Live');
+  ctx._writeError = '500: pool timeout';
+  ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Live');
+  assert.equal(ctx._writeError, '500: pool timeout', 'a live connection does not erase the failed write');
+  ctx.offlineQueue = [{url:'/api/board/TASK-1',timestamp:Date.now(),error:ctx._writeError}];
+  ctx.updateConnectionStatus(); assert.equal(connection.textContent, '1 pending');
+  assert.match(element('offline-ops').innerHTML, /500: pool timeout/, 'the failed operation retains its actionable error');
+  ctx._writeError = ''; ctx.offlineQueue = []; ctx._boardReadError = '500';
+  ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Sync error');
+  ctx._boardReadError = ''; ctx._syncReadError = 'network_error';
+  ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Sync error');
+  ctx._sessionLoadError = {status:401};
+  ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Access required');
+});
+
+function sharedStorage() {
+  const flights = new Map();
+  return {stored: new Map(), locks: {request(name, work) {
+    const flight = (flights.get(name) || Promise.resolve()).then(work);
+    flights.set(name, flight.catch(() => {}));
+    return flight;
+  }}};
+}
+
+test('concurrent tabs append without overwriting another tab and replay each intent once', async () => {
+  const shared = sharedStorage();
+  const a = fixture([], shared); const b = fixture([], shared);
+  await Promise.all([a.ctx._queueOp('/api/board/TASK-1', patch), b.ctx._queueOp('/api/board/TASK-2', patch)]);
+  assert.equal(JSON.parse(shared.stored.get('amux_offline_queue')).length, 2);
+  const delivered = [];
+  for (const {ctx} of [a,b]) ctx._origFetch = async url => {
+    delivered.push(url);
+    return new Response(JSON.stringify({id:url.split('/').pop()}), {status:200});
+  };
+  await Promise.all([a.ctx.runSyncBanner(), b.ctx.runSyncBanner()]);
+  assert.deepEqual(delivered.sort(), ['/api/board/TASK-1','/api/board/TASK-2']);
+  assert.equal(JSON.parse(shared.stored.get('amux_offline_queue')).length, 0);
+});
+
+test("acknowledging an in-flight write does not erase a different tab's new intent", async () => {
+  const shared = sharedStorage(); const a = fixture([], shared); const b = fixture([], shared);
+  await enqueue(a.ctx);
+  let finish;
+  a.ctx._origFetch = () => new Promise(resolve => { finish = resolve; });
+  const flight = a.ctx.runSyncBanner(); await new Promise(setImmediate);
+  await b.ctx._queueOp('/api/board/TASK-2', patch);
+  finish(new Response('{"id":"TASK-1"}', {status:200}));
+  await flight;
+  const pending = JSON.parse(shared.stored.get('amux_offline_queue'));
+  assert.equal(pending.length, 1); assert.equal(pending[0].url, '/api/board/TASK-2');
+});
+
+test('an acknowledgement preserves newer editor keystrokes and advances their expected revision', async () => {
+  const {ctx, element} = fixture(['boardDetailSave']);
+  let finish;
+  Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:2, _bdHydrated:true,
+    _bdLoadedIdentity:{id:'TASK-1',generation:2,rev:1}, _tagState:{bd:[]}, _boardDrafts:{},
+    boardItems:[{id:'TASK-1',status:'todo'}], boardDetailStatus:'todo', _boardDraftsPersist() {},
+    updateBoardItem: () => new Promise(resolve => { finish = resolve; })});
+  element('bd-title').value = 'Submitted edit';
+  const save = ctx.boardDetailSave();
+  assert.equal(await ctx.boardDetailSave(), false, 'a second click cannot submit the same revision twice');
+  element('bd-title').value = 'Later unsaved edit';
+  finish({id:'TASK-1',rev:2}); await save;
+  assert.equal(ctx._boardDrafts['TASK-1'].title, 'Later unsaved edit');
+  assert.equal(ctx._boardDrafts['TASK-1'].expect_rev, 2);
+  assert.match(element('bd-save-status').textContent, /newer changes not saved/);
+});
+
+
+test('ignored board fields cannot acknowledge or silently drain an edit', async () => {
+  const {ctx} = fixture(); await enqueue(ctx);
+  ctx._origFetch = async () => new Response('{"id":"TASK-1","ignored_fields":["gate"]}');
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 1);
+  assert.equal(ctx.offlineQueue[0].state, 'blocked');
+  assert.match(ctx._writeError, /ignored gate/);
+});
+
+test('a failed worker start retains the draft and a restart retries only unfinished steps', async () => {
+  const {ctx, stored} = fixture();
+  Object.assign(ctx, {render() {}, _applyYoloDefault:async () => {},
+    saveDrafts() {stored.set('drafts', JSON.stringify(ctx.drafts));},
+    removeDraft(name) {ctx.drafts = ctx.drafts.filter(d => d.name !== name);}});
+  ctx.drafts = [{name:'fixture',dir:'/tmp/fixture',prompt:'one prompt'}];
+  ctx._origFetch = async url => new Response(url.endsWith('/start') ? 'pool timeout' : '{}', {status:url.endsWith('/start') ? 500 : 200});
+  await ctx.runSyncBanner();
+  assert.equal(ctx.drafts.length, 1);
+  assert.equal(ctx.drafts[0].synced_create, true);
+  assert.match(ctx.drafts[0].error, /Start worker/);
+  // Reconstruct exactly the persisted draft, as a page restart would.
+  ctx.drafts = JSON.parse(stored.get('drafts'));
+  const calls = []; let firstId;
+  ctx._origFetch = async (url, options) => {
+    calls.push(url);
+    if (url.endsWith('/send')) { firstId = JSON.parse(options.body).msg_id; return new Response('lost response', {status:500}); }
+    return new Response('{}');
+  };
+  await ctx.runSyncBanner();
+  assert.equal(calls.some(url => url === '/api/sessions'), false);
+  ctx.drafts = JSON.parse(stored.get('drafts'));
+  ctx._origFetch = async (url, options) => {
+    assert.ok(url.endsWith('/send'));
+    assert.equal(JSON.parse(options.body).msg_id, firstId);
+    return new Response('{}');
+  };
+  await ctx.runSyncBanner();
+  assert.equal(ctx.drafts.length, 0);
+  assert.equal(ctx._writeError, '');
+});
+
+
+test('a board poll during hydration cannot make stale controls look like user edits', async () => {
+  const {ctx, element} = fixture(['_bdHydrate']);
+  let finish;
+  Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:2, _bdHydrated:false,
+    _bdActiveDirty:false, _boardDrafts:{}, _tagState:{bd:[]},
+    boardItems:[{id:'TASK-1', title:'Old snapshot', status:'todo'}],
+    _bdReadSnapshot:() => new Promise(resolve => {finish = resolve;}),
+    _bdDraftHasActiveEdits:() => false, _renderDetailStatusBtns() {}, _bdRenderHistory() {},
+    _bdRenderStatusBanner() {}, _bdRenderMeta() {}, _populateSessionSelect() {}, _bdConfigureGo() {},
+    _beTagRenderChips() {}, _beTagInputUpdate() {}});
+  element('bd-title').value = 'Old snapshot';
+  const hydration = ctx._bdHydrate('TASK-1');
+  const fresh = {id:'TASK-1', title:'Committed update', status:'todo', rev:2};
+  ctx.boardItems = [fresh];
+  finish(fresh);
+  assert.equal(await hydration, true);
+  assert.equal(element('bd-title').value, 'Committed update');
+  assert.equal(ctx._bdLoadedIdentity.rev, 2);
+});
+
+
+test("unavailable storage coordination refuses a write instead of risking another tab's pending data", async () => {
+  const {ctx, stored} = fixture();
+  ctx.navigator.locks = undefined;
+  assert.equal(await ctx._queueOp('/api/board/TASK-1', patch), false);
+  assert.equal(stored.has('amux_offline_queue'), false);
+  assert.match(ctx._writeError, /storage is unavailable/);
+});
+
+
+test('message receipt loss replays the same msg_id after reload; dedup receipt drains it', async () => {
+  const first = fixture();
+  const body = JSON.stringify({text:'one logical message', msg_id:'stable-message-id'});
+  await first.ctx._queueOp('/api/sessions/owned/send', {method:'POST', body});
+  let delivered;
+  first.ctx._origFetch = async (_, opts) => { delivered = opts.body; throw new Error('receipt lost after delivery'); };
+  await first.ctx.runSyncBanner();
+  assert.equal(delivered, body);
+  const second = fixture([], {stored:first.stored});
+  second.ctx._origFetch = async (_, opts) => {
+    assert.equal(opts.body, body);
+    return new Response(JSON.stringify({ok:true,deduped:true}));
+  };
+  await second.ctx.runSyncBanner();
+  assert.equal(JSON.parse(first.stored.get('amux_offline_queue')).length, 0);
+});
+
+test('ambiguous 200 checks acceptance and preserves ordering behind it across retries', async () => {
+  const {ctx, stored} = fixture();
+  for (const text of ['first','second']) await ctx._queueOp('/api/sessions/owned/send', {method:'POST',body:JSON.stringify({text,msg_id:text})});
+  const calls = [];
+  ctx._origFetch = async (url,opts) => { calls.push({url,method:opts.method}); return new Response(JSON.stringify({ok:true,submitted:false})); };
+  await ctx.runSyncBanner();
+  const saved = JSON.parse(stored.get('amux_offline_queue'));
+  assert.equal(calls.length, 1);
+  assert.equal(saved.length, 2);
+  assert.equal(saved[0].state, 'pending');assert.equal(saved[0].delivery_uncertain,true);
+  await ctx.runSyncBanner();
+  assert.deepEqual(calls.map(r=>r.method),['POST','GET'],'only a receipt read may follow uncertain acceptance');
+  // The receipt read carries the text (AMUX-4594), so the server can settle a
+  // reservation no live send owns from the lane transcript instead of leaving it
+  // uncertain forever. Still a GET for the SAME msg_id, and still nothing behind it.
+  assert.equal(calls[1].url,'/api/sessions/owned/send?msg_id=first&text=first');
+  assert.equal(JSON.parse(stored.get('amux_offline_queue')).length,2,'later message remains durable and unsubmitted');
+});
+
+test('server deferred and steering receipts acknowledge storage without claiming terminal submission', async () => {
+  for (const [endpoint, receipt] of [['send',{ok:true,submitted:null,submission:'deferred'}], ['steer',{ok:true,id:'steer-123',deliverable:false}]]) {
+    const {ctx,stored} = fixture();
+    await ctx._queueOp('/api/sessions/owned/'+endpoint, {method:'POST',body:JSON.stringify({text:'queued server-side',msg_id:endpoint})});
+    ctx._origFetch = async () => new Response(JSON.stringify(receipt));
+    await ctx.runSyncBanner();
+    assert.equal(JSON.parse(stored.get('amux_offline_queue')).length, 0);
+  }
+});
+
+test('replay retries a durable message even while connectivity is believed offline', async () => {
+  const {ctx, stored, timers} = fixture();
+  await enqueue(ctx);
+  ctx.online = false;
+  const retry = [...timers.values()].at(-1);
+  assert.ok(retry);
+  retry();
+  await ctx._syncFlight;
+  assert.equal(ctx.offlineQueue.length, 0);
+  assert.deepEqual(JSON.parse(stored.get('amux_offline_queue')), []);
+  assert.equal(ctx._syncBackoffMs, 0, 'successful drain resets outage backoff');
+});
+
+test('a newly queued send stays quiet while a stuck send shows its waiting state', () => {
+  const {ctx, element} = fixture(['updateConnectionStatus']);
+  ctx.document.querySelectorAll = () => [];
+  Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'',
+    _liveSSE:true, _recordConnState() {}, _sessionReadNotice:() => ''});
+  const classes = new Set();
+  element('offline-banner').classList = {add: x=>classes.add(x), remove:x=>classes.delete(x)};
+  ctx.offlineQueue = [{url:'/api/sessions/worker/send',timestamp:Date.now()}];
+  ctx.updateConnectionStatus();
+  assert.equal(classes.has('active'), false);
+  ctx.offlineQueue[0].timestamp -= 600001;
+  ctx.updateConnectionStatus();
+  assert.equal(classes.has('active'), true);
+  assert.match(element('offline-banner-title').innerHTML, /1 stalled/);
+  ctx.online = false;
+  ctx.updateConnectionStatus();
+  assert.match(element('offline-banner-title').innerHTML, /will send on reconnect/);
+});
+
+
+test('Send and Queue use durable local acceptance before any network attempt', async () => {
+  const {ctx, stored} = fixture(['_isLocallyQueued', 'doSend', 'steerSession']);
+  let direct = 0;
+  ctx._origFetch = async () => { direct++; return new Response('{"ok":true,"submitted":true,"id":"server-steer"}'); };
+  ctx.showSendingIndicator = () => {};
+  ctx._stampSendTime = text => text;
+  ctx._cloudEmail = ''; ctx._localMemberEmail = '';
+  ctx.sessions = []; ctx.peekSession = null; ctx._steeringUpdateBadge = () => {}; ctx.render = () => {};
+  ctx.fetch = async (url, options) => {
+    assert.equal(await ctx._queueOp(url, options), true);
+    return new Response('{"ok":true,"queued":true}', {status:202, headers:{'X-Amux-Outbox':'queued'}});
+  };
+  assert.equal(await ctx.doSend('worker', 'durable send'), 'queued');
+  assert.equal(await ctx.steerSession('worker', 'durable steer'), true);
+  assert.equal(direct, 0, 'neither mode may bypass the outbox');
+  const saved = JSON.parse(stored.get('amux_offline_queue'));
+  assert.equal(saved.length, 2);
+  assert.ok(saved.every(q => JSON.parse(q.options.body).msg_id));
+});
+
+test('ordinary message acceptance and automatic retries do not open delivery progress', async () => {
+  const {ctx, timers} = fixture();
+  const toasts = []; ctx.showToast = value => toasts.push(value);
+  assert.equal(await ctx._queueOp('/api/sessions/worker/send', {method:'POST', body:'{"text":"local intent"}'}), true);
+  assert.deepEqual(toasts, []);
+  let quiet;
+  ctx.runSyncBanner = value => { quiet = value; };
+  [...timers.values()].at(-1)();
+  assert.equal(quiet, true, 'automatic replay must leave the progress banner closed');
+});
+
+test('composer pending notice is quiet for ordinary delivery, visible for a delayed or offline message', () => {
+  const {ctx, element} = fixture(['_pendingSendsFor', '_updatePendingPill']);
+  ctx.peekSession = 'worker';
+  ctx.offlineQueue = [{url:'/api/sessions/worker/send',timestamp:Date.now(),options:{body:'{"text":"saved message"}'}}];
+  ctx._updatePendingPill();
+  assert.equal(element('peek-pending-pill').style.display, 'none');
+  ctx.offlineQueue[0].error = 'temporary server refusal';
+  ctx._updatePendingPill();
+  assert.equal(element('peek-pending-pill').style.display, '');
+  assert.match(element('peek-pending-pill').innerHTML, /message waiting/);
+  delete ctx.offlineQueue[0].error;
+  ctx.online = false;
+  ctx._updatePendingPill();
+  assert.match(element('peek-pending-pill').innerHTML, /saved offline/);
+});
+
+test('exact durable receipt drains local intent while the original POST remains unfinished', async () => {
+  const {ctx,stored,timers}=fixture(['_waitForMessageReceipt']);
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:JSON.stringify({text:'already in native queue',msg_id:'receipt-race'})});
+  let finish;let posts=0;let reads=0;
+  ctx._origFetch=(url)=>{
+    if(url.includes('?msg_id=')){reads++;return Promise.resolve(new Response(JSON.stringify({ok:true,accepted:true,msg_id:'receipt-race',id:'accepted-one'})));}
+    posts++;return new Promise(resolve=>{finish=resolve;});
+  };
+  const replay=ctx.runSyncBanner();await new Promise(setImmediate);
+  assert.ok(JSON.parse(stored.get('amux_offline_queue'))[0].attempted_at);
+  [...timers.values()].at(-1)(); // the receipt delay, while POST stays held
+  await replay;
+  assert.equal(posts,1);assert.equal(reads,1);assert.equal(ctx.offlineQueue.length,0);
+  finish(new Response('{"ok":true,"submitted":true}'));await new Promise(setImmediate);
+});
+
+test('an unaccepted or wrong-identity receipt never clears the local message',async()=>{
+  for(const receipt of [{ok:true,accepted:false,msg_id:'wanted'},{ok:true,accepted:true,msg_id:'other',id:'not-ours'}]){
+    const {ctx,timers}=fixture(['_waitForMessageReceipt']);
+    await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"retain","msg_id":"wanted"}'});
+    let finish;ctx._origFetch=url=>url.includes('?msg_id=')?Promise.resolve(new Response(JSON.stringify(receipt))):new Promise(resolve=>{finish=resolve});
+    const replay=ctx.runSyncBanner();await new Promise(setImmediate);[...timers.values()].at(-1)();await new Promise(setImmediate);
+    assert.equal(ctx.offlineQueue.length,1);
+    finish(new Response('temporarily unavailable',{status:503}));await replay;
+    assert.equal(ctx.offlineQueue.length,1);
+  }
+});
+
+test('an attempted local send cannot be cancelled as though it never reached the server',async()=>{
+  const {ctx,stored}=fixture(['_pendingCancel']);ctx._peekMessagesRender=()=>{};
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"retain"}'});
+  await ctx._mutateQueue(rows=>{rows[0].attempted_at=Date.now()});
+  await ctx._pendingCancel(ctx.offlineQueue[0].id);assert.equal(JSON.parse(stored.get('amux_offline_queue')).length,1);
+  await ctx._mutateQueue(rows=>{delete rows[0].attempted_at});
+  await ctx._pendingCancel(ctx.offlineQueue[0].id);assert.equal(ctx.offlineQueue.length,0);
+});
+
+
+test('new input during a replay starts next tick instead of waiting for outage backoff', async () => {
+  const {ctx,timers,timerDelays}=fixture();
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"first","msg_id":"one"}'});
+  let release;const posts=[];
+  ctx._origFetch=(_url,init)=>{
+    posts.push(JSON.parse(init.body).msg_id);
+    return posts.length===1 ? new Promise(resolve=>release=resolve)
+      : Promise.resolve(new Response('{"ok":true,"submitted":true}'));
+  };
+  const replay=ctx.runSyncBanner();await new Promise(setImmediate);
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"second","msg_id":"two"}'});
+  assert.equal(ctx.runSyncBanner(),replay);
+  release(new Response('{"ok":true,"submitted":true}'));await replay;
+  assert.equal(timerDelays.get(ctx._syncRetryTimer),0);
+  timers.get(ctx._syncRetryTimer)();await ctx._syncFlight;
+  assert.deepEqual(posts,['one','two']);assert.equal(ctx.offlineQueue.length,0);
+});
+
+test('post-input terminal polling is lightweight, serial and bounded', async () => {
+  const {ctx,timers,timerDelays}=fixture(['_peekPollInterval','_stopPeekPoll','_schedulePeekPoll','_peekKickFast','_refreshPeekSoon']);
+  let now=1000;const refreshes=[];
+  Object.assign(ctx,{performance:{now:()=>now},peekSession:'lane',peekTimer:null,_peekUrgentUntil:0,_peekLastChangeMs:0,
+    _peekPollGen:0,_peekPollActive:false,_peekPollSession:null,_peekPrevStatus:'active',_peekFullPending:false,_peekLastFullMs:900,_PEEK_HISTORY_REFRESH_MS:30000,
+    sessions:[{name:'lane',status:'waiting'}],_peekPollBeacon(){},_peekUpdateBranch(){},refreshPeek:async live=>refreshes.push(live)});
+  ctx._refreshPeekSoon();assert.equal(timerDelays.get(ctx.peekTimer),40);
+  await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true]);
+  assert.equal(timerDelays.get(ctx.peekTimer),100);
+  now=3000;await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true,false]);
+  assert.ok(timerDelays.get(ctx.peekTimer)>100);
+  ctx.document.hidden=true;ctx._schedulePeekPoll();assert.equal(ctx.peekTimer,null);
+});
+
+
+test('distinct fast taps fire while synthetic click echoes remain suppressed', () => {
+  const {ctx}=fixture(['_btnGestureStart','_btnFire','_btnTouchStart']);
+  let now=1000;let calls=0;
+  const button={closest:()=>button};
+  Object.assign(ctx,{performance:{now:()=>now},_tapTrace:[],_tapTraceEv(){},_btnDbg(){},_btnTouchX:0,_btnTouchY:0});
+  const event=type=>({type,target:button,currentTarget:button,detail:1});
+  ctx._btnGestureStart(event('pointerdown'));ctx._btnFire(event('pointerup'),()=>calls++);
+  ctx._btnFire(event('click'),()=>calls++);assert.equal(calls,1);
+  now+=40;ctx._btnGestureStart(event('pointerdown'));ctx._btnFire(event('pointerup'),()=>calls++);
+  ctx._btnFire(event('click'),()=>calls++);assert.equal(calls,2);
+  now+=40;ctx._btnTouchStart({...event('touchstart'),touches:[{clientX:1,clientY:1}]});
+  ctx._btnFire(event('touchend'),()=>calls++);ctx._btnFire(event('click'),()=>calls++);assert.equal(calls,3);
+});
+
+
+test('offline banner distinguishes blocked work from changes that will retry', () => {
+  const {ctx, element} = fixture(['updateConnectionStatus']);
+  ctx.document.querySelectorAll = () => [];
+  Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'',
+    _liveSSE:false, _recordConnState() {}, _sessionReadNotice:() => '', online:false});
+  ctx.offlineQueue = [{id:'blocked',state:'blocked',error:'409: revision conflict',url:'/api/board/TASK-1',timestamp:Date.now()}];
+  ctx.updateConnectionStatus();
+  let title = element('offline-banner-title').innerHTML;
+  assert.match(title, /Offline/);
+  assert.match(title, /1 failed op/);
+  assert.match(title, /review/);
+  assert.doesNotMatch(title, /will send on reconnect/);
+  ctx.offlineQueue.push({id:'pending',url:'/api/board/TASK-2',timestamp:Date.now()});
+  ctx.updateConnectionStatus();
+  title = element('offline-banner-title').innerHTML;
+  assert.match(title, /1 queued, will send on reconnect/);
+  assert.match(title, /1 failed/);
+  assert.doesNotMatch(title, /2 (ops|queued)/);
+  ctx.online = true;
+  ctx.updateConnectionStatus();
+  assert.match(element('offline-banner-title').innerHTML, /1 sending, 1 failed/);
+  ctx.offlineQueue = [{id:'stalled',url:'/api/board/TASK-2',timestamp:Date.now()-3*60*60*1000}];
+  ctx.updateConnectionStatus();
+  title = element('offline-banner-title').innerHTML;
+  assert.match(title, /1 stalled 3h/);
+  assert.match(title, /review/);
+  assert.doesNotMatch(title, /sending|_clearBlockedOps/);
+});
+
+test('a stale failed-row dismiss cannot remove work another tab has resumed', async () => {
+  const {ctx, stored} = fixture(['_dismissQueuedOp', '_clearBlockedOps']);
+  const old = {id:'resumed',state:'blocked',url:'/api/board/TASK-1'};
+  ctx.offlineQueue = [old];
+  stored.set('amux_offline_queue',JSON.stringify([{...old,state:'pending'},{id:'still-blocked',state:'blocked',url:'/api/board/TASK-2'}]));
+  const events=[];ctx.amuxTrack=(...args)=>events.push(args);
+  await ctx._dismissQueuedOp('resumed');
+  assert.deepEqual(JSON.parse(stored.get('amux_offline_queue')).map(q=>q.id),['resumed','still-blocked']);
+  assert.equal(events[0][0],'outbox_dismiss_ignored');
+  await ctx._clearBlockedOps();
+  assert.deepEqual(JSON.parse(stored.get('amux_offline_queue')).map(q=>q.id),['resumed']);
+});
+
+
+test('uncertain message receipt never becomes a synced checkmark or deletes intent', async()=>{
+  const {ctx,stored,element}=fixture();
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:JSON.stringify({text:'with @/tmp/evidence.txt',msg_id:'uncertain'})});
+  ctx._origFetch=async()=>new Response(JSON.stringify({ok:false,submission:'uncertain'}),{status:409});
+  await ctx.runSyncBanner();
+  const rows=JSON.parse(stored.get('amux_offline_queue'));
+  assert.equal(rows.length,1);assert.equal(rows[0].state,'pending');assert.equal(rows[0].delivery_uncertain,true);
+  assert.equal(JSON.parse(rows[0].options.body).msg_id,'uncertain');
+  assert.equal(element('sync-title-text').textContent,'0 synced, 1 awaiting confirmation');
+  assert.doesNotMatch(element('sync-items').innerHTML,/sync-item done/);
+});
+
+test('steering rows survive reload and time passage without merging identical requests',async()=>{
+  const {ctx,stored}=fixture(['_steerQueueFor']);
+  for(const id of ['one','two'])await ctx._queueOp('/api/sessions/worker/steer',{method:'POST',body:JSON.stringify({text:'same text',msg_id:id})});
+  await ctx._mutateQueue(q=>{for(const r of q)r.timestamp-=600000});
+  const reloaded=fixture(['_steerQueueFor'],{stored});
+  reloaded.ctx.offlineQueue=reloaded.ctx._readQueue();
+  const rows=reloaded.ctx._steerQueueFor({name:'worker',steering:[]});
+  assert.equal(rows.length,2);assert.ok(rows.every(r=>r.pending));assert.notEqual(rows[0].id,rows[1].id);
+  await reloaded.ctx._mutateQueue(q=>q.splice(0,q.length));
+  assert.equal(reloaded.ctx._steerQueueFor({name:'worker',steering:[]}).length,0,'delivered steering leaves no optimistic ghost');
+});
+
+
+test('quiet batches show individual receipts while one ordinary send stays quiet', async()=>{
+  for(const count of [1,2]) {
+    const {ctx,element}=fixture();let shown=false;
+    element('sync-banner').classList.add=()=>{shown=true};
+    for(let i=0;i<count;i++)await ctx._queueOp('/api/board/TASK-'+i,patch);
+    ctx._origFetch=async url=>new Response(JSON.stringify({id:url.split('/').pop()}),{status:200});
+    await ctx.runSyncBanner(true);
+    assert.equal(shown,count>=2);
+    assert.equal(ctx.offlineQueue.length,0);
+  }
+});
+
+test('offline board editing requires a complete versioned snapshot and never masks an HTTP refusal', async () => {
+  const {ctx} = fixture(['_bdCompleteSnapshot', '_bdReadSnapshot']);
+  const full = {id:'TASK-1', title:'Cached task', desc:'Keep this prose', status:'todo', rev:7,
+    session:null, due:null, due_time:null, tags:[], gate:['Preserve evidence']};
+  let cached = full, writes = 0, reads = 0;
+  Object.assign(ctx, {online:false, _bdAudit() {}, _idb:{
+    getIssue:async () => {reads++; return cached;}, putIssue:async () => {writes++;},
+  }});
+  assert.equal((await ctx._bdReadSnapshot('TASK-1')).rev, 7);
+  for (const invalid of [{...full, id:'TASK-2'}, {...full, rev:null}, {...full, deleted:1},
+    {...full, desc:undefined}, {...full, gate:null}, {...full, session:undefined}]) {
+    cached = invalid;
+    assert.equal(await ctx._bdReadSnapshot('TASK-1'), null);
+  }
+  cached = full; ctx.online = true;
+  for (const status of [403,404,409,503]) {
+    const before = reads;
+    ctx.fetch = async () => new Response('{}', {status});
+    assert.equal(await ctx._bdReadSnapshot('TASK-1'), null);
+    assert.equal(reads, before, 'a server refusal must not fall back to a stale row');
+  }
+  ctx.fetch = async () => {throw new TypeError('Network unavailable');};
+  assert.equal((await ctx._bdReadSnapshot('TASK-1')).desc, full.desc);
+  ctx.fetch = async () => new Response(JSON.stringify({...full, rev:8}));
+  assert.equal((await ctx._bdReadSnapshot('TASK-1')).rev, 8);
+  assert.equal(writes, 1);
+});
+
+test('offline snapshot hydration cannot authorize a different card after navigation', async () => {
+  const {ctx} = fixture(['_bdHydrate']);
+  let resolve;
+  Object.assign(ctx, {boardDetailId:'TASK-1', _boardDetailOpenGeneration:1,
+    boardItems:[], _bdHydrated:false, _bdLoadedIdentity:null,
+    _bdReadSnapshot:() => new Promise(done => {resolve=done;})});
+  const pending = ctx._bdHydrate('TASK-1');
+  ctx.boardDetailId='TASK-2'; ctx._boardDetailOpenGeneration=2;
+  resolve({id:'TASK-1', rev:7});
+  assert.equal(await pending, false);
+  assert.equal(ctx._bdHydrated, false);
+  assert.equal(ctx._bdLoadedIdentity, null);
+});
+
+test('file reconnect checks only a confirmed durable receipt and retains failed bytes for retry', async () => {
+  const {ctx, element, timers} = fixture(['_syncOneUpload']);
+  let rows = [{id:'file-1', name:'evidence.bin', surface:'directory', totalChunks:2}];
+  let confirm; const refreshed=[];
+  Object.assign(ctx, {_filesPath:'/folder', _explorePath:'/folder', loadFiles:path => refreshed.push('files:' + path), loadExplore:path => refreshed.push('explore:' + path),
+    _upqList:async () => rows, _storedUploadFile:() => ({}), _uploadStorageError() {}, _upqRenderBadge() {},
+    _upqRemove:async id => {rows = rows.filter(row => row.id !== id);},
+    _runUpload:async f => {await new Promise(resolve => {confirm = resolve;}); f.error='Connection dropped';},
+  });
+  const replay = ctx.runSyncBanner(); await new Promise(setImmediate);
+  assert.equal(rows.length, 1);
+  assert.match(element('sync-items').innerHTML, /running/);
+  assert.doesNotMatch(element('sync-items').innerHTML, /sync-item done/);
+  confirm(); await replay;
+  assert.equal(rows.length, 1);
+  assert.equal(element('sync-title-text').textContent, '0 synced, 1 failed');
+  assert.ok(timers.size, 'an upload-only failure schedules an automatic retry');
+  ctx._runUpload=async f => {f.path='/tmp/evidence.bin'; f.url='/api/upload/evidence.bin';};
+  await ctx.runSyncBanner();
+  assert.equal(rows.length, 0);
+  assert.equal(element('sync-title-text').textContent, '1 synced');
+  assert.equal(ctx._uploadSyncPending, false);
+  assert.ok(refreshed.includes('files:/folder'));
+  assert.ok(refreshed.includes('explore:/folder'));
+});
+
+test('browser offline does not retry writes or cover the editor with a failed sync banner', async () => {
+  const {ctx, element} = fixture(); await enqueue(ctx);
+  ctx.navigator.onLine=false;
+  ctx._origFetch=async () => {assert.fail('no network attempts while the browser is explicitly offline');};
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 1);
+  assert.equal(element('sync-items').innerHTML, '');
+  ctx.navigator.onLine=true;
+  ctx._origFetch=async () => new Response('{"id":"TASK-1"}');
+  await ctx.runSyncBanner();
+  assert.equal(ctx.offlineQueue.length, 0);
+  assert.equal(element('sync-title-text').textContent, '1 synced');
+});
+
+test('reconnect retries retain completed file checkmarks without uploading those files twice', async () => {
+  const {ctx, element} = fixture(); await enqueue(ctx);
+  let uploads=[{id:'evidence',name:'evidence.txt'}], uploadsSent=0;
+  let visible=false;
+  element('sync-banner').classList={contains:() => visible, add() {visible=true;}, remove() {visible=false;}};
+  Object.assign(ctx, {_upqList:async () => uploads, _upqRenderBadge() {},
+    _syncOneUpload:async () => {uploadsSent++; uploads=[];},
+    _origFetch:async () => new Response('unavailable',{status:503})});
+  await ctx.runSyncBanner();
+  assert.equal(element('sync-title-text').textContent,'1 synced, 1 failed');
+  ctx._origFetch=async () => new Response('{"id":"TASK-1"}');
+  await ctx.runSyncBanner();
+  assert.equal(element('sync-title-text').textContent,'2 synced');
+  assert.equal(uploadsSent,1);
+  assert.equal((element('sync-items').innerHTML.match(/sync-item done/g)||[]).length,2);
+});
+
+test('a queue entry removed in another tab cannot earn an acknowledgement checkmark', async () => {
+  const {ctx, stored, element} = fixture(); await enqueue(ctx);
+  ctx._outboxLock=async (name, work) => {if(name.startsWith('amux-outbox-delivery:')) stored.set('amux_offline_queue','[]'); return work();};
+  await ctx.runSyncBanner();
+  assert.equal(element('sync-title-text').textContent,'0 synced, 1 skipped');
+  assert.doesNotMatch(element('sync-items').innerHTML,/sync-item done/);
+});
+
+test('background history import never enters the user outbox or claims a failed migration completed', async () => {
+  const {ctx} = fixture(['_loadCmdHistoryFromServer']);
+  let status=503;
+  Object.assign(ctx,{_cmdHistory:['retained local history'],_cmdHistoryServerLoaded:false,
+    fetch:async (url,options) => {
+      if(url.includes('/import')) {assert.equal(options._skipOutbox,true); return new Response('{}',{status});}
+      return new Response('[]');
+    }});
+  await ctx._loadCmdHistoryFromServer(); assert.equal(ctx._cmdHistoryServerLoaded,false);
+  status=200; await ctx._loadCmdHistoryFromServer(); assert.equal(ctx._cmdHistoryServerLoaded,true);
+});
+
+test('history migration never promotes a pending message to sent history before replay', async () => {
+  const {ctx} = fixture(['_loadCmdHistoryFromServer']);
+  await ctx._queueOp('/api/sessions/owned/steer',{method:'POST',body:JSON.stringify({text:'not delivered',msg_id:'pending'})});
+  Object.assign(ctx,{_cmdHistory:[{text:'not delivered',session:'owned'}],_cmdHistoryServerLoaded:false,
+    _msgNorm:x => x, _mergeUnechoed:() => ctx._cmdHistory, _peekReclassifyPrompts() {},
+    fetch:async url => {assert.equal(url,'/api/history?limit=500'); return new Response('[]');}});
+  await ctx._loadCmdHistoryFromServer();
+  assert.equal(ctx._cmdHistory[0].text,'not delivered');
+});
+
+test('successful sync clears stale offline feedback without hiding unrelated failures', async () => {
+  const {ctx, element} = fixture(); await enqueue(ctx);
+  let visible=true, cancelled=false;
+  Object.assign(ctx,{toastTimer:0});
+  const toast=element('toast'); toast.textContent='Server unreachable — offline mode';
+  toast.classList.remove=() => {visible=false;};
+  toast.getAnimations=() => [{cancel() {cancelled=true;}}];
+  await ctx.runSyncBanner();
+  assert.equal(visible,false); assert.equal(cancelled,true);
+  visible=true; toast.textContent='Upload failed: storage unavailable';
+  ctx._clearSyncTransientToast(); assert.equal(visible,true);
+});
+
+
+test('repeated Stop clicks across tabs retain one durable intent and one replay', async () => {
+  const shared = sharedStorage();
+  const a = fixture([], shared), b = fixture([], shared);
+  const url = '/api/sessions/tubescience/stop';
+  await Promise.all([a.ctx._queueOp(url, {method:'POST'}), b.ctx._queueOp(url, {method:'POST'})]);
+  assert.equal(JSON.parse(a.stored.get('amux_offline_queue')).length, 1);
+  let calls = 0;
+  a.ctx._origFetch = async () => {calls++; return new Response('{"ok":true,"message":"stopping"}', {status:202});};
+  await a.ctx.runSyncBanner();
+  assert.equal(calls, 1);
+  assert.equal(a.ctx.offlineQueue.length, 0);
+});
+
+test('Stop deduplication preserves a later Stop after Start and separate worker intent', async () => {
+  const {ctx} = fixture();
+  for (const url of ['/api/sessions/a/stop', '/api/sessions/b/stop', '/api/sessions/a/stop', '/api/sessions/a/start', '/api/sessions/a/stop'])
+    await ctx._queueOp(url, {method:'POST'});
+  assert.deepEqual(Array.from(ctx.offlineQueue, q => q.url), ['/api/sessions/a/stop', '/api/sessions/b/stop', '/api/sessions/a/start', '/api/sessions/a/stop']);
+});

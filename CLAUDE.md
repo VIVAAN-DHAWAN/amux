@@ -33,10 +33,10 @@ owes two things: the fix, and a log signal so the next instance self-announces
 - `crates/amux-server` -- axum server: `src/api/`, `src/db/`, `migrations/`, `src/runtime_jobs/`
 - `crates/amux-dashboard` -- SPA: `static/` (`index.html`, `app.js`, `app.css`, `sw.js`)
 - `crates/amux-core` / `crates/amux-cli` -- shared types; Rust CLI
-- `amux` -- bash CLI. This file IS the fleet's CLI: `~/.local/bin/amux` is a
-  symlink pointing HERE, not the other way round. Live on save, not on commit —
-  and so also live on `git checkout`, `stash`, or a branch switch, which swap it
-  for all lanes with no save involved.
+- `amux` -- Bash CLI source. Publish a resolved, reviewed checkout with
+  `make install-cli` (`BIN_DIR=/usr/local/bin` for that additional installation).
+  The installer validates a private snapshot and atomically replaces the client.
+  Never symlink the installed client into a mutable worktree or copy it by hand.
 - `e2e/` -- Playwright; `crates/amux-server/tests/` -- integration tests
 - `cloud/` -- cloud.amux.io (read `cloud/README.md` first)
 
@@ -49,7 +49,8 @@ Verify a hook by what it WROTE, not by the settings file.
 
 - **No auto-pull.** Shared checkout; the freshness hook reports staleness, the human decides.
 - **Commit after every completed task.** Committing deploys locally (builder adopts within ~60s).
-- **Bash CLI ships on SAVE** (symlink). `check-and-commit.sh` runs `bash -n` on every save.
+- **Bash CLI ships via `make install-cli`** (also part of `install.sh`).
+  `check-and-commit.sh` checks saves; installation validates the exact published bytes.
   Server ships on COMMIT via the auto-builder.
 - **`CARGO_TARGET_DIR=~/.amux/rust-build-target`** -- one shared build dir, never per-session.
 - **Bracket measurements with `/health`'s `build`** -- the builder swaps the binary on any commit.
@@ -159,10 +160,35 @@ ScheduleWakeup, or one delay sized to the job. (AF-396)
 **Before `git push origin main`:**
 ```bash
 git fetch origin
-git rev-list --count origin/main..main
-git log --format="%h [%(trailers:key=Amux-Session,valueonly,separator=)] %s" origin/main..main
+scripts/push-consent.sh          # who must you ask, and who CANNOT be asked
 ```
 If foreign commits exist, ask their author before pushing.
+
+**Some authors cannot be asked, and the script names them rather than leaving you
+to not know.** An ISOLATED lane refuses sends carrying a worker origin, so for its
+commits that instruction has no truthful path — the two moves are push unasked
+while a MANDATORY rule says otherwise, or never push. Found live 2026-09-07, when
+a consent poll named 16 of 23 commits and missed 5 belonging to an isolated `amux`
+(AF-548). Pushing is defensible: a lane committing to shared main has already
+accepted that a peer will push it. Claiming consent you could not obtain is not.
+State the exemption; a named exemption is a truthful path and silence is not.
+
+**And a green Rust gate is not push-readiness for the range.** `cargo clippy
+--workspace` and `cargo test -p amux-server` are scoped to a LANGUAGE and get
+quoted as a verdict on a PUSH. In that same range 10 of 23 commits touched no
+`.rs` file at all, including the commit of the lane that asked. The script prints
+both counts so the denominator travels with the verdict.
+
+**Run gates on a DETACHED worktree, not this one.** Every local check here reads a
+tree with other lanes' uncommitted files in it, so a green is a claim about your
+peers' drafts as much as about your commits:
+```bash
+git worktree add --detach /tmp/push-check main
+git -C /tmp/push-check status --porcelain --untracked-files=no   # must be empty
+```
+This is how the 2026-09-07 push was found to carry a test that passes alone and
+fails in the suite (AF-549) — 2013 passed, 1 failed, on bytes nobody had ever
+compiled in isolation.
 
 When user says "deploy": `git add` + `git commit` + verify above + `git push origin main`.
 

@@ -481,7 +481,7 @@ fn google_redirect_uri() -> String {
 /// `X-Amux-*` and drops inbound copies from clients. If that ever stops holding,
 /// this becomes domain-wide impersonation — keep the gateway's header-strip in
 /// step with this.
-fn impersonation_subject(headers: &HeaderMap) -> Option<String> {
+fn impersonation_subject(headers: &HeaderMap, home: &std::path::Path) -> Option<String> {
     if let Some(v) = headers
         .get("x-amux-user-email")
         .and_then(|h| h.to_str().ok())
@@ -490,7 +490,7 @@ fn impersonation_subject(headers: &HeaderMap) -> Option<String> {
     {
         return Some(v.to_string());
     }
-    super::google_sa::sa_config().map(|(_, subject)| subject)
+    super::google_sa::sa_config_in(home).map(|(_, subject)| subject)
 }
 
 /// Does a provider have an OAuth token on disk? Tokens live under
@@ -541,6 +541,48 @@ fn env_val(file_env: &std::collections::BTreeMap<String, String>, key: &str) -> 
 /// copied into server.env by hand (AMUX-3341, and the connectors-setup "reuse
 /// this one" note). The value is for presence/masking and the server's own OAuth
 /// flow only; never emitted raw.
+/// What this box CANNOT reach right now, and the exact env key that would fix
+/// each one (AF-372).
+///
+/// Returns `(connector id, missing key names)` for every registry provider whose
+/// credentials are not all resolvable, sorted by id. Empty means every connector
+/// has its keys, which is a DIFFERENT fact from "the probe did not run" and the
+/// caller is expected to say which (AF-320).
+///
+/// WHY THIS IS A FUNCTION AND NOT A NEW CHECK. The whole status ladder already
+/// existed behind GET /api/connectors, key by key, with `set` per key. AF-372
+/// asked for a preflight that "names the credential by the KEY it needs", and
+/// that answer was already computed. What did not exist was any path by which a
+/// lane learned it before hitting a 401 mid-task. So this pulls the same
+/// resolution out of the HTTP handler and into something the memory composer can
+/// call, rather than inventing a second source of truth for which keys matter.
+///
+/// Pure over `home`, so a test drives a fixture server.env instead of this box.
+/// Google is resolved through `resolve_cred_in`, which also accepts the
+/// service-account and oauth-client-file paths, so a connector usable by
+/// delegation is not reported as missing keys it does not need.
+pub(crate) fn credential_gaps_in(home: &std::path::Path) -> Vec<(&'static str, Vec<&'static str>)> {
+    let file_env = parse_env_file(&home.join("server.env"));
+    let mut out: Vec<(&'static str, Vec<&'static str>)> = REGISTRY
+        .iter()
+        .filter_map(|p| {
+            let missing: Vec<&'static str> = env_keys(p)
+                .into_iter()
+                .filter(|k| resolve_cred_in(home, &file_env, p.category, k).is_none())
+                .collect();
+            (!missing.is_empty()).then_some((p.id, missing))
+        })
+        .collect();
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
+
+/// How many providers the registry knows, so a caller can report a share rather
+/// than a bare count: "3 of 8" is measurable, "3 unusable" is not.
+pub(crate) fn connector_count() -> usize {
+    REGISTRY.len()
+}
+
 fn resolve_cred_in(
     home: &std::path::Path,
     file_env: &std::collections::BTreeMap<String, String>,
@@ -852,7 +894,7 @@ async fn mattermost_login(
 /// accepted for parity with the scope explain link but the status here is
 /// global (credential presence + token); per-scope enablement is the scope
 /// read.
-async fn list() -> Response {
+async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
     let file_env = parse_env_file(&amux_home().join("server.env"));
     let items: Vec<Value> = REGISTRY
         .iter()
@@ -873,7 +915,7 @@ async fn list() -> Response {
             // Where the credential came from, so the tab can say "reusing the
             // existing Google client" rather than looking un-configured (AMUX-3341).
             let in_server_env = keys.iter().all(|k| env_val(&file_env, k).is_some());
-            let cred_source = if p.category == "Google" && super::google_sa::sa_config().is_some() {
+            let cred_source = if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
                 json!("service account (domain-wide delegation)")
             } else if !all_creds_set {
                 Value::Null
@@ -905,8 +947,8 @@ async fn list() -> Response {
             // if the key file still exists. sa_usable() checks that; reading
             // "connected" off a configured-but-missing key is the dishonest
             // status that turned a moved key into a silent 502 (AMUX-3383).
-            let sa_configured = p.category == "Google" && super::google_sa::sa_config().is_some();
-            let sa_available = p.category == "Google" && super::google_sa::sa_usable();
+            let sa_configured = p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some();
+            let sa_available = p.category == "Google" && super::google_sa::sa_usable_in(&ctx.home);
             let sa_key_gone = sa_configured && !sa_available;
             // Status ladder, most-blocked first.
             let status = if sa_available {
@@ -1292,11 +1334,33 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
             std::env::set_var(k, v);
         }
     }
+    // REPUBLISH THE PREFLIGHT, because this is the event that makes it stale
+    // (AF-372).
+    //
+    // Every worker's MEMORY.md carries a "Credentials" section naming the keys
+    // this box cannot reach. `refresh_fleet_rosters` is documented as
+    // "deliberately not on a timer: nothing about the roster decays on its own",
+    // which is true of a ROSTER and false of a credential: the moment a key is
+    // pasted here, every one of those files keeps asserting it is unset, and
+    // stays wrong until somebody happens to rename a worker.
+    //
+    // So it is refreshed on the WRITE, which is the signal that doc asks for
+    // rather than the timer it rejects. O(fleet) small file writes, on an action
+    // a human takes by hand a few times a year.
+    let refreshed = crate::api::session_verbs::refresh_fleet_rosters();
+    tracing::info!(
+        marker = "connector_credentials_republished",
+        connector = %id,
+        memories_rewritten = refreshed,
+        measured = true,
+        "credential preflight refreshed in every worker's memory after a key changed"
+    );
     Json(json!({
         "ok": true,
         "connector": id,
         "written": written,
         "rejected": rejected,
+        "memories_refreshed": refreshed,
         "note": "stored in ~/.amux/server.env; restart is not required for this run. Values are never returned.",
     }))
     .into_response()
@@ -1847,7 +1911,10 @@ async fn complete_exchange(
 /// (broker) lands, since there is no stored access token to present yet. The
 /// bearer value is NEVER logged — only the provider id, HTTP status and latency
 /// (grep `connector_test`).
-async fn test_connection(Path(id): Path<String>) -> Response {
+async fn test_connection(
+    Extension(ctx): Extension<Arc<ConnectorsCtx>>,
+    Path(id): Path<String>,
+) -> Response {
     // DECLARED CONNECTORS TEST GENERICALLY (AMUX-3993). The builtin ladder below
     // branches per `Auth` because each vendor family has its own shape; a row
     // declared in the tab has no such knowledge, so all amux can honestly do is
@@ -1954,7 +2021,7 @@ async fn test_connection(Path(id): Path<String>) -> Response {
             // service-account domain-wide delegation (AMUX-3347) — no per-user
             // browser grant. If no SA is configured, fall back to the honest
             // "connect first" until the OAuth broker (AMUX-3192) lands.
-            if p.category == "Google" && super::google_sa::sa_config().is_some() {
+            if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
                 match super::google_sa::mint_token(scopes).await {
                     Ok(tok) => tok,
                     Err(e) => {
@@ -2199,7 +2266,7 @@ async fn mint_connector_token(
             // Named an account nobody holds a grant for: if the SA can
             // impersonate it, fall through to the SA path with it as subject;
             // otherwise the honest answer names how to connect it.
-            if !(p.category == "Google" && super::google_sa::sa_usable()) {
+            if !(p.category == "Google" && super::google_sa::sa_usable_in(&ctx.home)) {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({
@@ -2216,7 +2283,8 @@ async fn mint_connector_token(
         }
         None => None,
     };
-    if user_account.is_none() && !(p.category == "Google" && super::google_sa::sa_config().is_some())
+    if user_account.is_none()
+        && !(p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some())
     {
         // No SA: fall back to the user-grant store. One stored account is
         // unambiguous; several need `?account=`; none is an honest "connect
@@ -2253,7 +2321,7 @@ async fn mint_connector_token(
     if let Some(acct) = user_account {
         return mint_from_user_grant(&ctx, p, family, &acct, &scope).await;
     }
-    let Some(subject) = impersonation_subject(&headers) else {
+    let Some(subject) = impersonation_subject(&headers, &ctx.home) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "status": "error", "detail": "no impersonation subject (GOOGLE_SA_SUBJECT unset and no X-Amux-User-Email)"})),
@@ -3063,17 +3131,24 @@ mod tests {
     fn impersonation_subject_prefers_the_gateway_header_and_ignores_blank() {
         // Cloud path: the gateway-injected user is impersonated verbatim, so a
         // minted token is bound to the requester, not the whole domain.
+        // An empty home, so the fall-through arm resolves against THIS home's
+        // (absent) server.env rather than whatever the box running the suite
+        // has exported (AF-529).
+        let home = tempfile::tempdir().unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-amux-user-email", "alice@mixpeek.com".parse().unwrap());
         assert_eq!(
-            impersonation_subject(&h).as_deref(),
+            impersonation_subject(&h, home.path()).as_deref(),
             Some("alice@mixpeek.com")
         );
         // A blank header must never become the subject — it falls through to the
         // configured subject (or None), never impersonates "   ".
         let mut blank = HeaderMap::new();
         blank.insert("x-amux-user-email", "   ".parse().unwrap());
-        assert_ne!(impersonation_subject(&blank).as_deref(), Some("   "));
+        assert_ne!(
+            impersonation_subject(&blank, home.path()).as_deref(),
+            Some("   ")
+        );
     }
 
     #[test]
@@ -3884,4 +3959,50 @@ mod tests {
         assert_eq!(d["scope_count"], n);
         assert_eq!(d["permits"].as_array().map(Vec::len), Some(n), "{d:#}");
     }
+    /// AF-372: the gaps are real keys, resolved against a real server.env.
+    ///
+    /// Pure over `home`, so this drives a fixture rather than this box. The
+    /// specimen matters: `slack` needs two keys and setting ONE of them must
+    /// still report the other, because "partially configured" is the state a
+    /// caller most easily mistakes for done.
+    #[test]
+    fn credential_gaps_name_the_unset_keys_and_clear_when_set() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"), "").unwrap();
+
+        let gaps = credential_gaps_in(home.path());
+        let slack: Vec<&str> = gaps
+            .iter()
+            .find(|(id, _)| *id == "slack")
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            slack,
+            vec!["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"],
+            "an empty server.env must name both slack keys: {gaps:?}"
+        );
+        assert!(connector_count() >= gaps.len(), "the share needs a denominator");
+
+        // HALF-CONFIGURED IS STILL A GAP.
+        std::fs::write(home.path().join("server.env"), "SLACK_CLIENT_ID=abc\n").unwrap();
+        let gaps = credential_gaps_in(home.path());
+        let slack: Vec<&str> = gaps
+            .iter()
+            .find(|(id, _)| *id == "slack")
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        assert_eq!(slack, vec!["SLACK_CLIENT_SECRET"], "the set key drops out, the unset one stays");
+
+        // AND BOTH SET CLEARS IT, or the check could be reporting a constant.
+        std::fs::write(
+            home.path().join("server.env"),
+            "SLACK_CLIENT_ID=abc\nSLACK_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        assert!(
+            !credential_gaps_in(home.path()).iter().any(|(id, _)| *id == "slack"),
+            "slack is fully configured and must disappear from the gaps"
+        );
+    }
+
 }

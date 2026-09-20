@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
 # Canonical status-hook installation and payload regression cells.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "FAIL status-hook fixture line=$LINENO command=$BASH_COMMAND" >&2' ERR
 cd "$(dirname "$0")/.."
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 SETTINGS="$TMP/settings.json"
+
+# Fixture writes participate in the same queue lock as the producer/drain.
+# Seeing HTTP capture does not mean the acknowledgement has reached disk.
+write_queue_fixture() {
+  /usr/bin/python3 - "$1" "$2" <<'PYWRITE'
+import fcntl,os,sys,tempfile
+path,payload=sys.argv[1:]
+with open(path+".lock","a+") as guard:
+    fcntl.flock(guard,fcntl.LOCK_EX)
+    fd,tmp=tempfile.mkstemp(prefix="fixture.",dir=os.path.dirname(path))
+    with os.fdopen(fd,"w") as stream:
+        stream.write(payload);stream.flush();os.fsync(stream.fileno())
+    os.replace(tmp,path)
+print("ok   fixture queue write serialized with durable acknowledgement")
+PYWRITE
+}
 
 printf '%s\n' '{
   "model": "keep-me",
@@ -29,7 +46,7 @@ import json, sys
 v=json.load(open(sys.argv[1]))
 assert v["model"] == "keep-me"
 hooks=v["hooks"]
-required={"SessionStart","UserPromptSubmit","PostToolUse","Stop","SubagentStart","SubagentStop"}
+required={"SessionStart","UserPromptSubmit","PostToolUse","Stop","SubagentStart","SubagentStop","Notification"}
 assert required <= set(hooks)
 rows=[]
 for event, groups in hooks.items():
@@ -37,8 +54,13 @@ for event, groups in hooks.items():
         for hook in group.get("hooks", []):
             rows.append((event, group.get("matcher"), hook.get("command", "")))
 reports=[r for r in rows if "hook-report.sh" in r[2]]
-assert len(reports) == 6, reports
+assert len(reports) == 7, reports
+# Notification is the `blocked` producer (AMUX-4723). Named here, not just
+# counted: a bumped number would pass on any seventh hook at all.
+assert any(r[0]=="Notification" and " blocked " in r[2] for r in reports), reports
 assert len([r for r in reports if r[0] == "PostToolUse" and r[1] == ".*"]) == 1
+read_guards=[r for r in rows if "large-read-guard.py" in r[2]]
+assert sorted((r[0],r[1]) for r in read_guards)==[("PreToolUse","Bash"),("PreToolUse","Read")],read_guards
 assert any(r[2] == "echo unrelated" for r in rows)
 assert any(r[2] == "bash check-format.sh" for r in rows)
 assert not any("/api/sessions/" in r[2] and "hook-report.sh" not in r[2] for r in rows)
@@ -280,7 +302,7 @@ echo "ok   ordinary state hook wakes and route-corrects a surviving legacy queue
 
 # Corruption is evidence, not an empty queue. Preserve the exact bad bytes,
 # announce the verdict, and let the new event proceed in a fresh atomic file.
-printf '%s' '{not-json' > "$QF"
+write_queue_fixture "$QF" '{not-json'
 HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
   bash scripts/hooks/hook-report.sh subagent-start corrupt-successor \
   <<<'{"session_id":"abc-123","agent_id":"after-corrupt"}'
@@ -288,7 +310,7 @@ wait_for 'any(r["body"].get("agent_id")=="after-corrupt" for r in rows)'
 CORRUPT=$(find "$TMP/home/.amux/hook-report-queue" -name 'probe.json.corrupt.*' -print -quit)
 test -n "$CORRUPT"
 test "$(cat "$CORRUPT")" = '{not-json'
-printf '%s' '{}' > "$QF"
+write_queue_fixture "$QF" '{}'
 HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
   bash scripts/hooks/hook-report.sh subagent-start corrupt-schema-successor \
   <<<'{"session_id":"abc-123","agent_id":"after-schema-corrupt"}'
@@ -388,5 +410,103 @@ bad=[r for r in rows if r["path"]!=r["expected_path"]]
 assert not bad,bad
 print("ok   every captured hook request used its exact worker report path")
 PY
+
+# AMUX-4723: the missing producer for `blocked`, and the filter that keeps it
+# from being worse than the bug. Notification fires for several types; only
+# permission_prompt means a human is being asked. Reporting idle_prompt as
+# blocked would park every quiet lane behind the 409 automation guard for the
+# 24h `blocked` trust window.
+#
+# The two negatives are asserted against a BARRIER: the permission report is
+# sent last and waited for, so "no row appeared" is a real absence rather than
+# a race that had not finished yet.
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh blocked notif-idle \
+  <<<'{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}'
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh blocked notif-empty <<<'{}'
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh blocked notif-perm \
+  <<<'{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}'
+wait_for 'any(r["body"].get("source")=="notif-perm" for r in rows)'
+/usr/bin/python3 - "$CAPTURE" <<'PY2'
+import json,sys
+rows=[json.loads(line)["body"] for line in open(sys.argv[1])]
+perm=[r for r in rows if r.get("source")=="notif-perm"]
+assert perm and all(r.get("state")=="blocked" for r in perm), perm
+print("ok   a permission_prompt Notification is the first thing to ever report blocked")
+idle=[r for r in rows if r.get("source")=="notif-idle"]
+assert not idle, f"idle_prompt must NOT report blocked, or every quiet lane is unreachable: {idle}"
+print("ok   an idle_prompt Notification reports nothing")
+empty=[r for r in rows if r.get("source")=="notif-empty"]
+assert not empty, f"an unreadable payload must fail CLOSED, not claim a human is waiting: {empty}"
+print("ok   an unrecognised payload reports nothing")
+PY2
+
+# The producer has to be installed, not merely supported. `blocked` was
+# accepted by the server, read by lane_is_blocked and covered by a test for the
+# whole life of the feature while nothing emitted it.
+/usr/bin/python3 - <<'PY2'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("inst","scripts/hooks/install-claude-status-hooks.py")
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+c=m.canonical("/tmp/hook-report.sh")
+assert "Notification" in c, sorted(c)
+cmd=c["Notification"]["hooks"][0]["command"]
+assert " blocked " in cmd, cmd
+# Clearing edges must stay installed: an approval runs the tool (PostToolUse ->
+# active) and a rejection or ended turn reports idle (Stop). Without BOTH, a
+# blocked lane could never return.
+assert " active " in c["PostToolUse"]["hooks"][0]["command"], c["PostToolUse"]
+assert " idle " in c["Stop"]["hooks"][0]["command"], c["Stop"]
+print("ok   Notification is installed as the blocked producer, with both clearing edges intact")
+PY2
+
+# AMUX-4783. Wiring an event and shipping its handler are two different
+# commands, and on 2026-09-18 they came apart for ~4h: Notification wired
+# against a 2026-09-04 script with no notification_type, so every notification
+# type reported blocked. The installer now refuses that combination.
+/usr/bin/python3 - <<'PY2'
+import importlib.util, json, subprocess, sys, tempfile
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("inst", "scripts/hooks/install-claude-status-hooks.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+# The pure seam, both directions. A handler missing the discriminator is
+# unsupported; one carrying it is not.
+assert m.unsupported_events("case $notification_type in") == [], "a handler WITH the discriminator must be accepted"
+assert m.unsupported_events("no discriminator here") == ["Notification"], "a handler without it must be refused"
+# Unreadable is not silently 'fine': read_hook_source reports None and the
+# caller decides, rather than this function inventing an empty source.
+assert m.read_hook_source("/nonexistent/hook-report.sh") is None
+print("ok   the handler-support seam accepts and refuses on the discriminator")
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    settings = d / "settings.json"
+    old, new = d / "old.sh", d / "new.sh"
+    old.write_text("#!/bin/sh\necho old\n")
+    new.write_text("#!/bin/sh\ncase $notification_type in permission_prompt) : ;; esac\n")
+
+    settings.write_text("{}")
+    r = subprocess.run([sys.executable, "scripts/hooks/install-claude-status-hooks.py",
+                        "--settings", str(settings), "--hook-path", str(old)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0, r
+    assert "refusing to wire Notification" in r.stderr, r.stderr
+    assert "install.sh" in r.stderr, "the remedy must name the command that ships the handler"
+    assert settings.read_text() == "{}", "a refusal must not half-write settings"
+    print("ok   an unsupported handler is refused BEFORE settings are written")
+
+    settings.write_text("{}")
+    r = subprocess.run([sys.executable, "scripts/hooks/install-claude-status-hooks.py",
+                        "--settings", str(settings), "--hook-path", str(new)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r
+    hooks = json.loads(settings.read_text())["hooks"]
+    assert "Notification" in hooks, sorted(hooks)
+    print("ok   a supported handler still wires Notification")
+PY2
 
 echo "ok   all shipped status-hook durability regressions passed"

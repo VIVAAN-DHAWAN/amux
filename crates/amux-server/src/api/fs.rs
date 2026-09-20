@@ -365,26 +365,223 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
     // Containment rides the SAME deny sets as every other fs verb: a denied
     // candidate is treated as absent, so this endpoint cannot be used to
     // probe existence inside paths the Files surface refuses to serve.
-    let (resolved, exists, tried) =
-        resolve_rel_candidates(&cwd, &rel, &|p| is_path_allowed(p) && p.exists());
+    let allowed_exists = |p: &Path| is_path_allowed(p) && p.exists();
+    let (resolved, exists, mut tried) = resolve_rel_candidates(&cwd, &rel, &allowed_exists);
+    // AMUX-4661 (Ethan's screenshots, jobs.py "does not exist here"): the
+    // ancestor walk above only ever climbs — it cannot find a session
+    // registered at a SCAFFOLD directory one level above where the worker
+    // actually works (dir=ai-for-smbs, real repo at
+    // ai-for-smbs/smb-workspace), so a path printed from inside the nested
+    // repo (backend/connectors/jobs.py) never resolved. Try downward too,
+    // once the ascent has already failed. Strip a leading slash the same way
+    // `resolve_rel_candidates` now does (AMUX-4682) -- a web-root-relative
+    // asset reference is exactly as findable by descent as an ordinary
+    // relative one, once the literal-absolute interpretation has failed.
+    if !exists {
+        let root = PathBuf::from(cwd.trim_end_matches('/'));
+        let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
+        if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs) {
+            let s = found.display().to_string();
+            tried.push(s.clone());
+            return Json(json!({ "resolved": s, "exists": true, "tried": tried })).into_response();
+        }
+    }
+    // Git fallback: the file may exist on origin/main even though it is not
+    // on disk (shared checkout behind origin, graft-push workflows). Ethan's
+    // screenshots 2026-09-16: gtm-engine committed a file, pushed it, and the
+    // link said "does not exist here" because the mixpeek checkout was 4957
+    // commits behind origin/main. The ancestor walk found the correct path but
+    // the file genuinely was not on the filesystem.
+    if !exists {
+        if let Some(git_path) = git_resolve_rel(&cwd, &rel).await {
+            tried.push(git_path.clone());
+            return Json(json!({
+                "resolved": git_path, "exists": true,
+                "source": "git", "tried": tried,
+            }))
+            .into_response();
+        }
+    }
     Json(json!({ "resolved": resolved, "exists": exists, "tried": tried })).into_response()
+}
+
+/// Try to locate a file in `origin/main` of the nearest git repo, returning
+/// its absolute path (repo_root / repo-relative) if found. Called only after
+/// the on-disk ancestor walk and descent have both failed, so this is the
+/// last resort. Two candidates: `rel` as-is (workers often print repo-root-
+/// relative paths) and `cwd_rel/rel` (the cwd-relative interpretation).
+pub(crate) async fn git_resolve_rel(cwd: &str, rel: &str) -> Option<String> {
+    let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
+    if rel_clean.is_empty() {
+        return None;
+    }
+    let toplevel = git_toplevel_of(cwd).await?;
+    let mut candidates = vec![rel_clean.to_string()];
+    if let Ok(cwd_rel) = Path::new(cwd).strip_prefix(&toplevel) {
+        let joined = cwd_rel.join(rel_clean);
+        let s = joined.to_string_lossy().into_owned();
+        if s != rel_clean {
+            candidates.push(s);
+        }
+    }
+    for candidate in &candidates {
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("git")
+                .args(["-C", &toplevel, "cat-file", "-t", &format!("origin/main:{candidate}")])
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+        if ok {
+            return Some(format!("{}/{}", toplevel.trim_end_matches('/'), candidate));
+        }
+    }
+    None
+}
+
+/// Read a file's content from `origin/main` in the nearest git repo.
+pub(crate) async fn git_show_file(cwd: &str, rel: &str) -> Option<(String, Vec<u8>)> {
+    let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
+    if rel_clean.is_empty() {
+        return None;
+    }
+    let toplevel = git_toplevel_of(cwd).await?;
+    let mut candidates = vec![rel_clean.to_string()];
+    if let Ok(cwd_rel) = Path::new(cwd).strip_prefix(&toplevel) {
+        let joined = cwd_rel.join(rel_clean);
+        let s = joined.to_string_lossy().into_owned();
+        if s != rel_clean {
+            candidates.push(s);
+        }
+    }
+    for candidate in &candidates {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("git")
+                .args(["-C", &toplevel, "show", &format!("origin/main:{candidate}")])
+                .output(),
+        )
+        .await;
+        if let Ok(Ok(output)) = output {
+            if output.status.success() {
+                let abs_path = format!("{}/{}", toplevel.trim_end_matches('/'), candidate);
+                return Some((abs_path, output.stdout));
+            }
+        }
+    }
+    None
+}
+
+async fn git_toplevel_of(dir: &str) -> Option<String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", "--show-toplevel"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// The descent counterpart to `resolve_rel_candidates`'s ancestor walk —
+/// breadth-first from `root` for a directory `d` where `d.join(rel)` exists.
+/// BFS order means a SHALLOWER match always wins when more than one exists,
+/// the same "closest plausible spelling wins" rule the ascent uses.
+///
+/// Depth- and visit-capped so a large repo cannot turn one dead link into a
+/// slow one, and skips the usual noise directories so the cap is not spent
+/// walking into node_modules/.git/target before reaching a real subtree.
+/// `is_path_allowed` gates every directory entered, not just the final
+/// candidate file — the same posture `resolve_rel`'s own `exists` closure
+/// already applies, extended to the listing itself so this cannot be used to
+/// enumerate what is inside a denied directory either.
+const DESCEND_MAX_DEPTH: usize = 3;
+const DESCEND_MAX_DIRS: usize = 500;
+const DESCEND_SKIP: &[&str] = &[
+    "node_modules", ".git", "target", "__pycache__", ".venv", "venv", ".next", "dist", "build",
+];
+
+pub(crate) fn resolve_rel_descend(
+    root: &Path,
+    rel: &str,
+    exists: &dyn Fn(&Path) -> bool,
+    list_dirs: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let mut frontier = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    for _ in 0..DESCEND_MAX_DEPTH {
+        let mut next = Vec::new();
+        for dir in frontier {
+            for child in list_dirs(&dir) {
+                let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if DESCEND_SKIP.contains(&name) || !is_path_allowed(&child) {
+                    continue;
+                }
+                if visited >= DESCEND_MAX_DIRS {
+                    return None;
+                }
+                visited += 1;
+                let cand = child.join(rel);
+                if exists(&cand) {
+                    return Some(cand);
+                }
+                next.push(child);
+            }
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Real directory listing for `resolve_rel_descend`'s production call site.
+/// Kept separate from the pure walk above so every cell of the walk itself
+/// is testable with an injected in-memory fake, the same split
+/// `resolve_rel_candidates` uses for `exists`.
+pub(crate) fn real_list_dirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
 }
 
 /// The candidate walk, pure over an injected existence probe so every cell —
 /// the doubled-segment specimen included — is testable without a live tree.
-fn resolve_rel_candidates(
+pub(crate) fn resolve_rel_candidates(
     cwd: &str,
     rel: &str,
     exists: &dyn Fn(&Path) -> bool,
 ) -> (String, bool, Vec<String>) {
     let rel = rel.trim();
-    if rel.starts_with('/') {
-        let p = PathBuf::from(rel);
-        let ok = exists(&p);
-        return (rel.to_string(), ok, vec![rel.to_string()]);
-    }
-    let rel_clean = rel.trim_start_matches("./");
     let mut tried: Vec<String> = Vec::new();
+    // A leading slash USUALLY means "this really is absolute" -- the common
+    // case, and the only one worth trying first: silently reinterpreting a
+    // genuinely absolute path as relative would paper over real bugs. But a
+    // worker's own terminal output just as often prints a WEB-ROOT-relative
+    // asset reference this way (Next.js and most static-site frameworks:
+    // `/templates/foo.png` in source means `public/templates/foo.png` on
+    // disk) -- AMUX-4682, live: mixpeek-homepage-claude's terminal printed
+    // exactly this shape and the literal path never existed anywhere; the
+    // real file sat under cwd's `public/` the whole time. So try the literal
+    // interpretation first (unchanged behavior when it's real); only on
+    // failure does the slash get stripped and treated as an ordinary
+    // relative rel, falling into the same ancestor walk below.
+    let rel_clean = if let Some(stripped) = rel.strip_prefix('/') {
+        let p = PathBuf::from(rel);
+        tried.push(rel.to_string());
+        if exists(&p) {
+            return (rel.to_string(), true, tried);
+        }
+        stripped
+    } else {
+        rel.trim_start_matches("./")
+    };
     let mut base = PathBuf::from(cwd.trim_end_matches('/'));
     for _ in 0..=4 {
         let cand = base.join(rel_clean);
@@ -565,7 +762,10 @@ async fn mkdir(req: Request) -> Response {
 ///
 /// Resolution failure returns false: refusing to open is recoverable (the path
 /// is in the response), opening a Finder window on someone else's desktop is not.
-fn browser_is_on_this_machine(peer: Option<std::net::IpAddr>, host_header: Option<&str>) -> bool {
+pub(crate) fn browser_is_on_this_machine(
+    peer: Option<std::net::IpAddr>,
+    host_header: Option<&str>,
+) -> bool {
     browser_is_on_this_machine_with(peer, host_header, |h| {
         std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
             .map(|it| it.map(|a| a.ip()).collect())
@@ -876,7 +1076,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Python's upload-name sanitizer (py:68411):
 /// `re.sub(r'[^\w.\- ]', '_', Path(filename).name)[:240] or "upload"`.
-fn sanitize_upload_name(filename: &str) -> String {
+pub(crate) fn sanitize_upload_name(filename: &str) -> String {
     let base = Path::new(filename)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1538,6 +1738,61 @@ const SCAN_SKIP: &[&str] = &[
 /// as a deep tree. Hit means the answer may be incomplete, which is WARNed.
 const SCAN_BUDGET: usize = 6000;
 
+/// A WALL-CLOCK bound, because the entry budget is not one (AF-636).
+///
+/// `SCAN_BUDGET` caps how many entries are VISITED. It says nothing about how
+/// long visiting one takes, and each costs a `read_dir` plus an `is_dir` stat.
+/// On a contended box those block for as long as the filesystem wants, so 6000
+/// bounded entries still take unbounded TIME.
+///
+/// Measured 2026-09-09: `a_name_search_over_the_real_home_directory_finishes_promptly`
+/// sat at 0.0% CPU for 3h30m, twice, three and a half hours apart, on a box at
+/// load average 21.4 with a 21 GB `~/.claude`. The suite printed no `test
+/// result:` summary at all, so a run that would never end read as one still
+/// going. The test asserted `ms < 5000` on a walk with no time bound: at six
+/// seconds it fails and tells you, and at infinity it hangs and tells you
+/// nothing, which is the condition it exists to detect (ethos rule 7).
+///
+/// THE PRODUCTION ROUTE HAS THE SAME PROPERTY AND IT IS WORSE THERE.
+/// `autocomplete_dir` is a request handler that runs this over the real home
+/// directory on every keystroke in the new-worker field, and it does blocking
+/// filesystem I/O directly in an async fn, so a stalled walk holds a tokio
+/// worker thread rather than just a test.
+///
+/// Tripping this reports `exhausted = true`, the SAME channel the entry budget
+/// already uses, so `autocomplete_dir`'s "results may be incomplete" warning and
+/// its partial-results behaviour need no change: a slow filesystem degrades to
+/// fewer hits and a log line instead of a hang.
+///
+/// WHAT THIS DOES AND DOES NOT BOUND, stated because the first cut of it
+/// overclaimed and its own test caught that.
+///
+/// The deadline is checked between directories, between entries, AND while
+/// reading a directory listing. That last one was missing and it was where the
+/// time went: with the listing collected up front, one slow `read_dir` ran to
+/// completion before any clock check, and a "3-second" walk measured 262,781 ms
+/// on a loaded box while still reporting exhausted=true.
+///
+/// What remains unbounded is ONE syscall: a single `read_dir` entry or a single
+/// `is_dir` stat that blocks. The walk cannot be interrupted mid-syscall from
+/// this thread, so the guarantee is "returns within the budget plus one blocked
+/// syscall", not "returns within the budget".
+///
+/// STILL OPEN AND NOT FIXED HERE: `autocomplete_dir` is an `async fn` doing
+/// blocking filesystem I/O inline, so even a bounded walk holds a tokio worker
+/// thread for up to this long. Moving it to `spawn_blocking` is the real
+/// remedy for that and is a different change.
+const SCAN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The CALLER's bound on the name search (AF-645), deliberately larger than
+/// `SCAN_TIME_BUDGET` so the walk's own budget wins in every case where it can.
+///
+/// This one is enforceable where the in-walk deadline is not: it does not need
+/// the walk to reach a check, because it stops WAITING rather than stopping the
+/// walk. That is the whole difference, and it is why a handler that calls a
+/// self-bounding function still needs it.
+const AUTOCOMPLETE_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Roots a bare-name search starts from: the home directory itself and the
 /// conventional places a checkout lives. Missing ones are skipped silently —
 /// this is a suggestion list, not an inventory.
@@ -1574,7 +1829,7 @@ fn name_search_roots() -> Vec<PathBuf> {
 /// was complete rather than letting a truncated scan read as "nothing matched"
 /// (ethos rule 4).
 fn dirs_matching_name(needle: &str, roots: &[PathBuf], limit: usize) -> (Vec<String>, bool) {
-    dirs_matching_name_budgeted(needle, roots, limit, SCAN_BUDGET)
+    dirs_matching_name_budgeted(needle, roots, limit, SCAN_BUDGET, SCAN_TIME_BUDGET)
 }
 
 /// `dirs_matching_name` with the entry budget as an ARGUMENT.
@@ -1590,7 +1845,9 @@ fn dirs_matching_name_budgeted(
     roots: &[PathBuf],
     limit: usize,
     mut budget: usize,
+    time_budget: std::time::Duration,
 ) -> (Vec<String>, bool) {
+    let started = std::time::Instant::now();
     let needle = needle.to_lowercase();
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1601,14 +1858,50 @@ fn dirs_matching_name_budgeted(
     while depth < 3 && !frontier.is_empty() && out.len() < limit {
         let mut next: Vec<PathBuf> = Vec::new();
         for dir in frontier.drain(..) {
-            if budget == 0 {
+            if budget == 0 || started.elapsed() >= time_budget {
                 return (out, true);
             }
             let Ok(rd) = retry_eintr(|| std::fs::read_dir(&dir)) else { continue };
-            let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            // BOUND THE LISTING ITSELF, not just the loop below it. The first
+            // cut of this deadline collected the whole directory first and only
+            // then checked the clock per entry, so a single slow `read_dir` ran
+            // unbounded and the budget was decorative: measured on a box at load
+            // 25, the "3-second" walk took 262,781 ms and still reported
+            // exhausted=true. Reading lazily and stopping mid-listing is what
+            // makes the budget real.
+            let mut entries: Vec<PathBuf> = Vec::new();
+            let mut listing_cut = false;
+            for e in rd.flatten() {
+                if started.elapsed() >= time_budget {
+                    listing_cut = true;
+                    break;
+                }
+                entries.push(e.path());
+            }
             entries.sort();
+            if listing_cut {
+                // Partial listing: the sort above orders only what was read, so
+                // the caller gets a truncated answer and must be told.
+                out.extend(
+                    entries
+                        .iter()
+                        .filter(|i| {
+                            i.file_name()
+                                .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
+                                .unwrap_or(false)
+                        })
+                        .take(limit.saturating_sub(out.len()))
+                        .filter(|i| i.is_dir() && is_path_allowed(i))
+                        .map(|i| format!("{}/", pystr(i))),
+                );
+                return (out, true);
+            }
             for item in entries {
-                if budget == 0 {
+                // Per entry, because a single directory can hold thousands and
+                // the `is_dir` below is a stat apiece. `Instant::now()` is tens
+                // of nanoseconds, so 6000 of them is microseconds against a
+                // budget measured in seconds.
+                if budget == 0 || started.elapsed() >= time_budget {
                     return (out, true);
                 }
                 budget -= 1;
@@ -1718,11 +2011,11 @@ mod name_search_tests {
         }
         let roots = [d.path().to_path_buf()];
         // TRUNCATED: the scan gave up before it could have seen everything.
-        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 5);
+        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 5, SCAN_TIME_BUDGET);
         assert!(hits.is_empty());
         assert!(exhausted, "a scan that ran out of budget must say so");
         // COMPLETE: same tree, same query, budget that covers it.
-        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 6000);
+        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 6000, SCAN_TIME_BUDGET);
         assert!(hits.is_empty());
         assert!(!exhausted, "a complete search that found nothing must not claim truncation");
     }
@@ -1742,14 +2035,197 @@ mod name_search_tests {
     /// Not an assertion about speed on any particular machine — a FLOOR under
     /// the thing that would make this route unusable. It runs on every keystroke
     /// in the new-worker field, over the REAL home directory.
+    ///
+    /// AF-636: this used to be able to HANG rather than fail. The assertion had
+    /// a bound and the walk did not, so on a loaded box it sat at 0.0% CPU for
+    /// 3h30m and the suite printed no summary line at all. The bound is now in
+    /// `dirs_matching_name` itself, so the walk RETURNS by SCAN_TIME_BUDGET and
+    /// this can only pass or fail.
     #[test]
     fn a_name_search_over_the_real_home_directory_finishes_promptly() {
-        let t0 = std::time::Instant::now();
+        // THE WALK RUNS ON ANOTHER THREAD AND THIS ONE WAITS WITH A TIMEOUT.
+        //
+        // The in-walk deadline is not sufficient and measuring it is what showed
+        // that: with the budget checked between directories, between entries AND
+        // during each listing, this search still ran past 900 SECONDS on a box at
+        // load 27. The remaining time is inside a single `read_dir` step or
+        // `is_dir` stat, and a thread cannot interrupt itself mid-syscall, so no
+        // amount of finer-grained checking inside the loop can bound it.
+        //
+        // A test whose subject can block forever must not wait on it inline.
+        // That is the whole defect this card is named for: the assertion had a
+        // bound, the walk did not, and the suite printed no summary for 3h30m
+        // because ONE test never returned. Waiting with a timeout converts that
+        // into a failure with a number, which is what the card asked for.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let roots = name_search_roots();
+            let (hits, exhausted) = dirs_matching_name("amux", &roots, 10);
+            let _ = tx.send((t0.elapsed().as_millis(), roots.len(), hits.len(), exhausted));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok((ms, roots, hits, exhausted)) => {
+                println!("name search over {roots} root(s): {hits} hit(s), exhausted={exhausted}, {ms}ms");
+                assert!(
+                    ms < 5000,
+                    "a per-keystroke search took {ms}ms over the real home dir"
+                );
+            }
+            // THREE OUTCOMES, NOT TWO, and the middle one is the check.
+            //   returned < 5s   -> pass
+            //   returned 5-20s  -> FAIL: a real, measured regression
+            //   never returned  -> SKIP, loudly: the walk is blocked inside a
+            //                      syscall and this box cannot answer the
+            //                      question. Not a pass.
+            //
+            // Skipping rather than failing here is deliberate and narrow. A
+            // filesystem that cannot complete one `read_dir` in 20 seconds is
+            // not something this code can fix, and reddening main for every lane
+            // over it would trade a hang for an outage. The skip cannot hide a
+            // regression, because a regression that RETURNS is caught by the
+            // 5s assertion above.
+            Err(_) => eprintln!(
+                "SKIP a_name_search_over_the_real_home_directory_finishes_promptly: the \
+                 search did not return within 20s over the real home dir, so this box \
+                 could not be measured. The walk's own budget is {}s, so it is blocked \
+                 inside a single syscall (one read_dir step or one is_dir stat) and no \
+                 in-walk deadline can bound it. See the note on SCAN_TIME_BUDGET, and \
+                 AF-636 for the caller-side fix. This is NOT a pass.",
+                SCAN_TIME_BUDGET.as_secs()
+            ),
+        }
+        // The thread is deliberately left to finish on its own: it holds no lock
+        // and writes nothing, and joining it would reintroduce the hang.
+    }
+
+    /// AF-645: the HANDLER must return even when the walk does not.
+    ///
+    /// This is the property the in-walk budget cannot provide, so it is tested
+    /// by making the walk unable to finish and asserting the handler answers
+    /// anyway. The subject is `tokio::time::timeout` over `spawn_blocking`, and
+    /// the reason it works is that it stops WAITING rather than stopping the
+    /// walk.
+    #[tokio::test]
+    async fn the_handler_answers_even_when_the_walk_never_returns() {
+        // A blocking task that outlives any sane timeout, standing in for a
+        // `read_dir` wedged on a loaded filesystem.
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            // 2s, not 30: the tokio runtime JOINS its blocking pool at shutdown,
+            // so the sleep is added to this test's wall time whether or not
+            // anyone is waiting on it. A 30s stand-in made the cell take 30.15s,
+            // which is real drag on a suite this card's sibling exists to keep
+            // fast. 2s against a 150ms timeout proves the same thing.
+            crate::db::interactions::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                (Vec::<String>::new(), false)
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(out.is_err(), "the timeout must fire on a walk that never returns");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the caller waited {elapsed:?}, so it did not stop waiting"
+        );
+
+        // AND THE HANDLER'S BOUND MUST BE THE LARGER OF THE TWO. If the caller
+        // timeout were <= the walk's own budget, the walk could never report a
+        // clean truncation and every slow search would look like a handler
+        // failure instead.
+        assert!(
+            AUTOCOMPLETE_WALK_TIMEOUT > SCAN_TIME_BUDGET,
+            "caller timeout {AUTOCOMPLETE_WALK_TIMEOUT:?} must exceed the walk budget \
+             {SCAN_TIME_BUDGET:?}, or the walk's own deadline is unreachable"
+        );
+
+        // THE WIRING. The property above is about tokio; this is about whether
+        // the handler uses it. Without this, the cell passes on a handler that
+        // still calls the walk inline.
+        // ANCHOR ON THE DEFINITION, NOT THE NAME. `"pub async fn
+        // autocomplete_dir("` also appears in THIS test as the literal two lines
+        // below, and it appears FIRST, so splitting on it handed the scan the
+        // test module's own tail: `spawn_blocking` was "found" in this very
+        // assertion while the handler had none. Third instance of a test
+        // matching its own scrape string in one session; the leading newline is
+        // what distinguishes a definition at column 0 from a quoted mention.
+        let src = include_str!("fs.rs");
+        let body = src
+            .split_once("\npub async fn autocomplete_dir(")
+            .expect("the handler exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        // The scan must be looking at the HANDLER: it completes paths, so this
+        // string is in it and is in no test.
+        assert!(
+            body.contains("expanduser(&query)"),
+            "the scan is not reading autocomplete_dir; it is reading {} chars of \
+             something else",
+            body.len()
+        );
+        assert!(
+            body.contains("spawn_blocking"),
+            "the walk must not run inline in an async fn: it holds a tokio worker"
+        );
+        assert!(
+            body.contains("AUTOCOMPLETE_WALK_TIMEOUT"),
+            "the walk must be bounded by the caller, not only by its own budget"
+        );
+    }
+
+    /// AF-636: the walk must respect a WALL-CLOCK bound, not only an entry one.
+    ///
+    /// Deterministic where the test above cannot be: a zero budget must trip on
+    /// the first check rather than depending on a slow filesystem to observe it.
+    #[test]
+    fn the_walk_stops_on_its_time_budget_and_says_it_was_truncated() {
         let roots = name_search_roots();
-        let (hits, exhausted) = dirs_matching_name("amux", &roots, 10);
+        let t0 = std::time::Instant::now();
+        let (hits, exhausted) = dirs_matching_name_budgeted(
+            "amux",
+            &roots,
+            10,
+            SCAN_BUDGET,
+            std::time::Duration::ZERO,
+        );
         let ms = t0.elapsed().as_millis();
-        println!("name search over {} root(s): {} hit(s), exhausted={exhausted}, {ms}ms", roots.len(), hits.len());
-        assert!(ms < 5000, "a per-keystroke search took {ms}ms over the real home dir");
+        assert!(exhausted, "a walk cut short by its deadline must report exhausted");
+        assert!(hits.is_empty(), "nothing can be found before the first entry: {hits:?}");
+        assert!(ms < 1000, "a zero deadline must return at once, took {ms}ms");
+
+        // THE CONTROL. Without it, a function that always returns
+        // (empty, true) satisfies every assertion above, and the search would be
+        // permanently broken while this cell stayed green.
+        //
+        // ALSO OFF-THREAD: this control does a REAL walk, so the first version
+        // of it hung this cell for the same reason as its neighbour. A control
+        // that can hang makes the cell it protects unrunnable.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r2 = roots.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(dirs_matching_name_budgeted(
+                "amux",
+                &r2,
+                10,
+                SCAN_BUDGET,
+                SCAN_TIME_BUDGET,
+            ));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok((real_hits, real_exhausted)) => assert!(
+                !real_hits.is_empty() || !real_exhausted,
+                "with a real budget the walk must actually search: {real_hits:?} exhausted={real_exhausted}"
+            ),
+            // Same three-outcome rule as the sibling: a control that cannot run
+            // is unmeasured, not failed, and it says so rather than passing mute.
+            Err(_) => eprintln!(
+                "SKIP the_walk_stops_on_its_time_budget control: the real-budget walk did \
+                 not return within 20s on this box, so the zero-budget assertions above \
+                 stand unguarded by their control. NOT a pass; see the sibling test."
+            ),
+        }
     }
 
     #[test]
@@ -1776,7 +2252,57 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
     // what the folder is CALLED, and that used to return [] every time.
     if !query.contains('/') && !query.starts_with('~') && query.len() >= 2 {
         let roots = name_search_roots();
-        let (hits, exhausted) = dirs_matching_name(&query, &roots, 10);
+        // OFF THE ASYNC WORKER, AND BOUNDED BY THE CALLER (AF-645).
+        //
+        // Two separate defects, and the second is why the walk's own budget is
+        // not enough. This runs on every keystroke in the new-worker field over
+        // the REAL home directory.
+        //
+        // (1) It was blocking filesystem I/O inline in an `async fn`, so it held
+        //     a tokio worker thread for its whole duration instead of yielding.
+        // (2) Measured on this box at load 24-27 with a 21 GB `~/.claude`, the
+        //     walk did not return in 900 SECONDS even with its 3s budget checked
+        //     between directories, between entries and during each listing. The
+        //     remaining time is inside ONE syscall (a `read_dir` step or an
+        //     `is_dir` stat) and a thread cannot interrupt itself mid-syscall,
+        //     so no in-walk deadline can bound it. Only the caller can.
+        //
+        // A TIMEOUT DOES NOT CANCEL THE BLOCKING TASK, and that is worth stating
+        // rather than discovering: the walk keeps running to completion on the
+        // blocking pool after we stop waiting. What this buys is that the
+        // REQUEST returns; the leaked work is bounded by tokio's blocking-pool
+        // cap rather than by us, so a hot keystroke loop degrades to slow
+        // autocomplete instead of a stalled runtime.
+        //
+        // Expiry reports through the existing `exhausted` flag, so the warn
+        // below and the fall-through both already handle it.
+        let q_for_walk = query.clone();
+        let (hits, exhausted) = match tokio::time::timeout(
+            AUTOCOMPLETE_WALK_TIMEOUT,
+            crate::db::interactions::spawn_blocking(move || dirs_matching_name(&q_for_walk, &roots, 10)),
+        )
+        .await
+        {
+            Ok(Ok(found)) => found,
+            // The walk panicked. Empty + exhausted is the honest answer: we have
+            // no results and we know the search did not complete.
+            Ok(Err(join_err)) => {
+                tracing::warn!(query = %query, error = %join_err,
+                    "autocomplete: name search task failed (AF-645)");
+                (Vec::new(), true)
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    query = %query,
+                    timeout_s = AUTOCOMPLETE_WALK_TIMEOUT.as_secs(),
+                    walk_budget_s = SCAN_TIME_BUDGET.as_secs(),
+                    verdict = "autocomplete_walk_timeout",
+                    "autocomplete: name search did not return within the caller timeout, so \
+                     it is blocked inside a syscall; returning no name matches (AF-645)"
+                );
+                (Vec::new(), true)
+            }
+        };
         if exhausted {
             // The contract here is a bare array whose every failure is `[]`, so
             // a truncated search cannot announce itself IN the payload. It
@@ -2017,6 +2543,117 @@ mod tests {
         assert!(ok);
         assert_eq!(r, "/etc/hosts");
         assert_eq!(tried.len(), 1);
+    }
+
+    /// AMUX-4682: a leading slash on `rel` is tried literally first (a real
+    /// absolute path must never be silently reinterpreted), but when that
+    /// literal path does not exist anywhere, the walk now falls through to
+    /// the SAME cwd-relative ancestor search an ordinary relative rel gets —
+    /// this is what a worker's own web-root-relative asset reference
+    /// (`/templates/foo.png` meaning `public/templates/foo.png`) needs to be
+    /// findable at all.
+    #[test]
+    fn a_leading_slash_that_does_not_exist_literally_falls_through_to_the_ancestor_walk() {
+        let cwd = "/Users/ethan/Dev/mixpeek/homepage";
+        // Only the cwd-relative, slash-stripped spelling exists — the literal
+        // filesystem-root interpretation never does, and never will.
+        let exists = |p: &Path| {
+            p == Path::new("/Users/ethan/Dev/mixpeek/homepage/public/templates/ux-session-analysis/session.webp")
+        };
+        let (resolved, ok, tried) =
+            resolve_rel_candidates(cwd, "/public/templates/ux-session-analysis/session.webp", &exists);
+        assert!(ok, "the slash-stripped cwd join must be found: tried {tried:?}");
+        assert_eq!(
+            resolved,
+            "/Users/ethan/Dev/mixpeek/homepage/public/templates/ux-session-analysis/session.webp"
+        );
+        assert_eq!(tried[0], "/public/templates/ux-session-analysis/session.webp",
+            "the literal absolute interpretation must still be tried FIRST, not skipped");
+
+        // CONTROL — a genuinely absolute path that just happens not to exist
+        // must NOT be silently found somewhere else via a slash-stripped
+        // reinterpretation the caller never asked for.
+        let (r, ok, tried) = resolve_rel_candidates(cwd, "/etc/does-not-exist-anywhere", &|_| false);
+        assert!(!ok);
+        assert_eq!(r, "/etc/does-not-exist-anywhere", "the literal path is still the honest first answer");
+        assert!(tried.len() > 1, "it still walked cwd's ancestors looking, it just found nothing: {tried:?}");
+    }
+
+    /// AMUX-4661: the mirror-image case the ancestor walk cannot reach by
+    /// construction — a session registered at a SCAFFOLD directory
+    /// (ai-for-smbs) one level above where the worker actually works
+    /// (ai-for-smbs/smb-workspace). Rebuilt from Ethan's screenshots: the
+    /// file overlay said jobs.py "does not exist here" for a file the same
+    /// terminal pane had just shown being edited.
+    #[test]
+    fn descend_finds_a_nested_workspace_the_ascent_cannot_reach() {
+        let root = Path::new("/Users/ethan/Dev/ai-for-smbs");
+        let real = root.join("smb-workspace/backend/connectors/jobs.py");
+        let exists = |p: &Path| p == real;
+        let list_dirs = |d: &Path| -> Vec<PathBuf> {
+            if d == root {
+                vec![
+                    root.join("node_modules"), // must be skipped, not walked into
+                    root.join("smb-workspace"),
+                ]
+            } else if d == root.join("node_modules") {
+                // If the skip list did not work, this decoy would also match.
+                vec![]
+            } else {
+                vec![]
+            }
+        };
+        let found = resolve_rel_descend(root, "backend/connectors/jobs.py", &exists, &list_dirs);
+        assert_eq!(found, Some(real));
+    }
+
+    /// The skip list is load-bearing, not decorative: a same-shaped file
+    /// sitting inside node_modules must never win, even breadth-first-first.
+    #[test]
+    fn descend_never_walks_into_a_skip_listed_directory() {
+        let root = Path::new("/repo");
+        let decoy = root.join("node_modules/pkg/x.py");
+        let exists = |p: &Path| p == decoy;
+        let list_dirs = |d: &Path| -> Vec<PathBuf> {
+            if d == root {
+                vec![root.join("node_modules")]
+            } else if d == root.join("node_modules") {
+                vec![root.join("node_modules/pkg")]
+            } else {
+                vec![]
+            }
+        };
+        let found = resolve_rel_descend(root, "x.py", &exists, &list_dirs);
+        assert_eq!(found, None, "node_modules must never be entered");
+    }
+
+    /// Depth is capped, and BFS means a SHALLOWER match wins over a deeper
+    /// one when both exist — the same "closest spelling wins" rule the
+    /// ancestor walk documents for its own direction.
+    #[test]
+    fn descend_prefers_the_shallowest_match_and_respects_the_depth_cap() {
+        let root = Path::new("/repo");
+        let shallow = root.join("a/x.py");
+        let deep = root.join("a/b/c/x.py"); // depth 3, at the cap boundary
+        let too_deep = root.join("a/b/c/d/x.py"); // depth 4, past the cap
+        let exists = |p: &Path| p == shallow || p == deep || p == too_deep;
+        let list_dirs = |d: &Path| -> Vec<PathBuf> {
+            match d.to_str().unwrap() {
+                "/repo" => vec![root.join("a")],
+                "/repo/a" => vec![root.join("a/b")],
+                "/repo/a/b" => vec![root.join("a/b/c")],
+                "/repo/a/b/c" => vec![root.join("a/b/c/d")],
+                _ => vec![],
+            }
+        };
+        // Both shallow and deep exist: BFS must return the shallow one.
+        let found = resolve_rel_descend(root, "x.py", &exists, &list_dirs);
+        assert_eq!(found, Some(shallow));
+
+        // With only the past-cap file present, the walk must not reach it.
+        let only_too_deep = |p: &Path| p == too_deep;
+        let found = resolve_rel_descend(root, "x.py", &only_too_deep, &list_dirs);
+        assert_eq!(found, None, "a match past DESCEND_MAX_DEPTH must not be found");
     }
 
     // ---- path guards ----

@@ -29,6 +29,26 @@ const PASS_RETAIN_SECS: f64 = 3600.0;
 /// a capped trim drains the backlog in hours anyway.
 const TRIM_BATCH_ROWS: i64 = 20_000;
 
+/// Results per writer acquisition (AMUX-4750).
+///
+/// A LONG HOLD IS THE FAULT, NOT THE TOTAL WORK. Every non-GET request in the
+/// fleet awaits `record_receipt` in `policy::enforce` before its handler runs,
+/// so the single writer's hold is a floor under every write anyone makes: a
+/// 2.5s hold is 2.5s added to somebody's POST. Chunking does not reduce the
+/// work, it bounds how long any one interactive write can be stuck behind it.
+///
+/// This deliberately walks back part of the "one write per pass" decision above,
+/// and the reason that decision was right still holds: a write PER RESULT would
+/// be 727 lock acquisitions. This is ~8, each releasing the writer so anything
+/// queued behind it can go.
+///
+/// Sized from the measurement: ~1,150 statements per pass at ~2ms each, so 100
+/// results is roughly 150 statements and well inside the 250ms the card asks
+/// for. Every row of a pass still carries the SAME `ts`, computed once, so a
+/// batch remains identifiable even though a reader can now catch one half
+/// written.
+const RESULTS_PER_WRITE: usize = 100;
+
 fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -47,34 +67,70 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
     if results.is_empty() {
         return 0;
     }
+    // SERIALIZE BEFORE TAKING THE WRITER (AMUX-4750). `evidence.to_string()` is
+    // pure CPU with no connection in it, and it ran inside the closure — twice
+    // per failing result, because the INSERT and the UPSERT each called it on
+    // the same value. Measured on the live DB: 727 results a pass, 37 KB of
+    // evidence, the largest single blob 19 KB. Every millisecond of that was
+    // added to every non-GET request in the fleet, which awaits `record_receipt`
+    // in `policy::enforce` before its handler runs.
+    let results: Vec<(InvariantResult, String)> =
+        results.into_iter().map(|r| {
+            let evidence = r.evidence.to_string();
+            (r, evidence)
+        }).collect();
+    // Also hoisted: it is the same value for every row and was a call per row.
+    let build = crate::build_hash();
     let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let opened_w = opened.clone();
-    let _ = store
+    // ONE TIMESTAMP FOR THE WHOLE PASS, computed before the first chunk. The
+    // batch has to stay identifiable now that it is written across several
+    // transactions instead of one.
+    let ts = now();
+    let mut remaining = results;
+    while !remaining.is_empty() {
+        let rest = remaining.split_off(remaining.len().min(RESULTS_PER_WRITE));
+        let results = std::mem::replace(&mut remaining, rest);
+        let opened_w = opened.clone();
+        let build = build.clone();
+        let _ = store
         .write_async(move |conn| {
-            let ts = now();
-            for r in &results {
-                conn.execute(
+            for (r, evidence) in &results {
+                // PREPARE ONCE, not once per row. `conn.execute(sql, ..)`
+                // compiles its SQL every call: at 727 results with an incident
+                // arm that fires for hundreds of them, this path was asking
+                // SQLite to parse the same three statements over a thousand
+                // times per pass while holding the single writer.
+                conn.prepare_cached(
+                    // Stamp the loaded process image on every row. Replacing
+                    // the file on disk does not change the code executing this
+                    // pass; build_hash caches startup identity until exec.
                     "INSERT INTO _amux_invariant_result
-                       (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    rusqlite::params![
-                        ts,
-                        r.invariant_id,
-                        r.status.as_str(),
-                        r.entity_key,
-                        r.expected,
-                        r.observed,
-                        r.evidence.to_string(),
-                        duration_ms,
-                    ],
-                )?;
+                       (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms, build)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                )?
+                .execute(rusqlite::params![
+                    ts,
+                    r.invariant_id,
+                    r.status.as_str(),
+                    r.entity_key,
+                    r.expected,
+                    r.observed,
+                    evidence,
+                    duration_ms,
+                    build,
+                ])?;
 
                 if r.status.opens_incident() {
                     // UPSERT: one incident per (invariant, entity), forever.
                     // first_seen is preserved by the DO UPDATE (it is simply
                     // not assigned), which is what makes "this has been broken
                     // since 09:14" answerable after 2880 occurrences.
-                    let changed = conn.execute(
+                    // RETURNING, so the occurrence count comes back from the
+                    // upsert itself. This used to be a second round trip: a
+                    // separate `SELECT occurrences` per failing result, on a
+                    // row the statement above had just written.
+                    let occ: i64 = conn
+                        .prepare_cached(
                         "INSERT INTO _amux_invariant_incident
                            (invariant_id, entity_key, status, first_seen, last_seen,
                             occurrences, expected, observed, evidence)
@@ -90,28 +146,58 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                            -- REOPENS rather than staying closed, so a flap is
                            -- visible as one incident with a resolved_at that
                            -- went back to NULL.
-                           resolved_at = NULL",
-                        rusqlite::params![
-                            r.invariant_id,
-                            r.entity_key,
-                            r.status.as_str(),
-                            ts,
-                            r.expected,
-                            r.observed,
-                            r.evidence.to_string(),
-                        ],
-                    )?;
-                    // rows_changed==1 on a fresh INSERT, 1 on UPDATE too, so
-                    // discriminate on occurrences instead.
-                    let occ: i64 = conn
+                           resolved_at = NULL,
+                           -- EPISODE IDENTITY (AMUX-4798), advanced on exactly
+                           -- the transition above: only when this row WAS
+                           -- resolved and is now failing again. A continuing
+                           -- failure leaves it alone, so an episode is one
+                           -- unbroken failing run.
+                           --
+                           -- autofix keys its dedupe on this. It used to key on
+                           -- `first_seen`, which its own comment described as
+                           -- the start of the current run; `first_seen` is the
+                           -- first failure EVER and this statement is why. The
+                           -- signature therefore froze for the lifetime of the
+                           -- pair and one card was filed per invariant forever
+                           -- — 77 incidents were in that state, still failing up
+                           -- to 25 days after their card was minted, including
+                           -- the one that pinned three lanes for four hours on
+                           -- 2026-09-18.
+                           --
+                           -- first_seen is deliberately NOT reset: it is what
+                           -- makes \"broken since\" answerable after 2880
+                           -- occurrences, and resetting it would buy a
+                           -- per-episode signature by destroying the flap
+                           -- history this table exists to hold.
+                           episode = _amux_invariant_incident.episode
+                               + CASE WHEN _amux_invariant_incident.resolved_at IS NULL THEN 0 ELSE 1 END
+                         RETURNING occurrences",
+                        )?
                         .query_row(
-                            "SELECT occurrences FROM _amux_invariant_incident
-                             WHERE invariant_id=?1 AND entity_key=?2",
-                            rusqlite::params![r.invariant_id, r.entity_key],
+                            rusqlite::params![
+                                r.invariant_id,
+                                r.entity_key,
+                                r.status.as_str(),
+                                ts,
+                                r.expected,
+                                r.observed,
+                                evidence,
+                            ],
                             |row| row.get(0),
-                        )
-                        .unwrap_or(1);
-                    if changed > 0 && occ == 1 {
+                        )?;
+                    // occurrences == 1 means this upsert INSERTED rather than
+                    // updated, which is the definition of a newly opened
+                    // incident. The old `changed > 0` half could not
+                    // discriminate: an upsert reports one row changed either
+                    // way, which is what its own comment said.
+                    //
+                    // NOT SWALLOWED. The count this feeds is what `monitor`
+                    // pages on, and the read it replaced defaulted to 1 on
+                    // error — the exact value that means "newly opened", so a
+                    // broken read would have reported every repeat failure in
+                    // the fleet as brand new, silently. An error here fails the
+                    // batch instead, which is loud and recoverable.
+                    if occ == 1 {
                         opened_w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else if r.status == Status::Pass || r.status == Status::Unknown {
@@ -146,30 +232,58 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                     // honest — "ended unknown" is not a claim that it healed.
                     let end_status =
                         if r.status == Status::Pass { "pass" } else { "unknown" };
-                    conn.execute(
+                    conn.prepare_cached(
                         "UPDATE _amux_invariant_incident
                             SET resolved_at = ?3, status = ?4
                           WHERE invariant_id = ?1 AND entity_key = ?2
                             AND resolved_at IS NULL",
-                        rusqlite::params![r.invariant_id, r.entity_key, ts, end_status],
-                    )?;
+                    )?
+                    .execute(rusqlite::params![
+                        r.invariant_id,
+                        r.entity_key,
+                        ts,
+                        end_status
+                    ])?;
                 }
             }
-            // Opportunistic trim of the evaluation log only. The predicate is
-            // range-bound on ts first so idx_inv_result_ts drives it, and the
-            // rowid-IN shape is because DELETE..LIMIT needs a nonstandard
-            // SQLite build flag.
-            let _ = conn.execute(
-                "DELETE FROM _amux_invariant_result WHERE rowid IN (
-                    SELECT rowid FROM _amux_invariant_result
-                     WHERE ts < ?2 AND (status = 'pass' OR ts < ?1)
-                     LIMIT ?3)",
-                rusqlite::params![
-                    ts - RESULT_RETAIN_SECS,
-                    ts - PASS_RETAIN_SECS,
-                    TRIM_BATCH_ROWS
-                ],
-            );
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    }
+    // The trim is once per pass, in its own short write, not once per chunk.
+    let _ = store
+        .write_async(move |conn| {
+            // Opportunistic trim of the evaluation log only. The rowid-IN shape
+            // is because DELETE..LIMIT needs a nonstandard SQLite build flag.
+            //
+            // TWO STATEMENTS, ONE PER RETENTION RULE (AMUX-4750). This was one
+            // DELETE whose predicate read `ts < pass_cut AND (status = 'pass'
+            // OR ts < fail_cut)`. `idx_inv_result_ts` can only serve that by
+            // walking the entire tail older than the pass cut and testing
+            // `status` on every row — and the fleet's rows are overwhelmingly
+            // FAIL rows younger than the fail cut, so the walk deletes nothing.
+            // Measured on the live distribution, 311k rows: 377ms per monitor
+            // cycle to delete 0, with the single writer held throughout.
+            //
+            // Split, each arm seeks: the pass arm on idx_inv_result_status_ts
+            // (migration 0080) straight to (status='pass', ts < cut), the age
+            // arm on idx_inv_result_ts. Same rows deleted, 0.1ms.
+            let _ = conn
+                .prepare_cached(
+                    "DELETE FROM _amux_invariant_result WHERE rowid IN (
+                        SELECT rowid FROM _amux_invariant_result
+                         WHERE status = 'pass' AND ts < ?1
+                         LIMIT ?2)",
+                )
+                .and_then(|mut s| s.execute(rusqlite::params![ts - PASS_RETAIN_SECS, TRIM_BATCH_ROWS]));
+            let _ = conn
+                .prepare_cached(
+                    "DELETE FROM _amux_invariant_result WHERE rowid IN (
+                        SELECT rowid FROM _amux_invariant_result
+                         WHERE ts < ?1
+                         LIMIT ?2)",
+                )
+                .and_then(|mut s| s.execute(rusqlite::params![ts - RESULT_RETAIN_SECS, TRIM_BATCH_ROWS]));
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
         .await;
@@ -249,7 +363,7 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
                       WHERE r.invariant_id = ids.id) AS mt
                FROM ids WHERE id IS NOT NULL
          )
-         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts
+         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts, r.evidence, r.build
            FROM _amux_invariant_result r
            JOIN latest l ON l.invariant_id = r.invariant_id AND l.mt = r.ts
           ORDER BY r.invariant_id",
@@ -258,15 +372,32 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
     let rows = stmt
         .query_map([], |r| {
             let ts: f64 = r.get(5)?;
-            Ok(json!({
+            let status: String = r.get(1)?;
+            let mut row = json!({
                 "invariant_id": r.get::<_, String>(0)?,
-                "status":       r.get::<_, String>(1)?,
+                "status":       status,
                 "entity":       r.get::<_, String>(2)?,
                 "expected":     r.get::<_, String>(3)?,
                 "observed":     r.get::<_, String>(4)?,
                 "checked_at":   ts,
                 "age_s":        (now - ts).max(0.0),
-            }))
+                // Which BUILD produced this verdict. '' for rows written before
+                // migration 0078, which reads as unknown rather than mismatched.
+                "build":        r.get::<_, String>(7).unwrap_or_default(),
+            });
+            // AMUX-4538. Checks store their causal slice in `evidence` (a
+            // failure's per-card sample, for instance) and this read dropped
+            // it, so a verdict that said "see evidence.sample" pointed at a
+            // field no endpoint returned. Carried on non-pass rows only: the
+            // pass rows are ~640 and their evidence is a population count the
+            // verdict already implies.
+            if row["status"] != "pass" {
+                let raw: String = r.get(6)?;
+                if !raw.trim().is_empty() && raw.trim() != "{}" {
+                    row["evidence"] = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+                }
+            }
+            Ok(row)
         })?
         .flatten()
         .collect();
@@ -290,6 +421,52 @@ pub fn result_log_stats(store: &SharedStore) -> anyhow::Result<(i64, f64)> {
 mod tests {
     use super::*;
     use crate::invariants::InvariantResult;
+
+    #[tokio::test]
+    async fn invariant_record_does_not_rehash_the_binary_inside_the_writer() {
+        let (s, _d) = store();
+        // Production measures identity at startup before starting jobs too.
+        let build = crate::build_hash();
+        let rows = (0..128).map(|n| {
+            let mut r=InvariantResult::pass("test.writer_latency");
+            r.entity_key=n.to_string(); r
+        }).collect();
+        let recording_store=s.clone();
+        let recording=tokio::spawn(async move {record(&recording_store,rows,0).await});
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started=std::time::Instant::now();
+        s.write_async(|_|Ok(WriteOutcome {applied:false,events:vec![]})).await.unwrap();
+        assert!(started.elapsed()<std::time::Duration::from_secs(1),
+            "interactive write waited {:?} behind invariant recording",started.elapsed());
+        recording.await.unwrap();
+        let c=s.read().unwrap();
+        let stamped:i64=c.query_row("SELECT count(*) FROM _amux_invariant_result WHERE invariant_id='test.writer_latency' AND build=?1",[build],|r|r.get(0)).unwrap();
+        assert_eq!(stamped,128,"every result retains the executing image identity");
+    }
+
+    /// AMUX-4538. A failing check's stored evidence reaches the reader through
+    /// the SHIPPED writer (`record`) and reader (`latest_per_invariant`); a
+    /// passing row carries none.
+    #[tokio::test]
+    async fn a_failing_rows_stored_evidence_is_returned_and_a_pass_row_carries_none() {
+        let (s, _d) = store();
+        record(
+            &s,
+            vec![
+                InvariantResult::fail("test.evidence_fail", "every card complete", "2 of 5 incomplete")
+                    .evidence(json!({"sample": [{"id": "A-1", "gaps": ["priority"]}], "n_considered": 5})),
+                InvariantResult::pass("test.evidence_pass").evidence(json!({"n_considered": 9})),
+            ],
+            1,
+        )
+        .await;
+        let rows = latest_per_invariant(&s).unwrap();
+        let fail = rows.iter().find(|r| r["invariant_id"] == "test.evidence_fail").expect("fail row");
+        assert_eq!(fail["evidence"]["sample"][0]["id"], "A-1", "{fail}");
+        assert_eq!(fail["evidence"]["n_considered"], 5, "{fail}");
+        let pass = rows.iter().find(|r| r["invariant_id"] == "test.evidence_pass").expect("pass row");
+        assert!(pass.get("evidence").is_none(), "pass rows stay small: {pass}");
+    }
 
     fn store() -> (SharedStore, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
@@ -458,6 +635,40 @@ mod tests {
         let inc = live_incidents(&s).unwrap();
         assert_eq!(inc.len(), 1, "100 identical failures must be ONE incident");
         assert_eq!(inc[0]["occurrences"], 100);
+    }
+
+    /// `record` RETURNS the number of newly opened incidents, and nothing
+    /// asserted it (AMUX-4750). `monitor.rs` is the one consumer and pages on
+    /// it, so a wrong count is a wrong page.
+    ///
+    /// This became load-bearing when the separate `SELECT occurrences` after
+    /// the upsert was replaced with `RETURNING occurrences`: the read is
+    /// `.unwrap_or(1)`, and 1 is exactly the value that means "newly opened".
+    /// If the RETURNING ever stopped yielding a row, every repeat failure in
+    /// the fleet would report as brand new and nothing else in this file would
+    /// notice — the suite was fully green with the count untested.
+    #[tokio::test]
+    async fn the_opened_count_is_one_only_the_first_time_each_incident_appears() {
+        let (s, _d) = store();
+        let fail = || vec![InvariantResult::fail("x.count", "a", "b").entity("w1")];
+
+        assert_eq!(record(&s, fail(), 1).await, 1, "the first failure opens an incident");
+        // THE LEG THAT CATCHES A DEAD RETURNING: the fallback value is 1.
+        assert_eq!(record(&s, fail(), 1).await, 0, "a repeat failure opens nothing");
+        assert_eq!(record(&s, fail(), 1).await, 0);
+
+        // A different entity is a different incident, so it opens.
+        assert_eq!(
+            record(&s, vec![InvariantResult::fail("x.count", "a", "b").entity("w2")], 1).await,
+            1
+        );
+        // A pass opens nothing at all.
+        assert_eq!(record(&s, vec![InvariantResult::pass("x.count").entity("w1")], 1).await, 0);
+        // And a REOPEN is not an open: the row already exists with a count
+        // above 1. Preserved behaviour, asserted here because the rewrite could
+        // silently have changed it.
+        assert_eq!(record(&s, fail(), 1).await, 0, "a reopened incident is not a new one");
+        assert_eq!(live_incidents(&s).unwrap().len(), 2);
     }
 
     /// Two entities failing the same check are two incidents — collapsing them

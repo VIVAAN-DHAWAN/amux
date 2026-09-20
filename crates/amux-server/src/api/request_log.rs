@@ -103,6 +103,13 @@ pub struct LogRow {
 /// definition rather than the test restating the order — the two drifting is
 /// exactly how the log came to disagree with the handlers in the first place.
 pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
+    // An invited human is authenticated by the member cookie. Ordinary
+    // X-Amux-Worker / X-Amux-Session values remain client-controlled, so the
+    // internal member actor must win or multiplayer request history is
+    // trivially spoofable.
+    if let Some(actor) = super::org::local_member_actor(h) {
+        return actor.to_string();
+    }
     for k in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
@@ -221,9 +228,25 @@ impl RequestLogger {
                         }
                         if sweep {
                             let cutoff = unix_now() - retain_days * 86400.0;
+                            conn.execute("DELETE FROM _amux_interaction_effects WHERE interaction_id IN
+                                (SELECT id FROM _amux_interactions WHERE updated_at < ?1)", [(cutoff * 1000.0) as i64])?;
+                            let receipts = conn.execute("DELETE FROM _amux_interactions WHERE updated_at < ?1", [(cutoff * 1000.0) as i64])?;
+                            if receipts > 0 { tracing::info!(verdict="interaction_retention", n_considered=receipts, "Expired interaction receipts removed"); }
+                            // CAPPED (AMUX-4750). This was an unbounded DELETE
+                            // over a 3.2M-row table, so the size of one writer
+                            // hold was however many rows happened to age out at
+                            // once — and every non-GET request in the fleet
+                            // waits behind that writer. The cap drains a
+                            // backlog across sweeps instead of in one hold, the
+                            // same shape the invariant-result trim already uses,
+                            // including the rowid-IN form that a plain
+                            // DELETE..LIMIT needs a nonstandard SQLite build to
+                            // accept.
                             let deleted = conn.execute(
-                                "DELETE FROM _amux_request_log WHERE ts < ?1",
-                                rusqlite::params![cutoff],
+                                "DELETE FROM _amux_request_log WHERE rowid IN (
+                                    SELECT rowid FROM _amux_request_log
+                                     WHERE ts < ?1 LIMIT ?2)",
+                                rusqlite::params![cutoff, RETENTION_BATCH_ROWS],
                             )?;
                             // The COUNT is the point (mandate: "count logged"):
                             // a sweep whose effect is invisible is a sweep
@@ -286,6 +309,12 @@ fn retain_days_config() -> f64 {
 /// runs BEFORE the alias rewrite and sees the RAW client path). Same
 /// wrapping shape as `alias_layer` — outer router whose fallback is the real
 /// app — so it provably applies to every route including fallbacks.
+/// Rows the retention sweep may delete in one writer acquisition (AMUX-4750).
+///
+/// Generous enough that ordinary daily churn clears in a single sweep, small
+/// enough that a backlog cannot turn one sweep into a multi-second hold.
+const RETENTION_BATCH_ROWS: i64 = 20_000;
+
 pub fn layer(app: Router, store: SharedStore) -> Router {
     layer_with(app, RequestLogger::spawn(store))
 }
@@ -429,6 +458,12 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     };
 
     let mut meta = serde_json::Map::new();
+    if let Some(id) = res.headers().get("x-amux-interaction-id").and_then(|v| v.to_str().ok()) {
+        meta.insert("interaction_id".into(), json!(id));
+    }
+    if let Some(kind) = res.headers().get("x-amux-command-kind").and_then(|v| v.to_str().ok()) {
+        meta.insert("command_kind".into(), json!(kind));
+    }
     if !query.is_empty() {
         meta.insert("query".into(), json!(truncate_chars(&query, QUERY_CHARS)));
     }
@@ -441,6 +476,18 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     // the budget the CALLER asked for, not the service getting slower.
     if let Some(v) = res.headers().get("x-amux-slow-ok").and_then(|v| v.to_str().ok()) {
         meta.insert("slow_ok".into(), json!(truncate_chars(v, 40)));
+    }
+    // AMUX-4779: which VERB a multi-verb route ran. `POST /api/browser/action`
+    // is one path over seven actions whose costs differ by three orders of
+    // magnitude (p50 9ms, p99 12698ms over 7 days), so the path alone is a
+    // grouping key coarser than the population it groups, and a latency card
+    // quoting a slow `wait` beside a `click`'s baseline points at the wrong
+    // verb. Recorded the same way `command_kind` and `slow_ok` already are:
+    // the handler sets a header, this lifts it.
+    if let Some(v) = res.headers().get("x-amux-action").and_then(|v| v.to_str().ok()) {
+        if !v.is_empty() {
+            meta.insert("action".into(), json!(truncate_chars(v, 40)));
+        }
     }
     let req_meta = if meta.is_empty() {
         None
@@ -683,10 +730,13 @@ pub fn routes() -> Router<AppState> {
 ///
 /// Additive params (not sent by the SPA today, needed by the daily sweep —
 /// docs/rust-migration/log-sweep.md): `worker` (the per-worker subset),
+/// `amux_session` (the CALLER, exactly — see AF-521 at its clause below; this is
+/// the attribution step 5 mandates and `session=` deliberately does not give),
 /// `since` + `until` (unix ts, a HALF-OPEN window `since < ts <= until`),
-/// `family`, `min_status`, `max_status`, `answered_by`. Additive response field:
+/// `family`, `min_status`, `max_status`, `answered_by`. Additive response fields:
 /// `total_matched` — the pre-LIMIT count, so volume questions are
-/// answerable without paging (the page-vs-corpus trap).
+/// answerable without paging (the page-vs-corpus trap) — and `ignored_params`,
+/// the keys the caller sent that this endpoint did not consume.
 ///
 /// `until` exists because this list used to stop at `since` (AF-230), and a
 /// lower bound alone is not a window: with `ORDER BY ts DESC LIMIT <=2000`
@@ -695,6 +745,58 @@ pub fn routes() -> Router<AppState> {
 /// `total_matched` is the pre-LIMIT count and stays the right answer for
 /// "how many" — `until` is for when you need the ROWS across a window
 /// wider than 2000 of them.
+/// Query keys `GET /api/logs` actually consumes. Anything else is DROPPED by
+/// design — AF-402 settled that ("the fix is to make the param real rather than
+/// to start rejecting unknown ones"), and a blanket 400 is unsafe here because
+/// any client may append a cache-buster. The decision this list serves is the
+/// other one: a drop that nobody can SEE is what makes the class recur.
+///
+/// Four endpoints have now shipped the same defect and been fixed one at a time
+/// — AF-402 (`max_status`, this endpoint), BACKE-3228 (/api/board), MF-822
+/// (/api/health), AF-518 (/api/scope). Every instance has the same shape: an
+/// ignored filter returns a SUPERSET that looks exactly like an answer, so the
+/// caller reads a confident wrong result rather than an error.
+const RECOGNISED_LOG_PARAMS: &[&str] = &[
+    "limit",
+    "category",
+    "session",
+    "worker",
+    "amux_session",
+    "family",
+    "since",
+    "until",
+    "min_status",
+    "max_status",
+    "answered_by",
+    // `ip`, because the sweep's step 4 is "group by client IP" and without a
+    // filter it can only be answered by paging unfiltered rows. Found by the
+    // 2026-09-09 sweep: `?ip=100.66.26.84` came back `ignored_params: ["ip"]`
+    // with `total_matched` 222,564 — the WHOLE log under one address's name,
+    // which is the AF-521 shape the `session=` note below is about. The
+    // question it blocked was "has this client recovered", which needs that
+    // one client's history and nothing else.
+    "ip",
+];
+
+/// Keys the caller sent that `GET /api/logs` neither consumed nor treats as a
+/// benign cache-buster: the ones they think are filtering and that did nothing.
+///
+/// Pure over the key set so it is tested without an HTTP round-trip, and sorted
+/// so the assertion does not depend on HashMap order.
+fn ignored_log_params<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = keys
+        .filter(|k| {
+            let lk = k.to_ascii_lowercase();
+            !RECOGNISED_LOG_PARAMS.contains(&lk.as_str())
+                && !crate::api::board::BENIGN_QUERY_KEYS.contains(&lk.as_str())
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit: i64 = q
         .get("limit")
@@ -742,9 +844,39 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         clauses.push("worker = ?".into());
         params.push(w.clone().into());
     }
+    // `amux_session` — the CALLER, exactly, with no worker fallback (AF-521).
+    //
+    // The sweep contract's step 5 mandates this attribution in bold ("Attribute
+    // on `amux_session` ONLY. Never fall back to `worker`") and says the endpoint
+    // enforces it. That is true of `/api/logs/writers`, the AGGREGATE. On THIS
+    // endpoint — the deep dive the same step routes you to when you need the
+    // rows — the rule had no query at all: `session=` is deliberately the OR
+    // above, `worker=` is the forbidden half on its own, and `amux_session=`
+    // was not a param, so it was dropped and the answer was the whole log.
+    //
+    // Measured 2026-09-06: `session=nissan` returned 146 rows of which 137 have
+    // an EMPTY amux_session; nissan made 9. `amux_session=nissan` returned
+    // 46,729 — every row in the window. The drop fails toward the accusation,
+    // which is the one direction this step must never fail in.
+    if let Some(a) = q.get("amux_session").filter(|s| !s.is_empty()) {
+        clauses.push("amux_session = ?".into());
+        params.push(a.clone().into());
+    }
     if let Some(f) = q.get("family").filter(|s| !s.is_empty()) {
         clauses.push("family = ?".into());
         params.push(f.clone().into());
+    }
+    // EXACT match, not a prefix or LIKE. An IP is an identifier, and a prefix
+    // match on one silently widens 100.66.26.8 into 100.66.26.84's rows.
+    //
+    // THE COLUMN IS `client_ip`; `ip` is only its name in the RESPONSE JSON.
+    // The first cut of this filter wrote `ip = ?` and every call 500'd with
+    // `no such column: ip`, while its test passed: the test scraped the source
+    // for the clause STRING, which was present and wrong. A filter's column
+    // name cannot be checked against the handler, only against the schema.
+    if let Some(ip) = q.get("ip").filter(|s| !s.is_empty()) {
+        clauses.push("client_ip = ?".into());
+        params.push(ip.clone().into());
     }
     if let Some(ts) = q.get("since").and_then(|v| v.parse::<f64>().ok()) {
         clauses.push("ts > ?".into());
@@ -847,11 +979,31 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     // AF-320: `count: 0` is ambiguous on its own — no matching events, or a
     // window nobody read. n_considered is the matched population, which is the
     // number that disambiguates it.
+    // WHAT YOU SENT THAT DID NOTHING (AF-521). Always present, empty when the
+    // query was fully consumed, so it answers "did my filter run" in the same
+    // payload as the rows — ethos rule 4's "a count beside a zero", applied to a
+    // filter instead of a measurement.
+    //
+    // In the BODY, not a response header. /api/board's fix for the same class
+    // put its disclosure in a header, and ~/.claude/CLAUDE.md already records
+    // what that costs: the reader pipes curl into python and never sees one.
+    let ignored_params = ignored_log_params(q.keys());
+    if !ignored_params.is_empty() {
+        tracing::warn!(
+            ignored = ?ignored_params,
+            recognised = ?RECOGNISED_LOG_PARAMS,
+            total_matched = total,
+            "[/api/logs AF-521] query param(s) DROPPED — the rows returned are a \
+             SUPERSET of what was asked for, not an answer to it. Filter on a \
+             recognised key, or read `ignored_params` in the body."
+        );
+    }
     Json(crate::api::measured::measured(
         json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
+        "ignored_params": ignored_params,
         // True = you are holding the newest `limit` rows, NOT the window you
         // asked for. Page backward with `until=<oldest ts you got>`.
         "truncated": truncated,
@@ -1098,9 +1250,13 @@ const ANY: &[&str] = &["*"];
 /// public and protected alike. Ordering is by mount site for diffability;
 /// matching specificity is computed, not positional.
 pub const ROUTE_TABLE: &[RouteEntry] = &[
+    RouteEntry { path: "/api/brex/status", methods: &["GET"] },
+    RouteEntry { path: "/api/brex/card", methods: &["POST"] },
+    RouteEntry { path: "/api/brex/webhook", methods: &["POST"] },
     // -- public (outside require_bearer)
     RouteEntry { path: "/health", methods: &["GET"] },
     RouteEntry { path: "/api/health", methods: &["GET"] },
+    RouteEntry { path: "/api/_clear_sw", methods: &["GET"] },
     RouteEntry { path: "/manifest.json", methods: &["GET"] },
     RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
     RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },
@@ -1113,23 +1269,42 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/debug/legacy-port", methods: &["GET"] },
     RouteEntry { path: "/api/debug/routes", methods: &["GET"] },
     RouteEntry { path: "/api/debug/duplicate-deliveries", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/needsyou-digest", methods: &["GET"] },
     RouteEntry { path: "/api/system-jobs", methods: &["GET"] },
     RouteEntry { path: "/api/system-jobs/{id}/run", methods: &["POST"] },
     RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/debug/invariants", methods: &["GET"] },
+    // AMUX-4682: deterministic stale/unverifiable dependency-citation scan.
+    RouteEntry { path: "/api/debug/dependency-audit", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
+    // AF-540 approval fate. Mounted at email.rs:71 and unlisted until AMUX-4668.
+    RouteEntry { path: "/api/email/approval/{id}", methods: &["GET"] },
+    RouteEntry { path: "/invite/{token}", methods: &["GET", "POST"] },
     // -- core state
+    RouteEntry { path: "/api/interactions/recent", methods: &["GET"] },
+    RouteEntry { path: "/api/interactions/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/interactions/{id}/effects", methods: &["GET"] },
+    RouteEntry { path: "/api/interactions/{id}/why", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/interactions", methods: &["GET"] },
+    RouteEntry { path: "/api/state/summary", methods: &["GET"] },
     RouteEntry { path: "/api/sync", methods: &["GET"] },
     RouteEntry { path: "/api/events", methods: &["GET"] },
     // -- board
     RouteEntry { path: "/api/board", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board-lifecycle", methods: &["GET"] },
     RouteEntry { path: "/api/board/export", methods: &["GET"] },
     RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
+    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
+    RouteEntry { path: "/api/board/lease-next", methods: &["POST"] },
+    RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
+    RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
+    RouteEntry { path: "/api/board/overlap/{coordination_id}", methods: &["GET"] },
     RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
     // The workflow-engine landing (board.rs:80-83) mounted these four and did
     // not add them here, which is what reddened `rust`. Methods read off the
@@ -1141,11 +1316,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/{id}/artifacts/{aid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
+    RouteEntry { path: "/api/board/{id}/undelete", methods: &["POST"] },
     // -- workers (+dead-letters merge)
     RouteEntry { path: "/api/workers", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/workers/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/workers/{id}/start", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/stop", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/pause", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/resume", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/peek", methods: &["GET"] },
     RouteEntry { path: "/api/workers/{id}/send", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/duplicate", methods: &["POST"] },
@@ -1191,11 +1369,37 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/schedules/audit", methods: &["GET"] },
     RouteEntry { path: "/api/schedules/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/schedules/{id}/run", methods: &["POST"] },
-    RouteEntry { path: "/api/verify/{id}", methods: &["POST"] },
+    RouteEntry { path: "/api/verify/{id}", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/policy", methods: &["GET"] },
+    RouteEntry { path: "/api/policy/evaluate", methods: &["POST"] },
+    RouteEntry { path: "/api/policy/approvals", methods: &["POST"] },
+    RouteEntry { path: "/api/policy/receipts", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/checkpoints/{id}", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/handoffs/{id}", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/harness/budgets/{id}", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/sensors", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/sensors/{task_type}", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/guides", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/compile", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/ratchet", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/traces/{turn_id}", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/work-metrics", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/adaptive-wip", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/goals", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/goals/{id}", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/goals/{id}/nodes", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/harness/planning-nodes/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/planning-nodes/{id}/plan", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/harness/reconciliations", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/reconciliations/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/harness/reconciliations/{id}/promote", methods: &["POST"] },
+    RouteEntry { path: "/api/harness/health", methods: &["GET"] },
     RouteEntry { path: "/api/prefs", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/criteria/{id}", methods: &["GET", "PUT"] },
     // -- metrics / usage / alerts / stats
     RouteEntry { path: "/api/metrics", methods: &["GET"] },
+    RouteEntry { path: "/api/metrics/host", methods: &["GET"] },
+    RouteEntry { path: "/api/metrics/host/history", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/fleet", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/replay", methods: &["GET"] },
     RouteEntry { path: "/api/reclaim/scan", methods: &["GET", "POST"] },
@@ -1209,6 +1413,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },
     RouteEntry { path: "/api/usage", methods: &["GET"] },
     RouteEntry { path: "/api/usage/attribution", methods: &["GET"] },
+    RouteEntry { path: "/api/usage/report.md", methods: &["GET"] },
     RouteEntry { path: "/api/alert/config", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/alert/owner", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/stats/daily", methods: &["GET"] },
@@ -1258,6 +1463,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/scope", methods: ANY },
     // -- browser
     RouteEntry { path: "/api/browser/start", methods: &["POST"] },
+    // The simulator is nested inside browser::routes(), one composition level
+    // below api/mod.rs. Keep its real verbs visible to request-log verdicts
+    // and route.callers_have_routes, just like the desktop browser verbs.
+    RouteEntry { path: "/api/browser/ios/targets", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/start", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/status", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/stop", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/state", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/screenshot", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/screenshot/file", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/action", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/inspect", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/inspect/clear", methods: &["POST"] },
     RouteEntry { path: "/api/browser/status", methods: &["GET"] },
     RouteEntry { path: "/api/browser/stop", methods: &["POST"] },
     RouteEntry { path: "/api/browser/identify", methods: &["POST"] },
@@ -1269,13 +1487,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/browser/screenshot/file", methods: &["GET"] },
     RouteEntry { path: "/api/browser/state", methods: &["GET"] },
     RouteEntry { path: "/api/browser/action", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/keepalive", methods: &["POST"] },
     RouteEntry { path: "/api/browser/inspect", methods: &["GET"] },
     RouteEntry { path: "/api/browser/inspect/clear", methods: &["POST"] },
     RouteEntry { path: "/api/browser/search", methods: &["GET"] },
     RouteEntry { path: "/api/browser/sessions", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/history", methods: &["GET"] },
     RouteEntry { path: "/api/browser/pw-profiles", methods: &["GET"] },
     RouteEntry { path: "/api/browser/save-profile", methods: &["POST"] },
     RouteEntry { path: "/api/browser/agent", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/profile/combine", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/import/discover", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/import", methods: &["POST"] },
     // -- file viewer / files / fs
     RouteEntry { path: "/api/file", methods: ANY },
     RouteEntry { path: "/api/file/raw", methods: ANY },
@@ -1341,9 +1564,17 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // completeness test learned to follow .nest() (AMUX-2917); it previously
     // scanned only api/mod.rs's own .route() calls.
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/board/orchestrations", methods: &["GET"] },
+    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/drain", methods: &["GET"] },
+    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
+    RouteEntry { path: "/api/board/{id}/fan-out", methods: &["POST"] },
+    // b707aefd one-shot launch endpoint, caught unlisted by the completeness
+    // check in tests/route_table_completeness.rs minutes after it landed.
+    RouteEntry { path: "/api/board/launch", methods: &["POST"] },
     RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
     RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
     RouteEntry { path: "/api/search", methods: &["GET"] },
@@ -1412,10 +1643,17 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // api/mod.rs on the AMUX-3145 ollama work but never tabled, so the route
     // census reported it unrouted while it answered fine (AMUX-2871 class).
     RouteEntry { path: "/api/ollama/models", methods: &["GET"] },
+    RouteEntry { path: "/api/models", methods: &["GET"] },
     // Mounted-but-untabled, all found by curling the census's "missing" list
     // against the live server (AMUX-2871). Each was reported as unrouted while
     // answering, because the census reads this table.
     RouteEntry { path: "/api/client-debug", methods: &["GET", "POST"] },
+    // Both of screen::routes()'s paths. The census reads this TABLE, so a
+    // mounted-but-unlisted route answers fine while every count reports it as
+    // unrouted (AMUX-4661's route, listed here after proxy_composition and this
+    // census both went red on origin/main).
+    RouteEntry { path: "/api/screen/capture", methods: &["GET"] },
+    RouteEntry { path: "/api/screen/capture/file", methods: &["GET"] },
     RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/review/week", methods: &["GET"] },
     RouteEntry { path: "/api/review/digest", methods: &["GET"] },
@@ -1433,6 +1671,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/map/pins", methods: &["POST"] },
     RouteEntry { path: "/api/map/search", methods: &["GET"] },
     RouteEntry { path: "/api/graph/fleet", methods: &["GET"] },
+    RouteEntry { path: "/api/graph/board", methods: &["GET"] },
+    RouteEntry { path: "/api/graph/board/verify", methods: &["GET"] },
     RouteEntry { path: "/api/graph/{id}", methods: &["GET"] },
     RouteEntry { path: "/api/graph/{id}/import-vault", methods: &["POST"] },
     RouteEntry { path: "/api/graph/{id}/nodes/{nid}", methods: &["PATCH"] },
@@ -1450,12 +1690,15 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/env/schema", methods: &["GET"] },
     RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
+    // AMUX-4664: ask a question of the messages.
+    RouteEntry { path: "/api/history/ask", methods: &["POST"] },
     // Nested sub-router routes that were missing from the table (AMUX-3083): they
     // answer for real (POST /api/orchestrate/plan -> 400 transcript-required, GET
     // /api/history/{id} -> the row) while /api/debug/routes and the
     // route.callers_have_routes census read the TABLE and reported them unrouted.
     // Caught by tests/route_table.rs's completeness scan (both were named).
     RouteEntry { path: "/api/history/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/history/{id}/card", methods: &["PUT"] },
     RouteEntry { path: "/api/orchestrate/plan", methods: &["POST"] },
     // -- logs (this module)
     RouteEntry { path: "/api/logs", methods: &["GET"] },
@@ -1464,6 +1707,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // CLAUDE.md tells people to consult instead of grepping, lying about the
     // very route that was just added.
     RouteEntry { path: "/api/lookup", methods: &["POST"] },
+    RouteEntry { path: "/api/lookup/bulk", methods: &["POST"] },
     RouteEntry { path: "/api/skin", methods: &["GET"] },
     RouteEntry { path: "/api/config/export", methods: &["GET"] },
     RouteEntry { path: "/api/config/apply", methods: &["PUT"] },
@@ -1491,6 +1735,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/dictation/dict/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/dictation/config", methods: ANY },
     RouteEntry { path: "/api/dictate", methods: &["POST"] },
+    RouteEntry { path: "/api/recordings", methods: &["GET"] },
+    RouteEntry { path: "/api/recordings/config", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/recordings/upload", methods: &["POST"] },
+    RouteEntry { path: "/api/recordings/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/recordings/{id}/transcribe", methods: &["POST"] },
     RouteEntry { path: "/api/tts", methods: &["POST"] },
     RouteEntry { path: "/api/tts/voices", methods: &["GET"] },
     // -- torrents / org / gmail
@@ -1501,7 +1750,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/torrents/{gid}/{action}", methods: &["POST"] },
     RouteEntry { path: "/api/org", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/org/members", methods: &["GET"] },
-    RouteEntry { path: "/api/org/members/{id}", methods: &["DELETE"] },
+    RouteEntry { path: "/api/org/members/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/org/teams", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/org/teams/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/org/invites", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/org/invites/{token}", methods: &["DELETE"] },
     RouteEntry { path: "/api/gmail/accounts", methods: &["GET"] },
@@ -1856,6 +2107,7 @@ async fn analyze(
                 client_ip.as_deref().unwrap_or(""),
             );
             let has_body = error_body.as_deref().is_some_and(|b| !b.is_empty());
+            let interaction = req_meta.as_deref().and_then(|m| serde_json::from_str::<Value>(m).ok()).unwrap_or(Value::Null);
             let sample = json!({
                 "ts": ts, "when": local_when(ts), "method": method, "path": path,
                 "status": status, "latency_ms": latency_ms,
@@ -1863,6 +2115,8 @@ async fn analyze(
                 "amux_session": amux_session, "worker": worker,
                 "answered_by": answered_by, "error_body": error_body,
                 "req_meta": req_meta,
+                "interaction_id": interaction["interaction_id"],
+                "command_kind": interaction["command_kind"],
             });
             let key = (status, method.clone(), family.clone(), target.clone());
             let g = groups.entry(key).or_insert_with(|| ErrGroup {
@@ -1967,7 +2221,8 @@ async fn analyze(
                         "you_sent": sent, "gate_required": gate, "count": n,
                     });
                     v["distinct_rejected_acks"] = json!(g.rejected_acks.len());
-                    if *n >= 5 && *n * 2 > g.count {
+                    let wedged = *n >= 5 && *n * 2 > g.count;
+                    if wedged {
                         let who = if sess.is_empty() { "(unattributed)" } else { sess.as_str() };
                         let reading = if sent == "null" {
                             "the caller is not acknowledging the gate at all"
@@ -1988,6 +2243,56 @@ async fn analyze(
                             g.method, target, n, g.count, who, attempted, reading, sent, gate,
                         ));
                     }
+                    // AMUX-4591: SAY THAT A GATE 409 IS BY DESIGN, on the GROUP
+                    // rather than in `verdicts`.
+                    //
+                    // `verdicts` means ANOMALY — the branch above names a caller
+                    // wedged in a loop, and the test one screen down asserts that
+                    // a diffuse group stays out of that list ("the control group
+                    // must be silent"). That is right and this does not change it.
+                    //
+                    // What was missing is that silence has two readings. Measured
+                    // 2026-09-16: the largest 409 group on this box is 205
+                    // refusals over 57 distinct (session, acknowledgement) pairs,
+                    // with no verdict, and a sweep reading the endpoint filed it
+                    // as 68 unexplained errors in an hour (AMUX-4591). The group
+                    // carried `distinct_rejected_acks` the whole time; nothing
+                    // said what the number MEANT.
+                    //
+                    // A gate 409 is the discovery step, not a failure: the move
+                    // is sent, the refusal names the card's resolved criteria,
+                    // the caller re-sends the ones that are true. It cannot be
+                    // removed by sending the acknowledgement up front, because
+                    // the acknowledgement is an attestation the caller has to
+                    // make.
+                    //
+                    // States the shape and names what would look different, so a
+                    // reader is not told to stop looking: a fleet-wide regression
+                    // is also diffuse.
+                    // `designed` MIRRORS THE DOMINANCE TEST, and the first
+                    // version of this did not — it said `true` for every gate
+                    // 409, so a wedged-caller group carried the verdict above
+                    // calling it a fault AND a field calling it by design, in
+                    // one payload. A reader believes whichever they read first.
+                    v["refusal_shape"] = json!({
+                        "designed": !wedged,
+                        "what": if wedged {
+                            "NOT the ordinary shape: one caller is carrying most of this group. \
+                             See the verdict for who and what they sent."
+                        } else {
+                            "a gate refusal: the board names the card's resolved criteria and \
+                             the caller re-sends with the ones that are true. The round trip IS \
+                             the mechanism — an acknowledgement is an attestation, so it cannot \
+                             be pre-filled by the CLI without bypassing the gate."
+                        },
+                        "distinct_callers": g.rejected_acks.len(),
+                        "per_caller": if g.rejected_acks.is_empty() { 0.0 }
+                                      else { (g.count as f64 / g.rejected_acks.len() as f64 * 10.0).round() / 10.0 },
+                        "what_would_be_a_fault": "one (session, acknowledgement) pair carrying most \
+                                 of the group, which gets its own verdict above; or this count \
+                                 climbing while distinct_callers stays flat, which is one caller \
+                                 re-wedging under different cards.",
+                    });
                 }
             }
             if g.status == 404 || g.status == 405 {
@@ -2651,7 +2956,7 @@ fn round4(v: f64) -> f64 {
 /// Every family claimed by a NAMED tab. `http` is the complement of this set,
 /// so the two definitions cannot disagree about what "everything else" means.
 const NAMED_CATEGORY_FAMILIES: &[&str] = &[
-    "/api/board", "/api/schedules", "/api/cal-events", "/api/calendar",
+    "/api/board", "/api/board-lifecycle", "/api/schedules", "/api/cal-events", "/api/calendar",
     "/api/sessions", "/api/workers", "/api/sessions-git", "/api/channels",
     "/api/memory", "/api/memories", "/api/scope", "/api/notes",
     "/api/fs", "/api/file", "/api/files", "/api/upload", "/api/uploads", "/api/library",
@@ -2683,7 +2988,7 @@ fn families_for_category(cat: &str) -> Vec<&'static str> {
 /// category, and the All tab shows it regardless.
 fn category_of(family: &str) -> &'static str {
     match family {
-        "/api/board" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
+        "/api/board" | "/api/board-lifecycle" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
         "/api/sessions" | "/api/workers" | "/api/sessions-git" | "/api/channels" => "session",
         "/api/memory" | "/api/memories" | "/api/scope" | "/api/notes" => "memory",
         "/api/fs" | "/api/file" | "/api/files" | "/api/upload" | "/api/uploads"
@@ -4110,6 +4415,33 @@ mod tests {
             .expect("the 409 board group");
         assert_eq!(grp["top_rejected_ack"]["session"], "mvs-infra", "{grp}");
         assert_eq!(grp["top_rejected_ack"]["count"], 8, "{grp}");
+
+        // AMUX-4591. SILENCE HAS TWO READINGS AND THE GROUP NOW SAYS WHICH.
+        //
+        // `verdicts` is the anomaly list and the assertion above keeps the
+        // diffuse group out of it, correctly. What that left is a group with a
+        // count, a client tally and nothing saying whether the count is a
+        // problem. Measured 2026-09-16: the largest 409 group on this box was
+        // 205 refusals over 57 distinct acknowledgements with no verdict, and a
+        // sweep reading this endpoint filed it as unexplained errors.
+        //
+        // The two groups in this fixture are the two readings, so one cell
+        // pins both and neither can pass by accident.
+        let diffuse = v["groups"].as_array().unwrap().iter()
+            .find(|g| g["target"] == "/api/schedules/{id}" && g["status"] == 409)
+            .expect("the diffuse 409 group");
+        assert_eq!(diffuse["refusal_shape"]["designed"], serde_json::json!(true),
+                   "six callers with six different acks is the gate working: {diffuse}");
+        assert_eq!(diffuse["refusal_shape"]["distinct_callers"], serde_json::json!(6), "{diffuse}");
+
+        // THE CONTROL, and the half the first version of this field got wrong.
+        // It set `designed: true` unconditionally, so the wedged group carried
+        // the verdict calling it a fault AND a field calling it by design. A
+        // payload that contradicts itself is worse than one that says nothing.
+        assert_eq!(grp["refusal_shape"]["designed"], serde_json::json!(false),
+                   "a caller wedged in a loop is NOT the designed shape: {grp}");
+        assert!(grp["refusal_shape"]["what"].as_str().unwrap_or_default().contains("NOT the ordinary shape"),
+                "and it must say so in words, not only in a bool: {grp}");
     }
 
     #[tokio::test]
@@ -4636,6 +4968,253 @@ mod tests {
         );
         assert_eq!(v["mutating_rows"], n as u64, "every write is still counted: {v}");
     }
+
+    /// Seed a row where the CALLER and the path-derived worker DISAGREE — the
+    /// only shape that can tell the three attribution filters apart. `seed`
+    /// writes `worker` as NULL, so it cannot express this case at all.
+    async fn seed_attributed(
+        store: &crate::db::Store,
+        ts: f64,
+        path: &str,
+        amux_session: &str,
+        worker: Option<&str>,
+    ) {
+        let (path, amux_session, worker) =
+            (path.to_string(), amux_session.to_string(), worker.map(str::to_string));
+        store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      amux_session, worker, answered_by, error_body) \
+                     VALUES (?1,'POST',?2,?3,200,1.0,'127.0.0.1',?4,?5,'native',NULL)",
+                    rusqlite::params![ts, path, family_of(&path), amux_session, worker],
+                )?;
+                Ok(WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// AF-521 — `amux_session=` must select the CALLER, with no worker fallback.
+    ///
+    /// The sweep contract's step 5 mandates this attribution in bold and states
+    /// the endpoint enforces it. `/api/logs/writers` does. THIS endpoint — the
+    /// deep dive the same step routes you to for the rows — did not have the
+    /// param at all, so it was dropped and the answer was the entire log.
+    ///
+    /// THE FIXTURE IS THE TEST. Two rows about lane `nissan` that `nissan` did
+    /// not make (an unattributed report ABOUT it, tagged worker=nissan by the
+    /// path) and one row it did. That is the live shape measured 2026-09-06:
+    /// `session=nissan` returned 146 rows of which 137 had an empty
+    /// `amux_session`. A fixture where caller and worker agree passes against
+    /// every one of the three filters, including the broken one.
+    #[tokio::test]
+    async fn amux_session_selects_the_caller_and_never_falls_back_to_worker() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // Two reports ABOUT nissan, made by nobody (the 7,708/day unattributed class).
+        seed_attributed(&store, now - 30.0, "/api/sessions/nissan/report", "", Some("nissan")).await;
+        seed_attributed(&store, now - 29.0, "/api/sessions/nissan/report", "", Some("nissan")).await;
+        // One write BY nissan, against a path that names nobody.
+        seed_attributed(&store, now - 28.0, "/api/board", "nissan", None).await;
+        // One write by someone else entirely, so "everything" is distinguishable
+        // from "the whole log happens to be nissan's".
+        seed_attributed(&store, now - 27.0, "/api/board", "backend", None).await;
+
+        let api = logs_api(store.clone());
+        let get = |uri: String| {
+            let api = api.clone();
+            async move {
+                let (st, body) =
+                    hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                assert_eq!(st, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        let since = now - 3600.0;
+
+        // Control: the fixture is real and all four rows are in the window.
+        // Without this a seeding failure makes every assertion below pass by
+        // returning nothing (ethos rule 7).
+        let all = get(format!("/api/logs?since={since}&limit=100")).await;
+        assert_eq!(all["total_matched"], 4, "control: four seeded rows: {all}");
+
+        // THE ASSERTION THAT FAILS PRE-FIX. Without the clause the param is
+        // dropped and this is 4 — every row in the log, read as nissan's writes.
+        let mine = get(format!("/api/logs?since={since}&amux_session=nissan&limit=100")).await;
+        assert_eq!(mine["total_matched"], 1, "amux_session must select the CALLER only: {mine}");
+        for e in mine["events"].as_array().unwrap() {
+            assert_eq!(e["amux_session"], "nissan", "a row nissan did not make leaked through: {e}");
+        }
+
+        // The other two filters are unchanged, and the numbers differ from each
+        // other — which is what proves `amux_session` is a third predicate and
+        // not an alias that happens to agree on this fixture.
+        let by_worker = get(format!("/api/logs?since={since}&worker=nissan&limit=100")).await;
+        assert_eq!(by_worker["total_matched"], 2, "worker= stays path-derived: {by_worker}");
+        let by_session = get(format!("/api/logs?since={since}&session=nissan&limit=100")).await;
+        assert_eq!(by_session["total_matched"], 3, "session= stays the documented OR: {by_session}");
+
+        // A caller that does not exist must match NOTHING, not everything. This
+        // is the direction step 5 must never fail in: a dropped filter hands
+        // back the whole log under the name of a lane, and the output of that
+        // step is the accusation the contract calls "the expensive kind".
+        let ghost =
+            get(format!("/api/logs?since={since}&amux_session=NO_SUCH_LANE&limit=100")).await;
+        assert_eq!(ghost["total_matched"], 0, "an unknown caller owns no rows: {ghost}");
+    }
+
+    /// AF-521 — a query key this endpoint does not consume must SAY so.
+    ///
+    /// AF-402 settled that unknown params stay dropped rather than rejected
+    /// (a blanket 400 breaks cache-busters), and this does not reopen that. It
+    /// closes the other half: the drop was invisible, which is why the class has
+    /// now shipped four times — AF-402 here, BACKE-3228, MF-822, AF-518. An
+    /// ignored filter returns a SUPERSET that reads exactly like an answer.
+    #[tokio::test]
+    async fn a_dropped_query_param_is_named_in_the_body_beside_the_rows_it_did_not_filter() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        seed_attributed(&store, now - 30.0, "/api/board", "backend", None).await;
+        seed_attributed(&store, now - 29.0, "/api/board", "nissan", None).await;
+        let api = logs_api(store.clone());
+        let get = |uri: String| {
+            let api = api.clone();
+            async move {
+                let (st, body) =
+                    hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                assert_eq!(st, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        let since = now - 3600.0;
+
+        // A typo that reads like a filter. It still returns both rows — that is
+        // the AF-402 decision standing — but the body now says which key did
+        // nothing, in the same payload as the rows.
+        let typo = get(format!("/api/logs?since={since}&sesion=nissan&limit=100")).await;
+        assert_eq!(typo["total_matched"], 2, "the drop still happens (AF-402 stands): {typo}");
+        assert_eq!(typo["ignored_params"], json!(["sesion"]), "the drop must be NAMED: {typo}");
+
+        // PRESENT AND EMPTY on a clean query, never absent. An absent key reads
+        // as None to `.get()` and as "nothing was dropped" to a human, and those
+        // are the same three characters as the honest answer (ethos rule 4).
+        let clean = get(format!("/api/logs?since={since}&amux_session=nissan&limit=100")).await;
+        assert_eq!(clean["ignored_params"], json!([]), "a consumed query drops nothing: {clean}");
+        assert_eq!(clean["total_matched"], 1, "and the recognised filter really ran: {clean}");
+
+        // Cache-busters are not typos. Surfacing `_=<ts>` would put noise in
+        // every polled response and train the reader to ignore the field.
+        let busted = get(format!("/api/logs?since={since}&_=12345&cb=x&limit=100")).await;
+        assert_eq!(busted["ignored_params"], json!([]), "cache-busters are benign: {busted}");
+    }
+
+    /// `ip` is a REAL filter, in both directions.
+    ///
+    /// The declaration and the SQL are separate edits, and getting only one is
+    /// silent in a different way each time: declared-but-unread means the
+    /// caller is told the filter ran when it did not (the AF-521 shape, which
+    /// returns the whole log under one address's name); read-but-undeclared
+    /// means a working filter is reported as ignored. The sibling test covers
+    /// read-but-undeclared by scraping the handler; this covers the other side
+    /// and the actual clause.
+    #[test]
+    fn ip_is_both_declared_and_actually_filtered() {
+        assert!(
+            RECOGNISED_LOG_PARAMS.contains(&"ip"),
+            "declared: without this `?ip=` reports ignored_params and the caller \
+             holds a superset, not an answer"
+        );
+        assert!(
+            ignored_log_params([String::from("ip")].iter()).is_empty(),
+            "a caller passing ip must not be told it was dropped"
+        );
+        // The SQL half. Scraped from the shipped handler, because a declaration
+        // with no clause is exactly the failure this pair exists to prevent and
+        // it cannot be seen from the constant.
+        let src = include_str!("request_log.rs");
+        let body = src
+            .split("async fn get_logs(")
+            .nth(1)
+            .expect("get_logs is in this file")
+            .split("\n/// One DB row")
+            .next()
+            .expect("get_logs ends before row_to_event");
+        assert!(
+            body.contains(r#"q.get("ip")"#),
+            "declared but never read: the filter would be silently inert"
+        );
+        assert!(
+            body.contains(r#"clauses.push("client_ip = ?""#),
+            "read but no WHERE clause, so every ip returns the whole window"
+        );
+        // EXACT, not prefix: a LIKE would fold 100.66.26.8 into 100.66.26.84.
+        assert!(
+            !body.contains(r#"clauses.push("client_ip LIKE"#),
+            "an ip filter must be exact; a prefix match silently widens it"
+        );
+
+        // AND THE COLUMN MUST EXIST. This is the half the first cut lacked and
+        // the reason it shipped broken: the scrape above passed on `ip = ?`,
+        // which is a perfectly well-formed clause naming a column that is not
+        // in the table, so every call 500'd with `no such column: ip`. A source
+        // scrape can only say the clause is THERE; only the schema says it is
+        // RIGHT. `ip` is the response-JSON name, `client_ip` is the column.
+        let mut conn = rusqlite::Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        for col in ["client_ip", "amux_session", "family", "status", "ts"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM _amux_request_log WHERE {col} IS NOT NULL"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("filter column `{col}` is not queryable: {e}"));
+            let _ = n;
+        }
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ip IS NOT NULL", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "if a bare `ip` column ever exists, this test's whole premise is stale"
+        );
+    }
+
+    /// AF-521 — every key the handler reads must be in `RECOGNISED_LOG_PARAMS`.
+    ///
+    /// Without this the disclosure rots in the direction that lies: add a real
+    /// filter, forget the list, and the endpoint reports its own working param
+    /// as ignored. The check is over the SHIPPED source of `get_logs`, so it
+    /// fails on the next `q.get("...")` that is not declared.
+    #[test]
+    fn every_param_the_handler_consumes_is_declared_as_recognised() {
+        let src = include_str!("request_log.rs");
+        let body = src
+            .split("async fn get_logs(")
+            .nth(1)
+            .expect("get_logs is in this file")
+            .split("\n/// One DB row")
+            .next()
+            .expect("get_logs ends before row_to_event");
+        let mut consumed: Vec<&str> = Vec::new();
+        for part in body.split("q.get(\"").skip(1) {
+            consumed.push(part.split('"').next().unwrap());
+        }
+        assert!(
+            consumed.len() >= 10,
+            "the scrape found only {} keys — get_logs was reshaped and this check is \
+             pinning nothing: {consumed:?}",
+            consumed.len()
+        );
+        for k in &consumed {
+            assert!(
+                RECOGNISED_LOG_PARAMS.contains(k),
+                "get_logs reads `{k}` but it is not in RECOGNISED_LOG_PARAMS, so a caller \
+                 using the working filter is told it was ignored"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4735,6 +5314,7 @@ mod caller_attribution_tests {
 
     /// CONTROL: no headers at all is still anonymous. A resolver that invented a
     /// caller would be worse than the bug.
+
     #[test]
     fn no_identity_headers_stays_anonymous() {
         assert_eq!(caller_from_headers(&HeaderMap::new()), "");

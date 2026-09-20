@@ -44,10 +44,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)
-last=$(cat "$STAMP" 2>/dev/null || echo "")
-[ "$head" = "$last" ] && exit 0
-
 # The sha that will actually be BUILT — the worktree below is created from
 # `rev-parse HEAD`. `$head` is a different thing: the last commit that touched
 # the build inputs, used as the rebuild stamp key. They differ routinely on a
@@ -58,7 +54,83 @@ last=$(cat "$STAMP" 2>/dev/null || echo "")
 # below name a sha, and they run before the build begins. Having them print
 # `$head` was the same defect in its cheapest form — a contention log that
 # names a commit which is not the one the winning process is building.
+head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)
 built_sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "$head")
+last=$(cat "$STAMP" 2>/dev/null || echo "")
+
+# A build stamp records what this script installed. It is deliberately NOT
+# accepted as proof of the running image: another checkout can replace the
+# binary after the stamp was written. The ATE-93 takeover had exactly that
+# shape — stamp=the elected mainline revision, /api/health=a foreign local
+# revision, and the builder exited 0 without touching the live image.
+#
+# The activation authority is one exact committed ref, not "a commit reachable
+# from main". A stale child of main can still include half-finished work, and a
+# divergent tip has no ancestry relationship that licenses it to replace the
+# fleet. An intentional pin remains possible only by explicitly naming its ref
+# at service configuration time; a worker's checkout/branch is never authority.
+ACTIVATION_REF="${AMUX_RS_ACTIVATION_REF:-origin/main}"
+
+server_api_base() {
+  local api
+  api="${AMUX_URL:-}"
+  if [ -z "$api" ] && [ -r "$HOME/.amux/endpoint.json" ]; then
+    api=$(python3 - "$HOME/.amux/endpoint.json" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get('canonical_url') or d.get('url') or d.get('endpoint') or '')
+except Exception:
+    pass
+PY
+)
+  fi
+  printf '%s\n' "${api:-https://localhost:8824}"
+}
+
+# One measurement owns both the decision and its receipt. A later successful
+# curl must never be used to explain an earlier timeout (AMUX-4225).
+measure_live_identity() {
+  local url body rc=0
+  url="${AMUX_RS_HEALTH_URL:-$(server_api_base)/api/health}"
+  body=$(curl -sk --max-time 4 "$url" 2>/dev/null) || rc=$?
+  live=""
+  identity_reason="curl_exit=$rc"
+  if [ "$rc" != 0 ]; then return 1; fi
+  live=$(printf '%s' "$body" | python3 -c '
+import json,re,sys
+try:
+    d=json.load(sys.stdin)
+    commit=d.get("commit_full") or d.get("commit", "")
+    if not isinstance(commit,str) or not re.fullmatch(r"[0-9a-f]{12,40}",commit):
+        raise ValueError("invalid commit")
+    print(commit)
+except Exception:
+    raise SystemExit(1)
+' 2>/dev/null) || { identity_reason="invalid_commit"; return 1; }
+}
+
+activation_authorized() {
+  local authority
+  authority=$(git -C "$REPO" rev-parse --verify -q "${ACTIVATION_REF}^{commit}" 2>/dev/null) || {
+    echo "== !! ACTIVATION AUTHORITY UNMEASURED $built_sha — cannot resolve $ACTIVATION_REF; refusing installation" >> "$LOG"
+    return 1
+  }
+  if [ "$built_sha" != "$authority" ]; then
+    echo "== !! ACTIVATION AUTHORITY REFUSED $built_sha — authority is $ACTIVATION_REF ($authority); a checkout-local or stale revision may not replace the elected image" >> "$LOG"
+    return 1
+  fi
+  return 0
+}
+
+# Provenance and disk-only seams never install or restart anything. Keeping
+# them outside the authority gate lets their hermetic fixtures stay about the
+# operation they actually exercise.
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ] \
+   && ! activation_authorized; then
+  exit 0
+fi
 
 # ── SINGLE-INSTANCE LOCK (AMUX-2927) ────────────────────────────────────────
 # Two invocations — the 60s launchd cycle and a human running this by hand —
@@ -98,28 +170,105 @@ echo $$ > "$LOCK/pid"
 # rebuilding it is the wasted-cycle half of the reported bug ("each next SOLO
 # cycle built the identical sha fine").
 last=$(cat "$STAMP" 2>/dev/null || echo "")
-[ "$head" = "$last" ] && exit 0
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
+   && [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" != "1" ]; then
+  # A process can have waited behind a different checkout's build. Re-check both
+  # authority and the observed image after taking the global lock; otherwise a
+  # pre-lock answer can become a false permission while we were waiting.
+  if ! activation_authorized; then
+    exit 0
+  fi
+  if [ "$head" = "$last" ]; then
+    if ! measure_live_identity; then
+      echo "== $(date '+%F %T') !! ACTIVATION IDENTITY UNMEASURED expected=$built_sha trigger=$head $identity_reason measured=false action=defer — unavailable health is not evidence of image drift" >> "$LOG"
+      exit 0
+    fi
+    case "$built_sha" in
+      "$live"*)
+        echo "== $(date '+%F %T') ACTIVATION IDENTITY MATCH expected=$built_sha live=$live measured=true action=skip" >> "$LOG"
+        exit 0 ;;
+      *)
+        # The elected bytes may already be installed while the old process is
+        # awaiting its next adoption tick. Recompiling them cannot help it.
+        if python3 - "$INSTALL" "${INSTALL}.identity.json" "$built_sha" <<'PYINSTALLED' 2>/dev/null
+import hashlib,json,sys
+try:
+    d=json.load(open(sys.argv[2]))
+    with open(sys.argv[1], 'rb') as f: digest=hashlib.sha256(f.read()).hexdigest()[:16]
+    raise SystemExit(0 if d.get('sha') == sys.argv[3] and d.get('build') == digest else 1)
+except (OSError,ValueError):
+    raise SystemExit(1)
+PYINSTALLED
+        then
+          echo "== $(date '+%F %T') !! ACTIVATION AWAITING ADOPTION expected=$built_sha live=$live installed_match=true measured=true action=skip_rebuild" >> "$LOG"
+          exit 0
+        fi
+        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG" ;;
+    esac
+  fi
+fi
 
-# PROVENANCE (AEAB-12). This builder rebuilds whenever $REPO's local HEAD moves
-# and does not care whether HEAD is on main or on somebody's feature branch. The
-# server then self-adopts within 5s. That permissiveness is CORRECT and must stay:
-# this machine survived weeks deliberately pinned to an unmerged fix branch, and
-# "only build main" would delete the rollback mechanism.
+# A COMMITTED stale-base tip can still be unsafe to adopt.  The real ATE-93
+# specimen was exactly that: 7c6f7b80 was not a revert of 31768303; it was a
+# divergent unpushed tip whose automatic adoption replaced the live image.
 #
-# The defect is that a deliberate pin and an ACCIDENTAL feature branch are
-# byte-identical to the builder, and the accidental one is announced nowhere. On
-# 2026-08-17 a commit made on a branch inside this checkout was serving the whole
-# fleet 76 seconds later and stayed there 9h42m — no CI had run on it, no review —
-# while the machine also could not track upstream, so the daily update schedule
-# silently did nothing. Everything looked healthy the entire time.
-#
-# So: say it. NOT a refusal, a fact, written where consumers can find it.
-#
-# The predicate is "HEAD is contained in main OR origin/main". Checking only
-# origin/main would false-positive right after a merge, because this script
-# deliberately does not fetch (it must not reach the network on a 60s timer) and
-# the local remote-tracking ref lags. Local `main` moves on the merge itself, so
-# the pair covers both orders.
+# Ask the currently running server about the COMMIT'S attributed worker, not
+# this launchd process.  A linked non-owner cannot deploy while the semantic
+# concern remains pending.  The first binary that introduces this endpoint
+# naturally sees a 404 from its predecessor; that one bootstrap adoption is
+# named in the log, while any later unknown answer REFUSES adoption rather than
+# treating an unmeasured permit as permission.
+overlap_deploy_permitted() {
+  local lane api reply code body allowed
+  # These seams exit before compilation/install. Requiring a live permit here
+  # made disk-cleanup diagnostics silently stop on hosts without an amux server.
+  if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ] \
+     || [ "${AMUX_RS_DISK_CLEAR_ONLY:-}" = "1" ]; then
+    echo "== OVERLAP GUARD NOT APPLICABLE $built_sha — diagnostic-only run cannot install a binary (provenance=${AMUX_RS_BUILD_PROVENANCE_ONLY:-0}, disk-clear=${AMUX_RS_DISK_CLEAR_ONLY:-0})" >> "$LOG"
+    return 0
+  fi
+  lane=$(git -C "$REPO" log -1 --format='%(trailers:key=Amux-Session,valueonly,separator=)' "$built_sha" 2>/dev/null | head -n1)
+  case "$lane" in
+    ""|"(human)") return 0 ;;
+  esac
+  api=$(server_api_base)
+  reply=$(curl -sk --max-time 8 -w $'\n%{http_code}' \
+    "$api/api/board/overlap/deployment-permit?session=$lane" 2>/dev/null) || {
+      echo "== !! OVERLAP GUARD UNMEASURED $built_sha — permit probe failed for $lane; refusing adoption" >> "$LOG"
+      return 1
+    }
+  code=${reply##*$'\n'}
+  body=${reply%$'\n'*}
+  if [ "$code" = "404" ]; then
+    echo "== !! OVERLAP GUARD BOOTSTRAP $built_sha — running server predates permit endpoint; allowing first adoption only" >> "$LOG"
+    return 0
+  fi
+  if [ "$code" != "200" ]; then
+    echo "== !! OVERLAP GUARD REFUSED $built_sha — permit HTTP $code for $lane: ${body:0:300}" >> "$LOG"
+    return 1
+  fi
+  allowed=$(printf '%s' "$body" | python3 -c 'import json,sys; print("yes" if json.load(sys.stdin).get("allowed") is True else "no")' 2>/dev/null || echo no)
+  if [ "$allowed" != yes ]; then
+    echo "== !! OVERLAP GUARD REFUSED $built_sha — $lane is a linked non-owner; reconcile/scope-split before deployment: ${body:0:500}" >> "$LOG"
+    return 1
+  fi
+  return 0
+}
+
+if ! overlap_deploy_permitted; then
+  # Do not advance the stamp: a later explicit reconciliation must make this
+  # exact committed tree eligible again, and the refusal line above is a sweep
+  # signal rather than a silent no-op.
+  exit 0
+fi
+
+# PROVENANCE (AEAB-12). Provenance still records whether this checkout happens
+# to be on main, but it is no longer an activation decision. ATE-93 showed why:
+# a valid-looking local stamp and an off-main live image can coexist after a
+# foreign builder runs. The exact `ACTIVATION_REF` gate above is the sole normal
+# activation authority. It deliberately does not fetch on the timer; freshness
+# is a human/CI action, while a stale remote-tracking ref fails closed instead
+# of silently adopting a checkout-local commit.
 on_main=no
 if git -C "$REPO" merge-base --is-ancestor HEAD main 2>/dev/null \
    || git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
@@ -181,6 +330,23 @@ fi
   # which is the shape where reading EITHER one alone leaves you confident and
   # wrong. The trigger is still worth printing; it just may not pose as the
   # thing that got built.
+  # A bad committed source used to rebuild every 60-second launchd tick. Bound
+  # repeated attempts, but retry immediately when the build inputs change.
+  retry_s="${AMUX_BUILD_FAILURE_RETRY_SECS:-900}"
+  case "$retry_s" in
+    ''|*[!0-9]*|0) echo '== cargo_build_retry_invalid: retry seconds must be positive'; exit 1 ;;
+  esac
+  failed_head=''; failed_at=0
+  if [ -r "${STAMP}.failed" ]; then
+    read -r failed_head failed_at < "${STAMP}.failed" || true
+    case "$failed_at" in ''|*[!0-9]*) failed_at=0 ;; esac
+  fi
+  retry_now=$(date +%s)
+  if [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] && [ "$failed_head" = "$head" ] \
+      && [ "$failed_at" -le "$retry_now" ] && [ "$((retry_now - failed_at))" -lt "$retry_s" ]; then
+    echo "== cargo_build_backoff trigger=$head retry_in_s=$((retry_s - retry_now + failed_at))"
+    exit 0
+  fi
   echo "== $(date '+%F %T') building $built_sha (trigger: $head, previous stamp: ${last:-none})"
   if [ "$on_main" != "yes" ]; then
     echo "== !! OFF-MAIN: $built_sha is on '$head_ref', which is not contained in main."
@@ -249,86 +415,37 @@ fi
   # cargo check/test runs from fleet sessions land in debug/ using the same
   # CARGO_TARGET_DIR. Debug artifacts are never reused by this script and can
   # accumulate without bound — 229 GB was observed on 2026-08-29. The threshold
-  # is generous (10 GB) to avoid thrashing on a small accumulation; the floor is
+  # is 32 GB: full workspace tests legitimately exceeded the old 10 GB limit,
+  # so every release build destroyed their cache and forced another cold build.
+  # safe-cargo now reduces debug data and enforces a 40 GB target ceiling while
+  # running. This idle cleanup stays below that ceiling; the floor is
   # measured BEFORE clearing so the log line is honest.
   #
-  # AF-303: THIS ARM USED TO SAY "always safe to remove", AND IT IS NOT. Two
-  # lines above, the same comment states that fleet sessions' cargo check/test
-  # land in debug/ — those artifacts are precisely what every lane's build is
-  # using while this runs. "No value to THIS BUILDER" is true; "safe to remove"
-  # does not follow from it, and the gap between those two sentences is ~50
-  # lanes' in-flight compilation. Deleting it mid-build is the vanished-rlib /
-  # ETXTBSY class already in the ledger (8 phantom failures in a module nobody
-  # touched, 15/15 green on an immediate re-run).
-  #
-  # Measured before the fix, from this log: 13 debug clears against 1 clear of
-  # the shared release cache. The DESTRUCTIVE arm ran 13x more often than the
-  # careful one, because the release cache is gated behind severe disk pressure
-  # (< 8 GB free) while this fired on SIZE alone, every 60s cycle. Six fired on
-  # 2026-08-30 alone.
-  #
-  # So gate it on what the clear is actually FOR. Unbounded growth is only
-  # harmful because it ends in ENOSPC, so while free disk is healthy there is no
-  # urgency worth a peer's build: defer to the next cycle, 60s away. When disk
-  # IS low the override is automatic and needs no counter, because ENOSPC breaks
-  # every lane including the ones being protected. That ties the exception to
-  # the harm rather than to a timeout someone would have to tune.
-  #
-  # Detecting a lane's build: any rustc/cargo process at THIS moment is a peer's.
-  # The builder holds the single-instance lock and has not started its own cargo
-  # yet — the guard runs before the build, deliberately (see the ordering note
-  # above), which is what makes this check unambiguous rather than a heuristic.
+  # ATE-92 supersedes AF-415: disk pressure never authorizes deleting a live
+  # build. Guard and mutate in ONE process, holding the shared lifetime lease
+  # and Cargo locks through cleanup. A failed probe is a deferral too.
+  reclaim_target() {
+    local root="$1" candidate="$2" result
+    # Existing deterministic test seam may force a refusal, never bypass a real
+    # process/lock check by setting the override empty.
+    if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}" ]; then
+      echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $AMUX_BUILD_PEER_PIDS_OVERRIDE); retry after builds finish."
+      return 0
+    fi
+    local guard_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$root" --path "$candidate")
+    [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || guard_cmd+=(--dry-run)
+    if result=$("${guard_cmd[@]}"); then
+      echo "== cargo_reclaim_result path=$candidate $result"
+    else
+      echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
+    fi
+  }
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   if [ -d "$DEBUG_DIR" ]; then
     DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
-    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}" ]; then
-      # WHY THIS IS AN if/else AND NOT `${VAR-$(...)}`, and why every pgrep
-      # carries `|| true`: this script runs under `set -euo pipefail`, `pgrep`
-      # exits 1 when nothing matches, and with pipefail a single failing element
-      # fails the whole pipeline. The one-line version therefore made the
-      # ASSIGNMENT return non-zero on an idle host and `set -e` killed the
-      # builder right here — before the build, on every cycle, for the whole
-      # fleet. Caught by running the real script against the real HOME rather
-      # than by any test; `bash -n` was clean and the unit cases were green,
-      # because they exercise the branch and not the shell's error discipline.
-      #
-      # `+set` rather than a value test: an explicitly EMPTY override means "no
-      # peers are building", a state the real detector reaches constantly and a
-      # test must be able to force. Treating empty as unset would fall through
-      # to pgrep and make the no-peer case host-dependent, green on an idle CI
-      # runner and red here whenever any lane compiles.
-      # `pgrep -x`, matching the EXECUTABLE NAME, never `pgrep -f` over the whole
-      # command line. Measured while writing this: `-f '(^|/)(rustc|cargo)( |$)'`
-      # matched the very shell that ran it, because that command line CONTAINED
-      # the word cargo inside the pattern. On this box, where lanes discuss and
-      # grep for cargo constantly, an `-f` detector would report a peer build
-      # almost every cycle, defer forever, and hand back the unbounded growth
-      # this clear exists to stop (229 GB, 2026-08-29). A guard that never fires
-      # is the same outcome as no guard, arrived at more expensively.
-      if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE+set}" ]; then
-        PEER_BUILDS="$AMUX_BUILD_PEER_PIDS_OVERRIDE"
-      else
-        PEER_BUILDS="$( { pgrep -x rustc || true; pgrep -x cargo || true; } 2>/dev/null \
-          | sort -un | tr '\n' ' ' | sed 's/ *$//' )"
-      fi
-      FREE_NOW_GB=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')
-      if [ -n "$PEER_BUILDS" ] && [ "${FREE_NOW_GB:-0}" -ge "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then
-        # DEFERRED, and said out loud: a skip with no trace is indistinguishable
-        # from a cycle that found nothing to clear, which is the same ambiguity
-        # the single-instance lock above had to learn to report (AMUX-2927).
-        # If this line runs every cycle for hours, debug/ is growing while the
-        # fleet never idles, and the answer is per-lane target dirs (AF-336),
-        # not a shorter fuse here.
-        echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR (> ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}GB threshold), but DEFERRED — peer build(s) in flight (pid $PEER_BUILDS) and ${FREE_NOW_GB}GB free is above the ${AMUX_BUILD_MIN_FREE_GB:-25}GB fleet floor. Their artifacts live in debug/; clearing now is the vanished-rlib class (AF-303). Retrying next cycle."
-      else
-        if [ -n "$PEER_BUILDS" ]; then
-          why="disk at ${FREE_NOW_GB}GB free is BELOW the ${AMUX_BUILD_MIN_FREE_GB:-25}GB fleet floor, so ENOSPC outranks the peer build(s) in flight (pid $PEER_BUILDS)"
-        else
-          why="no peer build in flight"
-        fi
-        echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR (> ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}GB threshold). Clearing — $why. Release build is unaffected."
-        [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" = "1" ] || rm -rf "$DEBUG_DIR"
-      fi
+    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" ]; then
+      echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Clearing eligible artifacts only after the Cargo safety guard permits it."
+      reclaim_target "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
     fi
   fi
 
@@ -346,33 +463,11 @@ fi
       fi
       CAND_GB=$(du -sk "$cand" 2>/dev/null | awk '{print int($1/1048576)}')
       if [ "$cand" = "$HOME/.amux/rust-build-target" ]; then
-        # AF-415: THIS ARM HAS NO PEER-BUILD GATE, AND THAT IS DELIBERATE.
-        #
-        # The debug-SIZE arm above defers while any rustc/cargo is running
-        # (AF-303, the vanished-rlib class). This one does not, and the
-        # asymmetry is easy to read as an oversight, so: AF-303's own reasoning
-        # covers it. "When disk IS low the override is automatic and needs no
-        # counter, because ENOSPC breaks every lane including the ones being
-        # protected." A peer build dies either way below this threshold; the
-        # difference is whether it dies with a diagnosable error or with the
-        # disk full.
-        #
-        # Do NOT add a peer check here without changing that argument. The
-        # ordering already does the cheap part — the idle e2e dir is cleared
-        # first, and the shared one only survives to this line when that was not
-        # enough.
-        #
-        # WHOSE BUILD GOES COLD: every lane's, not this builder's. That is worth
-        # saying in the log because the sentence used to read as if the cost
-        # landed on the process doing the clearing, and it was 11 firings of the
-        # 25GB-era version of this arm that produced the three mid-build failures
-        # in AMUX-2936 (see AF-416 for the full diagnosis).
-        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir — EVERY lane's next build goes cold, not just this one. No peer-build gate here on purpose: below this floor ENOSPC breaks them anyway (AF-415)."
+        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir only if idle — EVERY lane's next build goes cold."
       else
-        echo "== DISK LOW: ${FREE_GB}GB free. Clearing the ${CAND_GB:-?}GB idle e2e target dir first (this build does not need it)."
+        echo "== DISK LOW: ${FREE_GB}GB free. Clearing the ${CAND_GB:-?}GB idle e2e target dir first, subject to the same Cargo safety guard."
       fi
-      # A seam so the ORDERING is testable without a 4GB fixture or a real build.
-      [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" = "1" ] || rm -rf "$cand"
+      reclaim_target "$cand" "$cand"
       # Re-measure between candidates: what the idle cache freed is what decides
       # whether the shared one survives. Under dry-run there is nothing to
       # re-measure, so keep listing candidates to show the full order.
@@ -515,23 +610,58 @@ fi
              "Create the identity (see AMUX-3527) or set AMUX_CODESIGN_IDENTITY."
       fi
     fi
-    mv -f "$INSTALL_TMP" "$INSTALL"
+    PROV_JSON=$(python3 - "$INSTALL_TMP" "$PROV_JSON" "$head" <<'PYIDENTITY'
+import hashlib,json,sys
+with open(sys.argv[1], 'rb') as f:
+    build=hashlib.file_digest(f, 'sha256').hexdigest()[:16] if hasattr(hashlib, 'file_digest') else hashlib.sha256(f.read()).hexdigest()[:16]
+d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3])
+print(json.dumps(d))
+PYIDENTITY
+)
+    # Publish identity before the executable. Readers require its hash to
+    # match the candidate, so neither half of the rename pair can lie.
+    printf '%s\n' "$PROV_JSON" > "${INSTALL}.identity.json.new.$$"
+    mv -f "${INSTALL}.identity.json.new.$$" "${INSTALL}.identity.json"
+
+    # Strip com.apple.provenance so macOS Gatekeeper doesn't show a
+    # "Verifying..." progress dialog on every launch. The xattr survives
+    # codesign and mv, and on macOS 26+ triggers verification even for
+    # properly-signed local builds.
+    xattr -d com.apple.provenance "$INSTALL_TMP" 2>/dev/null || true
+
+    if cmp -s "$INSTALL_TMP" "$INSTALL"; then
+      echo "== ACTIVATION IDENTICAL BINARY sha=$built_sha action=skip_install — keeping executable inode and mtime; no self-adoption"
+      rm -f "$INSTALL_TMP"
+      # The live binary may still carry com.apple.provenance from a prior
+      # install that predates the stripping above. Strip it here too so the
+      # skip path doesn't leave a stale provenance that Gatekeeper re-verifies
+      # on every launch (root cause of the recurring TCC dialog, AMUX-3527).
+      xattr -d com.apple.provenance "$INSTALL" 2>/dev/null || true
+      install_action=unchanged
+    else
+      mv -f "$INSTALL_TMP" "$INSTALL"
+      install_action=replaced
+    fi
     INSTALL_TMP=""
     echo "$head" > "$STAMP"
+    rm -f "${STAMP}.failed"
+    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
+    echo "== ACTIVATION INSTALLED identity=$PROV_JSON"
     # AEAB-50: only NOW is this true. Written after the atomic install so the
     # file means "what is installed" rather than "what was attempted". On the
     # failure branch below it is left alone, so it keeps naming the last good
     # build — which is exactly what that branch says is still running.
-    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
-    echo "== installed atomically; running server will self-adopt within 5s"
+    echo "== installation action=$install_action; running server will verify identity before adoption"
   else
+    printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.failed"
     echo "== BUILD FAILED for $head — running server keeps the last good build"
     echo "-- diagnostics (every error, with context) ---------------------------"
     grep -nE '^error(\[E[0-9]+\])?:|^error: ' -A 8 "$BUILD_OUT" | head -200 || true
     echo "-- last 20 lines of cargo output -------------------------------------"
     tail -20 "$BUILD_OUT"
     echo "-- end diagnostics ($(wc -l < "$BUILD_OUT" | tr -d ' ') lines total) ---"
-    # Stamp is NOT updated: the next cycle retries. A failed build never
+    # Successful stamp is NOT updated: retry after the bounded cooldown, or
+    # immediately for changed build inputs. A failed build never
     # takes the fleet down (the AC-309 class: a bad save must not crash-loop
     # the server).
   fi

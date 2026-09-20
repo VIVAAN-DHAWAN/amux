@@ -24,14 +24,14 @@
 //!   does not model (`creator`, `created`, `notified`, `gcal_event_id`,
 //!   `deleted`).
 
-use amux_core::board::{self, Gate, GateCriterion, ItemType, Task, TaskStatus};
+use amux_core::board::{ Gate, GateCriterion, ItemType, Task, TaskStatus};
 use amux_core::events::Actor;
 use amux_core::ids::{GateId, TaskId};
 use amux_core::verification::VerifierKind;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
@@ -93,6 +93,39 @@ pub fn parse_status(raw: &str) -> Option<TaskStatus> {
         "quarantined" => Some(TaskStatus::Quarantined),
         _ => None,
     }
+}
+
+/// The DB spellings a card can hold while A LANE CAN STILL ACT ON IT, as a
+/// SQL-ready quoted list.
+///
+/// DERIVED from `TaskStatus::claims_live_work`, so a status added to the enum
+/// joins every query automatically (AF-555's lesson: a predicate every consumer
+/// must reimplement is a predicate that will be wrong somewhere).
+///
+/// AMUX-4801. Five call sites in autofix.rs hand-wrote the INVERSE of this as
+/// `status NOT IN ('done','verified','discarded')`, and that literal is wrong
+/// in two ways a reader cannot see:
+///
+/// 1. It counts `armed` and `quarantined` as live. A lane cannot act on
+///    either: `is_dormant` says an armed card waits for an event and is never
+///    auto-picked, and a quarantined card is parked FOR THE OWNER by
+///    `amux board fail`. Those sites' own comment says "only cards a lane can
+///    still act on count", so the literal contradicts the sentence above it,
+///    and a quarantined card silently suppressed re-filing of a live fault.
+/// 2. `NOT IN` is open-world: any status outside the three, including a legacy
+///    spelling, reads as LIVE. The board holds exactly one such card, MVS-163
+///    at `resolved`, which `parse_status` maps to Done. The literal calls it
+///    live; this list correctly does not.
+///
+/// Safe to interpolate: every element is a fixed ASCII identifier from the
+/// enum, never user input, and a test pins that.
+pub fn live_work_status_list() -> String {
+    amux_core::board::TaskStatus::ALL
+        .iter()
+        .filter(|s| s.claims_live_work())
+        .map(|s| format!("'{}'", db_status_spelling(*s)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The Python DB spelling for each status (what a FRESH write uses). Note
@@ -342,11 +375,13 @@ pub const NEEDSYOU_ASK_REQUIRED_KEY: &str = "AMUX_NEEDSYOU_ASK_REQUIRED";
 /// means a call only the owner's taste can settle, which is a real category
 /// (ethos rule 3 wants a truthful path for it) and NOT "I would like a second
 /// opinion".
-pub const ASK_TYPES: [&str; 5] = ["decision", "access", "credential", "external", "judgment"];
+pub const ASK_TYPES: [&str; 7] = ["budget", "customer_outbound", "decision", "access", "credential", "external", "judgment"];
 
 /// What each type means, printed in the refusal so the reader picks correctly
 /// on the first try rather than by guessing at five bare words.
-pub const ASK_TYPE_HELP: [(&str, &str); 5] = [
+pub const ASK_TYPE_HELP: [(&str, &str); 7] = [
+    ("budget", "increase spend or exceed an authorized budget"),
+    ("customer_outbound", "send customer communication without existing authorization"),
     ("decision", "a choice only the owner can make — direction, priority, or a trade-off with no right answer"),
     ("access", "you cannot reach something: a repo, a console, an environment, a person"),
     ("credential", "a secret, token, key or sign-in only the owner can supply"),
@@ -379,6 +414,86 @@ pub fn needsyou_ask_required(session: Option<&str>) -> bool {
         Some(v) => !is_off(&v),
         None => true,
     }
+}
+
+/// Scoped authorization categories, independent of whether the question is well
+/// formed. `*` is the explicit legacy policy. Existing deployments keep it until
+/// the owner selects a global/group/worker policy; no worker can silently infer
+/// a budget grant from the absence of a typed question.
+pub fn approval_types(session: Option<&str>) -> Vec<String> {
+    let configured = std::env::var("AMUX_APPROVAL_TYPES").ok().filter(|v|!v.trim().is_empty())
+        .or_else(||session.and_then(|s|crate::api::session_verbs::scoped_setting_in(&crate::api::session_verbs::home(),s,"AMUX_APPROVAL_TYPES")))
+        .unwrap_or_else(||"*".into());
+    configured.split(',').map(|s|s.trim().to_ascii_lowercase()).filter(|s|!s.is_empty()).collect()
+}
+pub fn approval_type_allowed(session: Option<&str>, kind: &str) -> bool {
+    let allowed=approval_types(session);
+    allowed.iter().any(|s|s=="*" || s==&kind.trim().to_ascii_lowercase())
+}
+
+/// Boards are self-contained by default. Legacy cooperative workspaces can
+/// explicitly opt in through the same worker/group/global setting resolver.
+pub fn board_delegation_allowed(session: Option<&str>) -> bool {
+    let value = std::env::var("AMUX_BOARD_DELEGATION").ok()
+        .or_else(|| session.and_then(|s| crate::api::session_verbs::scoped_setting_in(
+            &crate::api::session_verbs::home(), s, "AMUX_BOARD_DELEGATION")));
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+}
+
+/// References to other boards are evidence, not scheduler dependencies.
+/// This invariant is unconditional: delegation may authorize assignment, never
+/// an execution edge across owners. Unassigned cards form their own board.
+pub fn foreign_dependencies(conn: &Connection, session: Option<&str>, deps: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
+    let session = session.filter(|s| !s.is_empty());
+    let mut foreign = Vec::new();
+    for id in deps {
+        let owner = conn.query_row("SELECT session FROM issues WHERE id=?1 AND deleted IS NULL", [id],
+            |r| r.get::<_, Option<String>>(0)).optional()?;
+        match owner {
+            Some(owner) if owner.as_deref().filter(|s| !s.is_empty()) == session => {},
+            Some(owner) => foreign.push((id.clone(), owner.filter(|s| !s.is_empty()).unwrap_or_else(|| "unassigned".into()))),
+            None => foreign.push((id.clone(), "missing".into())),
+        }
+    }
+    Ok(foreign)
+}
+
+/// Reassignment must also preserve the board of every task that waits on this
+/// card. Keep connected work together; silently dropping these edges would
+/// turn an unfinished prerequisite into runnable work.
+pub fn foreign_dependents(conn: &Connection, id: &str, session: Option<&str>) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT i.id, COALESCE(NULLIF(i.session,''),'unassigned') FROM issues i, \
+         json_each(CASE WHEN json_valid(i.depends_on) THEN i.depends_on ELSE '[]' END) d \
+         WHERE i.deleted IS NULL AND d.value=?1 AND COALESCE(i.session,'') != ?2 ORDER BY i.id")?;
+    let rows = stmt.query_map(params![id, session.unwrap_or("")], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+fn refuse_dependency_write(card: &str, edges: &[(String, String)]) -> rusqlite::Result<()> {
+    if edges.is_empty() { return Ok(()) }
+    tracing::warn!(marker="cross_board_dependency_refused", card, dependencies=?edges,
+        measured=true, n_considered=edges.len(), "storage refused a dependency graph crossing worker boards");
+    Err(rusqlite::Error::InvalidParameterName(format!("cross_board_dependency_forbidden: {card}: {edges:?}")))
+}
+
+/// Guard the shared write path, including board-drive and internal assignments.
+/// Legacy bad edges may still receive evidence and be removed incrementally;
+/// new edges, ownership changes and reopening a terminal card are checked.
+fn validate_dependency_update(conn: &Connection, row: &IssueRow) -> rusqlite::Result<()> {
+    let previous: Option<(Option<String>, Option<String>, String, String)> = conn.query_row(
+        "SELECT session, depends_on, status, type FROM issues WHERE id=?1", [&row.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+    let Some((owner, deps, status, item_type)) = previous else { return Ok(()) };
+    let owner_changed = owner.as_deref().filter(|s| !s.is_empty()) != row.session.as_deref().filter(|s| !s.is_empty());
+    let old_deps: Vec<String> = serde_json::from_str(deps.as_deref().unwrap_or("[]")).unwrap_or_default();
+    let reopened = execution_is_terminal(&status, &item_type) && !execution_is_terminal(&row.status, &row.item_type);
+    let added: Vec<String> = row.depends_on.iter().filter(|d| owner_changed || reopened || !old_deps.contains(d)).cloned().collect();
+    refuse_dependency_write(&row.id, &foreign_dependencies(conn, row.session.as_deref(), &added)?)?;
+    if owner_changed {
+        refuse_dependency_write(&row.id, &foreign_dependents(conn, &row.id, row.session.as_deref())?)?;
+    }
+    Ok(())
 }
 
 /// Why a typed ask was refused, or that it was accepted.
@@ -560,6 +675,55 @@ pub fn continuation_applies(status: TaskStatus) -> bool {
 /// lanes are blocked behind costs three lanes a day. The owner's scarce
 /// resource is attention, so the ranking has to be by what clearing it
 /// RELEASES, which is the one thing the board actually knows.
+/// Blast radius for MANY ids in ONE pass.
+///
+/// AMUX-4618. `needsyou_queue` scored every row with `blast_radius`, which is an
+/// N+1 over a query that cannot use an index: `depends_on LIKE '%id%'` has a
+/// LEADING wildcard, so the planner answers `SCAN issues` across all 21,592
+/// rows. Measured 2026-09-16 on the live board: 52.7ms per call, 257 needsyou
+/// rows, 13.6s projected against 12.2-14.3s actually observed on the endpoint.
+/// The payload is 26KB, so none of that was serialisation.
+///
+/// This scans once. Only 223 rows in that population carry a non-empty
+/// `depends_on` at all, so the work after the scan is counting a few hundred
+/// short JSON arrays.
+///
+/// AND IT FIXES AN OVER-COUNT. `LIKE '%id%'` is a SUBSTRING match, so
+/// `blast_radius("BR-1")` counts a card that depends on BR-18, BR-115, BR-13 or
+/// BR-12. Measured on the live board: 26 such collisions among ids that are
+/// actually depended on. The score ranks the owner's queue and that queue is
+/// capped, so an inflated card can displace a real one. Parsing the JSON and
+/// comparing ids exactly removes the whole class.
+pub fn blast_radius_many(
+    conn: &Connection,
+    ids: &[String],
+) -> std::collections::HashMap<String, i64> {
+    let mut out: std::collections::HashMap<String, i64> =
+        ids.iter().map(|i| (i.clone(), 0)).collect();
+    if ids.is_empty() {
+        return out;
+    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT depends_on FROM issues WHERE deleted IS NULL AND archived = 0 \
+         AND status NOT IN ('done','verified','discarded') \
+         AND depends_on IS NOT NULL AND depends_on NOT IN ('','[]')",
+    ) else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return out;
+    };
+    for dep_json in rows.flatten() {
+        let deps: Vec<String> = serde_json::from_str(&dep_json).unwrap_or_default();
+        for d in deps {
+            if let Some(n) = out.get_mut(&d) {
+                *n += 1;
+            }
+        }
+    }
+    out
+}
+
 pub fn blast_radius(conn: &Connection, id: &str) -> i64 {
     let like = format!("%{id}%");
     conn.query_row(
@@ -1008,10 +1172,18 @@ pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String>
             "Ready for another set of eyes",
         ],
         (ItemType::Code, TaskStatus::Done) => &["Implemented and merged", "Tests / lint pass"],
+        // AF-719: criteria 2/3 used to have no truthful path for a code card in
+        // a repo/domain with no deployment concept at all (a local analysis
+        // script, a one-shot data-repo fix) — unlike criterion 1, which already
+        // had the "if not applicable, note why" escape. amux-server's own code
+        // genuinely deploys to a running service, so the bar is unchanged for
+        // it; the escape only matters for a code card where it is honestly
+        // inapplicable, and noting why is not a weaker bar than asserting a
+        // deployment that never happened.
         (ItemType::Code, TaskStatus::Verified) => &[
             "CI/CD green (if e2e infra is unavailable, note why — that is not a failure)",
-            "Deployed to prod",
-            "Confirmed working in prod",
+            "Deployed to prod (if this card has no deployment target, note why)",
+            "Confirmed working in prod (if this card has no deployment target, note why)",
             "Zero regressions",
         ],
         // Decision (AF-323): a card whose only output is an answer from the
@@ -1230,13 +1402,22 @@ pub fn effective_gate_trail(
     // Consult everything FIRST, decide after. Interleaving the two is what made
     // "consulted and empty" and "never asked" indistinguishable.
     let card = row.gate_criteria();
-    let worker = session.and_then(|s| scoped_gate(conn, s, target));
+    let worker_raw = session.and_then(|s| scoped_gate(conn, s, target));
+    let worker_additive = worker_raw.as_ref().map(|(_, a)| *a).unwrap_or(false);
+    let worker = worker_raw.map(|(c, _)| c);
     let mut group_merged: Vec<String> = Vec::new();
     let mut group_hits: Vec<String> = Vec::new();
+    let mut group_additive = false;
     if session.is_some() {
         for group in groups {
-            if let Some(list) = scoped_gate(conn, &format!("group:{group}"), target) {
+            if let Some((list, additive)) = scoped_gate(conn, &format!("group:{group}"), target) {
                 group_hits.push(group.clone());
+                // ANY contributing group asking to be additive makes the merged
+                // group tier additive. Union across groups is already this
+                // function's rule for criteria, and a mixed answer has no
+                // meaning: the merged list is one tier, so it either defers to
+                // the type or replaces it.
+                group_additive = group_additive || additive;
                 for c in list {
                     if !group_merged.contains(&c) {
                         group_merged.push(c);
@@ -1245,7 +1426,9 @@ pub fn effective_gate_trail(
             }
         }
     }
-    let column = configured_gate(conn, target);
+    let column_raw = configured_gate(conn, target);
+    let column_additive = column_raw.as_ref().map(|(_, a)| *a).unwrap_or(false);
+    let column = column_raw.map(|(c, _)| c);
     // `default_gates_for`, NOT `effective_gate`: the latter returns the CARD
     // OVERRIDE when one exists, so using it here made the type tier report the
     // card's criteria as its own — a tier claiming a rule it does not hold, in
@@ -1255,17 +1438,38 @@ pub fn effective_gate_trail(
     // override is empty and the two agree by definition.
     let type_default = default_gates_for(&row.item_type, target);
 
+    // AF-570: an ADDITIVE winning tier keeps the type default instead of
+    // replacing it. Type first, so the card's own definition of finished leads
+    // and the scope's process criteria follow. Deduped, because a scope is
+    // allowed to restate a criterion the type already has and nobody should be
+    // asked to acknowledge it twice.
+    let union_with_type = |scope_criteria: Vec<String>| -> Vec<String> {
+        let mut out = type_default.clone();
+        for c in scope_criteria {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    };
     let (criteria, source, winner) = if !card.is_empty() {
         (card.clone(), GateSource::Card, "card")
     } else if let Some(g) = worker.clone() {
+        let g = if worker_additive { union_with_type(g) } else { g };
         (g, GateSource::Worker(session.unwrap_or("").to_string()), "worker")
     } else if !group_merged.is_empty() {
+        let g = if group_additive {
+            union_with_type(group_merged.clone())
+        } else {
+            group_merged.clone()
+        };
         (
-            group_merged.clone(),
+            g,
             GateSource::Group(groups.iter().cloned().collect::<Vec<_>>().join(", ")),
             "group",
         )
     } else if let Some(c) = column.clone() {
+        let c = if column_additive { union_with_type(c) } else { c };
         (c, GateSource::Column, "column")
     } else {
         (type_default.clone(), GateSource::TypeDefault, "type_default")
@@ -1398,11 +1602,29 @@ impl GateSource {
 /// One scope's gate row from `session_gates` (scope key is a session name or
 /// `group:<name>`), or None when the row is absent, empty, or unreadable —
 /// every "cannot tell" inherits the next tier rather than opening the gate.
+/// The marker a scoped gate uses to declare itself ADDITIVE (AF-570).
+///
+/// A scoped gate normally REPLACES every tier below it, which is what makes the
+/// precedence readable. That is wrong for a gate whose criteria are about HOW a
+/// card was checked rather than WHAT it is: group:amux wants "a different worker
+/// reviewed it, and checked rather than believed" to apply to every card, while
+/// still letting each item TYPE say what being finished means for it. Under
+/// replacement those two cannot both be true, so setting the group gate to the
+/// peer criteria alone silently removes "Confirmed working in prod" from every
+/// `code` card (found by amux-cloud, reading effective_gate_trail, before this
+/// was built rather than after it shipped).
+pub const GATE_ADDITIVE_MARKER: &str = "@additive";
+
+/// An operator-authored gate for a scope, plus whether it is ADDITIVE.
+///
+/// OPT-IN, so this is a no-op for every gate that does not carry the marker: the
+/// fleet's other groups resolve through this same function and were not part of
+/// the decision to change amux's gate.
 fn scoped_gate(
     conn: &rusqlite::Connection,
     scope: &str,
     target: TaskStatus,
-) -> Option<Vec<String>> {
+) -> Option<(Vec<String>, bool)> {
     let id = status_to_db(target, "");
     let gate: Option<String> = conn
         .query_row(
@@ -1412,21 +1634,44 @@ fn scoped_gate(
         )
         .ok()?;
     let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let mut additive = false;
     let list: Vec<String> = list
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.eq_ignore_ascii_case(GATE_ADDITIVE_MARKER) {
+                additive = true;
+                false // the marker is a directive, never a criterion to acknowledge
+            } else {
+                true
+            }
+        })
         .collect();
-    (!list.is_empty()).then_some(list)
+    // A gate of ONLY the marker holds no criteria, so it is not a rule and must
+    // not win its tier. Returning it would hand the winner an empty criteria
+    // list, which reads as "no gate" and opens the strictest transitions -- the
+    // same failure `configured_gate` documents one function down.
+    (!list.is_empty()).then_some((list, additive))
 }
 
-/// The operator-authored gate for a column, or None.
+/// The operator-authored gate for a column, plus whether it is ADDITIVE
+/// (AF-393), or None.
 ///
 /// Returns None for a seeded row, an empty list, or unreadable JSON — every
 /// "cannot tell" answer falls back to the type defaults rather than to an empty
 /// gate. An empty gate would mean NO gate, so a malformed row must never read as
 /// permission (it would silently open the strictest transitions on the board).
-pub fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Option<Vec<String>> {
+///
+/// Mirrors [`scoped_gate`] exactly (same marker, same empty-after-marker
+/// fallthrough) so the column tier can opt into the same union-with-type-default
+/// behaviour the worker and group tiers already have — AF-393 found this tier
+/// was the one place a fleet-wide gate could only REPLACE each type's own
+/// criteria, never add to them.
+pub fn configured_gate(
+    conn: &rusqlite::Connection,
+    target: TaskStatus,
+) -> Option<(Vec<String>, bool)> {
     let id = status_to_db(target, "");
     let (gate, custom): (Option<String>, Option<i64>) = conn
         .query_row(
@@ -1439,12 +1684,21 @@ pub fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Optio
         return None;
     }
     let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let mut additive = false;
     let list: Vec<String> = list
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.eq_ignore_ascii_case(GATE_ADDITIVE_MARKER) {
+                additive = true;
+                false // the marker is a directive, never a criterion to acknowledge
+            } else {
+                true
+            }
+        })
         .collect();
-    (!list.is_empty()).then_some(list)
+    (!list.is_empty()).then_some((list, additive))
 }
 
 pub fn effective_gate(row: &IssueRow, target: TaskStatus) -> Vec<String> {
@@ -1485,12 +1739,121 @@ pub fn core_gates(criteria: &[String], target: TaskStatus) -> Vec<Gate> {
 // Log convention
 // ---------------------------------------------------------------------------
 
+/// A `` `YYYY-MM-DD` `` line on its own, distinct from an ordinary
+/// `` `HH:MM` message `` entry by length and shape alone. Returns the date
+/// text when `line` is exactly that.
+fn date_separator(line: &str) -> Option<&str> {
+    let inner = line.trim().strip_prefix('`')?.strip_suffix('`')?;
+    let b = inner.as_bytes();
+    (b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && inner[..4].bytes().all(|c| c.is_ascii_digit())
+        && inner[5..7].bytes().all(|c| c.is_ascii_digit())
+        && inner[8..10].bytes().all(|c| c.is_ascii_digit()))
+    .then_some(inner)
+}
+
 /// Append one history line exactly the way Python's `_append_board_log`
-/// does: `` (log.rstrip() + "\n`HH:MM` " + line).strip() `` — so logs written
+/// did: `` (log.rstrip() + "\n`HH:MM` " + line).strip() `` — so logs written
 /// by either server interleave without corrupting each other's lines.
+///
+/// AF-470: `HH:MM` alone lost the date, so a multi-day log's time axis had
+/// to be INFERRED from where the clock visibly wraps backwards (measured on
+/// TG-3239's 74 entries) rather than read. Every option that stamped every
+/// line paid a per-line width cost this view's own mobile rules (375px)
+/// don't have room for; Ethan's call (2026-09-18) was a date only where the
+/// day actually changes: `` `YYYY-MM-DD` `` as its own line, inserted the
+/// first time an entry lands on a day the log hasn't seen a separator for
+/// yet. A log with no separator at all (every entry written before this
+/// existed) gets one on its very next append — that is the honest
+/// boundary: existing HH:MM-only entries are baked in and stay ambiguous
+/// forever, which is the same limit the card's own options all shared.
 pub fn append_log(existing: Option<&str>, hhmm: &str, line: &str) -> String {
     let base = existing.unwrap_or("").trim_end();
-    format!("{base}\n`{hhmm}` {line}").trim().to_string()
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let last_separator = base.lines().rev().find_map(date_separator);
+    let mut out = base.to_string();
+    if last_separator != Some(today.as_str()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push('`');
+        out.push_str(&today);
+        out.push('`');
+    }
+    format!("{out}\n`{hhmm}` {line}").trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// AF-510: fleet-wide needs:you digest producer
+// ---------------------------------------------------------------------------
+
+/// One row of the fleet-wide needs:you digest -- what would be shown to the
+/// owner, regardless of which channel eventually carries it there.
+pub struct NeedsYouDigestCard {
+    pub id: String,
+    pub session: String,
+    pub title: String,
+    pub ask_question: Option<String>,
+    pub ask_actor: Option<String>,
+    pub archived: bool,
+    pub asked_at: f64,
+    pub age_days: f64,
+}
+
+/// AF-510. Fleet-wide needs:you digest: every non-terminal card that is
+/// waiting on a human, aged by the SAME clock `board_drive.rs`'s per-lane
+/// renag uses -- `MIN(issue_tags.added_at)` for a tagged ask, falling back to
+/// `i.updated` only when no tag row exists (AC-178: `updated` alone is
+/// last-touch, so the most-commented asks would look youngest) -- so a
+/// fleet-wide view and the per-lane renag never disagree about how old the
+/// same ask is.
+///
+/// Returns the OLDEST `cap` cards fleet-wide, plus the TRUE total before
+/// capping. Age is the ordering signal on purpose (AF-510's own
+/// recommendation: a week-old queue is what costs the owner, not today's
+/// newest asks), and the true total travels separately so a digest can never
+/// repeat the 92-cards-in-one-SMS mistake (autofix.rs's own comment on why
+/// broadcasts get capped) while still saying what it could not show (ethos
+/// rule 4 -- a capped list that does not report its own population reads as
+/// complete).
+///
+/// Caller decides delivery; this function decides nothing about a channel.
+pub fn needsyou_digest(
+    conn: &Connection,
+    now: f64,
+    cap: usize,
+) -> rusqlite::Result<(Vec<NeedsYouDigestCard>, usize)> {
+    let mut all: Vec<NeedsYouDigestCard> = conn
+        .prepare(
+            "SELECT i.id, i.session, i.title, i.ask_question, i.ask_actor, \
+                    COALESCE(i.archived,0), COALESCE(MIN(t.added_at), i.updated) AS asked_at \
+             FROM issues i LEFT JOIN issue_tags t \
+                  ON t.issue_id = i.id AND lower(t.tag) LIKE 'needs:you%' \
+             WHERE i.deleted IS NULL AND i.owner_type='agent' \
+             AND (t.tag IS NOT NULL OR i.status='needsyou') \
+             AND i.status NOT IN ('done','verified','discarded') \
+             GROUP BY i.id HAVING asked_at IS NOT NULL \
+             ORDER BY asked_at ASC",
+        )?
+        .query_map([], |r| {
+            let asked_at: f64 = r.get(6)?;
+            Ok(NeedsYouDigestCard {
+                id: r.get(0)?,
+                session: r.get(1)?,
+                title: r.get(2)?,
+                ask_question: r.get(3)?,
+                ask_actor: r.get(4)?,
+                archived: r.get::<_, i64>(5)? != 0,
+                asked_at,
+                age_days: (now - asked_at) / 86400.0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total = all.len();
+    all.truncate(cap);
+    Ok((all, total))
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,6 +2061,15 @@ pub struct IssueRow {
     pub callback_fired_at: Option<i64>,
     /// Visible refusal/recovery detail; never hidden in logs alone.
     pub callback_error: Option<String>,
+    /// Hard lease (RR-0052, migration 0068). `lease_owner` is the lane NAME
+    /// holding this card; NULL means no lease (every legacy card), which behaves
+    /// exactly as before. The timestamps are unix seconds; `lease_generation` is
+    /// bumped on every reclaim so a write from a dead claimant is recognizable.
+    pub lease_owner: Option<String>,
+    pub lease_acquired_at: Option<i64>,
+    pub lease_heartbeat_at: Option<i64>,
+    pub lease_expires_at: Option<i64>,
+    pub lease_generation: i64,
     /// Set ONLY when `desc` holds a bounded PREFIX rather than the whole
     /// string, which the slim list does to stop hydrating ~30 MB of prose per
     /// call (AF-346). `None` means `desc` is complete and every consumer
@@ -1807,18 +2179,34 @@ impl IssueRow {
             "next_action": self.next_action,
             "last_result": self.last_result,
             "unresolved": self.unresolved,
-            "acceptance_criteria": self.acceptance_criteria.as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            "acceptance_criteria": parse_json_or_raw_string(self.acceptance_criteria.as_deref()),
             "decision_question": self.decision_question,
             "decision_rationale": self.decision_rationale,
             "decision_supersedes": self.decision_supersedes,
-            "waiting_on": self.waiting_on.as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            // AF-930: was `.and_then(|s| serde_json::from_str(s).ok())`, which
+            // reports the same `null` for "empty" and "holds real content
+            // that failed to parse" -- same defect `parse_json_or_raw_string`
+            // exists to fix for `acceptance_criteria` (AF-711), unfixed here.
+            // A pre-fix plain-string value (or one written by a client that
+            // never JSON-encoded it) rendered as `null` with no sign anything
+            // was wrong.
+            "waiting_on": parse_json_or_raw_string(self.waiting_on.as_deref()),
             "requested_by": self.requested_by,
             "callback": self.callback_session.as_ref().map(|session| serde_json::json!({
                 "session": session,
                 "prompt": self.callback_prompt,
-                "trigger": "terminal",
+                "trigger": "dependency_resolution",
+                // AF-681: this used to be called `resolution_status`, which reads
+                // as "how did THIS card resolve" -- primis reported it reading
+                // "verified" on a card that was actually `discarded`. It never
+                // answered that question: it is `verified_is_meaningful(item_type)`,
+                // a constant for the TYPE, computed the same way whether this card
+                // discarded, verified, or never fired at all. `dependency_resolved`
+                // right below is the real per-card answer. Renamed to say what it
+                // actually is: which word THIS TYPE's completion is spelled with,
+                // for phrasing a callback prompt before anything has happened yet.
+                "completion_label_for_type": if amux_core::board::verified_is_meaningful(core_item_type(&self.item_type)) { "verified" } else { "done" },
+                "dependency_resolved": dependency_is_resolved(&self.status, &self.item_type),
                 "state": self.callback_state,
                 "message_id": self.callback_message_id,
                 "fired_at": self.callback_fired_at,
@@ -1858,9 +2246,10 @@ impl IssueRow {
     /// not in the shared vocabulary (a custom Python lane) — callers must
     /// refuse the transition honestly rather than guess.
     ///
-    /// `worker` is always `None`: `issues.session` is an owner NAME, not a
-    /// claim by `WorkerId` — atomic claims/leases land with RR-0052.
-    /// NO CARD MAY VANISH (AMUX-2632).
+    /// `worker` is the LEASE holder (`lease_owner`), not `session`: an owner
+    /// NAME mapped to a `WorkerId` via `foreign_worker_id` so core's
+    /// `AlreadyClaimed` becomes name-equality (RR-0052). A card with no lease is
+    /// `None` and ungated, exactly as before. NO CARD MAY VANISH (AMUX-2632).
     ///
     /// This opened `parse_status(&self.status)?`, so a status outside the
     /// closed vocabulary returned None — and the orchestrator's one caller did
@@ -1896,7 +2285,15 @@ impl IssueRow {
             title: self.title.clone(),
             desc: self.desc.clone(),
             status,
-            worker: None,
+            // RR-0052: the holder is the lease owner (lane NAME), mapped to a
+            // WorkerId via `foreign_worker_id` so core's `AlreadyClaimed` becomes
+            // name-equality. NULL lease -> None -> ungated, exactly as before.
+            worker: self
+                .lease_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::orchestrator::runtime::foreign_worker_id),
             item_type: core_item_type(&self.item_type),
             creator,
             created_at: ts(self.created),
@@ -1930,7 +2327,9 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
      i.decision_supersedes, i.waiting_on, i.requested_by, i.callback_session, \
      i.callback_prompt, i.callback_state, i.callback_message_id, \
-     i.callback_fired_at, i.callback_error, i.ask_actor";
+     i.callback_fired_at, i.callback_error, i.ask_actor, \
+     i.lease_owner, i.lease_acquired_at, i.lease_heartbeat_at, \
+     i.lease_expires_at, COALESCE(i.lease_generation,0)";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -2057,6 +2456,11 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         callback_fired_at: r.get(49)?,
         callback_error: r.get(50)?,
         ask_actor: r.get(51)?,
+        lease_owner: r.get(52)?,
+        lease_acquired_at: r.get(53)?,
+        lease_heartbeat_at: r.get(54)?,
+        lease_expires_at: r.get(55)?,
+        lease_generation: r.get(56)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2170,15 +2574,186 @@ pub fn probe_board_read(conn: &Connection) -> rusqlite::Result<usize> {
     Ok(mapped)
 }
 
+/// Columns the PLANNER needs, and no others (AMUX-4757).
+///
+/// `COLS` above carries ~55 columns including `desc`, `log`, `evidence`,
+/// `acceptance_criteria` and the whole `decision_*` and `callback_*` families.
+/// The orchestrator tick loads every active board row through it and uses none
+/// of that text: `to_task` copies `desc` into the Task and nothing in the
+/// planning path reads it, because the assignment path re-reads the card by id
+/// (`context::task_by_internal_id`) to build a worker's context.
+///
+/// Measured on the live board, 2026-09-18: the full projection materialises
+/// ~113 MB per tick against ~3.1 MB here, and the tick runs roughly every 3
+/// seconds. That is the CPU `runtime_job_blocking_poll` was reporting.
+const PLANNING_COLS: &str = "i.id, i.title, i.status, i.session, i.creator, \
+     i.created, i.updated, i.type, COALESCE(i.archived,0), COALESCE(i.pinned,0), \
+     COALESCE(i.pos,0), i.depends_on, i.reviewer, COALESCE(i.version,0), \
+     i.lease_owner, GROUP_CONCAT(t.tag)";
+
+/// A board row reduced to what planning needs.
+///
+/// `task.desc` IS ALWAYS EMPTY on rows from [`planning_tasks`]. That is not a
+/// card with no description; it is a column this query does not read. Anything
+/// that needs the text must load the card by id. The field cannot be made
+/// absent — `Task::desc` is a `String` — so the name of the constructor and
+/// this paragraph are the only warning available, which is why it is stated
+/// twice.
+pub struct PlanningRow {
+    pub task: Task,
+    /// The RAW status string, kept because `to_task` maps an unmodelled column
+    /// to `Blocked` and the caller warns using the original spelling.
+    pub raw_status: String,
+    /// The owning lane as stored, before the caller maps it to a `WorkerId`.
+    pub session: Option<String>,
+}
+
+/// Every board row as a planning `Task`, without the heavy text columns.
+///
+/// Ordering, filtering and the `to_task` mapping match [`list_issues`] exactly;
+/// only the column list differs. A divergence here would be a planner that
+/// disagrees with the board about which cards exist, so the shared pieces
+/// (`board_order`, `parse_status`, `core_item_type`, `internal_id`) are called
+/// rather than restated.
+pub fn planning_tasks(
+    conn: &Connection,
+    archived: ArchivedFilter,
+) -> rusqlite::Result<Vec<PlanningRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PLANNING_COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
+         WHERE i.deleted IS NULL GROUP BY i.id"
+    ))?;
+    let mut rows: Vec<(i64, f64, i64, PlanningRow)> = Vec::new();
+    let mapped = stmt.query_map([], |r| {
+        let archived_flag: i64 = r.get(8)?;
+        let pinned: i64 = r.get(9)?;
+        let pos: f64 = r.get(10)?;
+        let updated = ts_i64(r, 6)?;
+        let depends_raw: Option<String> = r.get(11)?;
+        let depends_on: Vec<String> = depends_raw
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+            .map(|v| v.into_iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let tags_csv: Option<String> = r.get(15)?;
+        let tags: Vec<String> = tags_csv
+            .unwrap_or_default()
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        let id: String = r.get(0)?;
+        let raw_status: String = r.get(2)?;
+        let creator: String = r.get(4)?;
+        let reviewer: Option<String> = r.get(12)?;
+        let lease_owner: Option<String> = r.get(14)?;
+        let item_type: String = r.get(7)?;
+        let task = Task {
+            id: internal_id(&id),
+            title: r.get(1)?,
+            // NOT LOADED. See PlanningRow.
+            desc: String::new(),
+            status: parse_status(&raw_status).unwrap_or(TaskStatus::Blocked),
+            worker: lease_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::orchestrator::runtime::foreign_worker_id),
+            item_type: core_item_type(&item_type),
+            creator: if creator.trim().is_empty() {
+                Actor::System { component: "python-board".into() }
+            } else {
+                Actor::Human { name: creator }
+            },
+            created_at: ts(ts_i64(r, 5)?),
+            updated_at: ts(updated),
+            archived: archived_flag != 0,
+            pinned: pinned != 0,
+            depends_on: depends_on.iter().map(|d| internal_id(d)).collect(),
+            reviewer: reviewer.map(|n| Actor::Human { name: n }),
+            gate_override: None,
+            tags,
+            version: u64::try_from(r.get::<_, i64>(13)?).unwrap_or(0),
+        };
+        Ok((
+            pinned,
+            pos,
+            updated,
+            PlanningRow { task, raw_status, session: r.get(3)? },
+        ))
+    })?;
+    for row in mapped {
+        let row = row?;
+        match archived {
+            ArchivedFilter::ActiveOnly if row.3.task.archived => continue,
+            ArchivedFilter::ArchivedOnly if !row.3.task.archived => continue,
+            _ => {}
+        }
+        rows.push(row);
+    }
+    rows.sort_by(|a, b| board_order(a.0, a.1, a.2, b.0, b.1, b.2));
+    Ok(rows.into_iter().map(|(_, _, _, r)| r).collect())
+}
+
+/// Every RAW status spelling that canonicalises to `wanted` (AMUX-4757).
+///
+/// `parse_status` is a closed alias table, so this set is exact rather than a
+/// guess: `doing` is also stored as `wip`, `in_progress` and `inprogress`, and
+/// a filter for `doing` has always matched all four because `list_issues`
+/// canonicalises both sides before comparing. An UNMODELLED status (an operator
+/// column `parse_status` does not know) canonicalises to its own trimmed
+/// lowercase, so it matches only itself.
+///
+/// This exists so the status filter can be pushed into SQL. It must stay
+/// EXACT in one direction specifically: missing a spelling here would silently
+/// drop rows the Rust filter would have kept, which is why every alias in the
+/// table has a cell.
+fn raw_spellings_for(wanted: &str) -> Vec<String> {
+    let want = wanted.trim().to_lowercase();
+    let Some(target) = parse_status(&want) else {
+        return vec![want];
+    };
+    const ALIASES: &[&str] = &[
+        "backlog", "todo", "doing", "wip", "in_progress", "inprogress", "review",
+        "in_review", "inreview", "in review", "needsyou", "needs_you", "blocked",
+        "done", "resolved", "complete", "completed", "closed", "verified",
+        "discarded", "armed", "quarantined",
+    ];
+    ALIASES
+        .iter()
+        .filter(|a| parse_status(a) == Some(target))
+        .map(|a| a.to_string())
+        .collect()
+}
+
 pub fn list_issues(
     conn: &Connection,
     status_filter: &[String],
     session_filter: &[String],
     archived: ArchivedFilter,
 ) -> rusqlite::Result<Vec<IssueRow>> {
+    // PUSH THE STATUS FILTER INTO SQL (AMUX-4757). The Rust filter below is
+    // unchanged and remains the authority; this only stops the query
+    // materialising rows it is about to discard. board-drive calls this SIX
+    // times per tick with a status filter, and each call was reading all 19,632
+    // active rows across ~55 columns — 113 MB materialised, measured on the
+    // live board, per call.
+    //
+    // The narrowing is exact, not conservative: `raw_spellings_for` enumerates
+    // the closed alias table `parse_status` matches on, so SQL selects exactly
+    // the rows the Rust comparison would keep.
+    let sql_status: Vec<String> =
+        status_filter.iter().flat_map(|s| raw_spellings_for(s)).collect();
+    let where_status = if sql_status.is_empty() {
+        String::new()
+    } else {
+        let marks = vec!["?"; sql_status.len()].join(",");
+        format!(" AND LOWER(TRIM(i.status)) IN ({marks})")
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
-         WHERE i.deleted IS NULL GROUP BY i.id"
+         WHERE i.deleted IS NULL{where_status} GROUP BY i.id"
     ))?;
     let canon = |s: &str| -> String {
         parse_status(s)
@@ -2187,7 +2762,7 @@ pub fn list_issues(
     };
     let want_status: Vec<String> = status_filter.iter().map(|s| canon(s)).collect();
     let mut rows = Vec::new();
-    for row in stmt.query_map([], issue_from_row)? {
+    for row in stmt.query_map(rusqlite::params_from_iter(sql_status.iter()), issue_from_row)? {
         let row = row?;
         if !want_status.is_empty() && !want_status.contains(&canon(&row.status)) {
             continue;
@@ -2623,6 +3198,19 @@ pub struct NewIssue {
     /// that now demands them would otherwise be demanding data it discards,
     /// which is worse than the hole it closes.
     pub ask_type: Option<String>,
+    /// The continuation, storable AT CREATION (AMUX-4748).
+    ///
+    /// EXACTLY THE HOLE THE COMMENT ABOVE DESCRIBES, one field over. The insert
+    /// omitted this column, so a create that supplied a perfectly good
+    /// `next_action` stored NULL, and the pickup gate then refused the card for
+    /// lacking the very thing the caller sent. Measured 2026-09-17: the amux
+    /// lane sat idle with 14 eligible todos, every candidate refused for
+    /// `next_action` absent. The card filed ABOUT that failure is its own
+    /// specimen: AMUX-4748 came back carrying
+    /// `ignored_fields: ["acceptance_criteria", "next_action"]`.
+    pub next_action: Option<String>,
+    /// JSON encoded string or string array, using the same representation as PATCH.
+    pub acceptance_criteria: Option<String>,
     pub ask_question: Option<String>,
     pub ask_unblocks: Option<String>,
     pub ask_actor: Option<String>,
@@ -2647,11 +3235,66 @@ pub struct NewIssue {
     pub callback_prompt: Option<String>,
 }
 
+/// The id of an OPEN capture card this session already holds for a byte-identical
+/// prompt, if there is one (AF-568).
+///
+/// This is the cross-path capture dedupe. It reads `issues` rather than
+/// `cmd_history` for two reasons that are separate and both load-bearing:
+///
+/// - `cmd_history` only records the DIRECT delivery. A steering-delivered capture
+///   claims the most recent UNCARDED row for its text, so when the direct delivery
+///   already carded the only row, the duplicate is minted with no history row at
+///   all. Counting history rows therefore undercounts captures, and a guard reading
+///   it cannot see the very duplicates it exists to stop.
+/// - Every mint writes `issues`, so a third delivery path added later is covered
+///   without knowing this function exists.
+///
+/// NO TIME WINDOW, deliberately. The delay this must tolerate is however long the
+/// lane takes to reach a turn boundary, which is unbounded by design; the incident
+/// that prompted this ran 16 to 25 minutes. The bound is the card's own LIFECYCLE
+/// instead: once the lane has closed or discarded it, an identical prompt is a new
+/// task and mints normally.
+///
+/// `deleted IS NULL` and the terminal-status exclusion are the whole predicate. An
+/// ARCHIVED but still-open card counts as present: archiving hides a card from
+/// views and autonomy loops, and re-minting one the lane deliberately put away is
+/// the noise this is here to prevent.
+///
+/// KNOWN IMPRECISION, stated rather than hidden: `desc` is the prompt TRUNCATED to
+/// `CAPTURE_DESC_CHAR_CAP` chars (2000, AF-716 — raised from the original 300,
+/// which cut real reports off mid-sentence with no marker), so two genuinely
+/// different prompts sharing that long a prefix compare equal here and the
+/// second is suppressed. The cmd_history guard above does not have this edge,
+/// because it compares the full text. Accepted because the two cards would be
+/// indistinguishable on the board anyway (both descs are the same truncated
+/// text), and because the caller logs the SURVIVING card id on every
+/// suppression, so a wrongly dropped prompt is a greppable line rather than a
+/// missing card nobody can see. If that line ever shows up for prompts that are not
+/// duplicates, the fix is to store a full-prompt hash on the card, not a longer
+/// desc.
+pub fn open_capture_with_desc(
+    conn: &Connection,
+    session: &str,
+    desc: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM issues \
+         WHERE session = ?1 AND source = 'capture' AND \"desc\" = ?2 \
+           AND deleted IS NULL \
+           AND status NOT IN ('done', 'verified', 'discarded') \
+         ORDER BY created DESC LIMIT 1",
+        params![session, desc],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
 /// Insert a new card, replicating the Python POST exactly: id minted from
 /// the shared counter, `pos` = (min non-zero pos in the column) - 1024 (new
 /// card at the top of its lane), int timestamps, `notified` 0. Returns the
 /// row as stored.
 pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Result<IssueRow> {
+    refuse_dependency_write("new card", &foreign_dependencies(conn, new.session.as_deref(), &new.depends_on)?)?;
     let prefix = prefix_from_session(new.session.as_deref().unwrap_or(""));
     let id = next_issue_id(conn, &prefix)?;
     let min_pos: f64 = conn.query_row(
@@ -2675,9 +3318,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
              ask_type, ask_question, ask_unblocks, entered_state_at, source, \
              requested_by, callback_session, callback_prompt, callback_state, ask_actor, \
+             next_action, acceptance_criteria, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2708,6 +3352,8 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             new.callback_prompt.as_deref().filter(|x| !x.trim().is_empty()),
             new.callback_session.as_ref().map(|_| "armed"),
             new.ask_actor.as_deref().filter(|x| !x.trim().is_empty()),
+            new.next_action.as_deref().filter(|x| !x.trim().is_empty()),
+            new.acceptance_criteria,
         ],
     )?;
     for tag in &new.tags {
@@ -2745,6 +3391,37 @@ pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(n > 0)
 }
 
+/// The inverse of `soft_delete` (AF-922). Before this existed, a mistaken
+/// DELETE on any card had no sanctioned recovery path at all -- `deleted` is
+/// the one column `save_patched` deliberately never touches (see its own
+/// note), and no other write in this module clears it, so the only way back
+/// was a raw SQL UPDATE against the live database. Same shape as
+/// `unarchive` clearing `archived`.
+///
+/// Returns false when the id does not resolve to a currently-deleted row
+/// (already live, or never existed -- the caller distinguishes those with
+/// [`issue_exists_including_deleted`] before calling this).
+pub fn undelete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let now = Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE issues SET deleted = NULL, updated = ?2 WHERE id = ?1 AND deleted IS NOT NULL",
+        params![id, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Whether `id` exists at all, deleted or not. The ONE sanctioned exception
+/// to this module's own invariant ("`deleted IS NULL` is filtered in every
+/// query") -- undelete needs to tell "never existed" apart from "exists but
+/// was never deleted", which every other query in this file answers
+/// identically (not found) because they were never asked to distinguish them.
+pub fn issue_exists_including_deleted(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM issues WHERE id = ?1", params![id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Write back a patched row. Only columns this API models are touched —
 /// `creator`, `created`, `notified`, `gcal_event_id` and `deleted` are
 /// deliberately NOT in the SET list so a Rust write can never corrupt a
@@ -2756,8 +3433,562 @@ pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
 /// "closed" means.
 pub const TERMINAL_STATUSES: [&str; 3] = ["done", "verified", "discarded"];
 
+/// Reads a column that is supposed to hold a JSON-encoded value (currently
+/// `acceptance_criteria`) without silently turning real content into `null`
+/// when it isn't valid JSON (AF-711).
+///
+/// The prior form of every caller was `.and_then(|s| serde_json::from_str(s)
+/// .ok())`, which reports EXACTLY the same `null` for "column is empty" and
+/// "column holds real text that failed to parse" — the second case is a
+/// caller having stored a plain string (a genuinely reasonable value for a
+/// text field to hold) with no way to know their content is now invisible
+/// everywhere the row is read. A parse failure returns the raw string
+/// instead: still visible, even if not structured the way a `board decompose`-
+/// written array would be.
+pub fn parse_json_or_raw_string(s: Option<&str>) -> serde_json::Value {
+    match s {
+        None => serde_json::Value::Null,
+        Some("") => serde_json::Value::Null,
+        Some(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+        }
+    }
+}
+
 pub fn is_terminal_status(s: &str) -> bool {
     TERMINAL_STATUSES.contains(&s)
+}
+
+/// Seconds a fresh lease is granted for before it expires (RR-0052). Short
+/// enough to free a crashed worker's slot fast, long enough to survive a slow
+/// turn. The holder's activity advances the heartbeat, pushing the expiry out.
+/// `AMUX_LEASE_TTL_S` overrides (default 1800 = 30 min).
+pub fn lease_ttl_s() -> i64 {
+    std::env::var("AMUX_LEASE_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1800)
+}
+
+/// Whether the PATCH door REFUSES a transition from a non-holder (RR-0052).
+/// Default OFF during rollout: leases are still written and the reaper still
+/// runs, but a cross-lane transition is only LOGGED ("would refuse"), not
+/// refused, so the would-refuse rate can be watched before enforcement flips on.
+/// `AMUX_LEASE_ENFORCE=1` turns hard refusal on.
+pub fn lease_enforcement_enabled() -> bool {
+    matches!(
+        std::env::var("AMUX_LEASE_ENFORCE").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Minimum seconds between two heartbeat writes for the same held card.
+///
+/// Every UPDATE on `issues` fires `search_issues_au`, which rewrites the card's
+/// whole search document (desc + log). The report hook fires on EVERY tool
+/// call, so an unthrottled heartbeat would reindex a busy lane's card several
+/// times a second. 60s against a 1800s TTL loses nothing a reaper can see.
+pub const LEASE_HEARTBEAT_MIN_GAP_S: i64 = 60;
+
+/// Heartbeat writes that actually moved a lease forward, process-lifetime.
+/// Published by `/api/debug/board-drive` beside the reaper's counts: leases
+/// being granted while this stays at 0 means the heartbeat path is broken and
+/// every busy holder is about to be reaped (the RR-0052 slice-2 bug, where the
+/// reaper's liveness events were never written by anything).
+pub static LEASE_HEARTBEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RR-0052 heartbeat: the holder lane is alive, so push out the expiry of every
+/// `doing` card it holds. Called from the worker self-report path, which is the
+/// one signal that comes FROM the worker process (a delivered message comes from
+/// the server, and proves nothing about the receiver).
+///
+/// Deliberately a raw UPDATE of the lease columns only: `updated` and `version`
+/// are untouched, so a heartbeat never reads as a card edit, never bumps rot
+/// clocks, and never races a real PATCH on the version check.
+pub fn refresh_lease_heartbeat(conn: &Connection, holder: &str, now: i64) -> rusqlite::Result<usize> {
+    let holder = holder.trim();
+    if holder.is_empty() {
+        return Ok(0);
+    }
+    let n = conn.execute(
+        "UPDATE issues SET lease_heartbeat_at = ?2, lease_expires_at = ?2 + ?3 \
+         WHERE status = 'doing' AND lease_expires_at IS NOT NULL AND lease_owner = ?1 \
+           AND deleted IS NULL AND COALESCE(lease_heartbeat_at, 0) <= ?2 - ?4",
+        params![holder, now, lease_ttl_s(), LEASE_HEARTBEAT_MIN_GAP_S],
+    )?;
+    if n > 0 {
+        LEASE_HEARTBEATS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(n)
+}
+
+/// A completed dependency must satisfy its type's real completion boundary.
+/// Code/ops/blockers need verification; docs and chores finish at done. Missing
+/// and discarded tasks are not proof that a required dependency was resolved.
+/// Readiness, promotion and completion callbacks share this predicate.
+pub fn dependency_is_resolved(status: &str, item_type: &str) -> bool {
+    matches!(parse_status(status), Some(TaskStatus::Verified))
+        || (matches!(parse_status(status), Some(TaskStatus::Done))
+            && !amux_core::board::verified_is_meaningful(core_item_type(item_type)))
+}
+
+/// Whether an execution lane can retire this assignment. Failed terminal
+/// outcomes stop execution but must never satisfy a dependent task's gate.
+pub fn execution_is_terminal(status: &str, item_type: &str) -> bool {
+    parse_status(status).is_some_and(|s| s.is_terminal())
+        || dependency_is_resolved(status, item_type)
+}
+
+pub fn dependency_resolved(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let state = conn.query_row(
+        "SELECT status, type FROM issues WHERE id=?1 AND deleted IS NULL",
+        [id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+    ).optional()?;
+    Ok(state.is_some_and(|(status, item_type)| dependency_is_resolved(&status, &item_type)))
+}
+
+/// Keep the durable terminal outcome compact enough for the board list/detail
+/// payload while leaving the complete evidence and append-only log untouched.
+/// This is deliberately mechanical: the board records what was written, it
+/// does not ask a provider to reinterpret its own output.
+fn compact_terminal_text(text: &str, limit: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= limit {
+        compact
+    } else {
+        let mut truncated = compact.chars().take(limit.saturating_sub(1)).collect::<String>();
+        truncated.push('…');
+        truncated
+    }
+}
+
+fn terminal_action_digest(log: Option<&str>) -> (usize, String) {
+    let mut count = 0;
+    let mut latest = None;
+    for line in log.unwrap_or_default().lines() {
+        let body = line
+            .strip_prefix('`')
+            .and_then(|rest| rest.find('`').map(|end| &rest[end + 1..]))
+            .unwrap_or(line)
+            .trim();
+        if body.is_empty() || body.starts_with("authz:") {
+            continue;
+        }
+        count += 1;
+        latest = Some(compact_terminal_text(body, 240));
+    }
+    (count, latest.unwrap_or_else(|| "none recorded".into()))
+}
+
+/// Build the one terminal summary that both the API and dashboard can render.
+/// The card this one was FOLDED into, if it was.
+///
+/// `api::board` writes `capture folded into <ID>` when an auto-captured prompt
+/// is turned into real work, so this is a server-authored line, not free text
+/// a lane happened to phrase that way.
+///
+/// It exists because a fold and a drop are opposite outcomes that the terminal
+/// summary rendered identically. Reported 2026-09-08 by mixpeek-frustrations
+/// and independently by mixpeek-cicd, five instances across two lanes in one
+/// session. Their specimen:
+///
+///   [task callback MS-1369] ... closed the request without resolving the
+///   dependency. State: discarded. Outcome: Final outcome: discarded (from
+///   doing). Recorded terminal outcome: not supplied. Actions: 2 recorded;
+///   latest: capture folded into MS-1370. Tests/deployment/live evidence: not
+///   recorded. Linked assets: none recorded.
+///
+/// Every clause is true and the sum is false: MS-1369 was a capture shell
+/// folded into MS-1370..MS-1375, six real cards with real content. The reader
+/// has to open the board to tell that from a request dropped on the floor, and
+/// the routing lane is told a peer abandoned their work. Both reporters chased
+/// it; one of them chased it twice.
+///
+/// The discriminator was already IN the payload, on the Actions line. This
+/// reads it instead of printing it beside a contradicting summary.
+pub fn folded_into(log: Option<&str>) -> Option<String> {
+    folded_into_detail(log).map(|(id, _inferred)| id)
+}
+
+/// A CAPTURE SHELL: amux minted this card from an inbound prompt, and nobody
+/// turned it into a unit of work.
+///
+/// The predicate is `creator='amux'` plus the `**Prompt:**` desc marker, which
+/// is the same pair the fold query, the dispatch filters and board-drive already
+/// use inline in four places. Named here because AF-634 needs it in prose rather
+/// than in SQL. [`capture_is_delegated_ask`] then carves out the one captured
+/// shape that IS a unit of work, and says why.
+///
+/// AF-634 (ts-gke, 19 cards and at least 21 notifications in one night): when a
+/// recipient correctly discards one of these, the terminal callback fires AT THE
+/// SENDER saying the recipient "closed the request without resolving the
+/// dependency", with "evidence: not recorded" and "assets: none recorded". Every
+/// clause is true of a capture shell and all of them are misleading about it:
+/// there was no request, no dependency and nothing owed. ts-gke nearly
+/// enumerated all 19 before recognising the shape, and a lane that trusts the
+/// text re-sends its finding or escalates to the owner.
+///
+/// This does NOT silence the callback. Whether a capture should notify its
+/// sender at all is ts-gke's option 1 or 2 and is not one lane's call; this is
+/// their option 3, which changes only what the sentence says.
+pub fn is_capture_shell(row: &IssueRow) -> bool {
+    row.creator == "amux"
+        && row.desc.trim_start().starts_with("**Prompt:**")
+        && !capture_is_delegated_ask(&row.desc)
+        && !has_execution_details(row)
+}
+
+/// Raw provenance can remain in the description after intake. Execution is
+/// structured when both the next action and at least one textual gate exist.
+pub fn has_execution_details(row: &IssueRow) -> bool {
+    row.next_action.as_deref().is_some_and(|s| !s.trim().is_empty())
+        && row.acceptance_criteria.as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .is_some_and(|value| match value {
+                // The public board API accepts both text and string arrays.
+                // Recognizing only arrays sent legitimate structured work back
+                // to intake while the board correctly displayed its criteria.
+                serde_json::Value::String(text) => {
+                    let present = !text.trim().is_empty();
+                    if present && row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
+                        && crate::log_dedupe::first_this_bucket(
+                            &format!("text-criteria:{}", row.id),
+                            crate::log_dedupe::hour_bucket(chrono::Utc::now().timestamp() as f64)) {
+                        tracing::info!(card = %row.id, measured=true, n_considered=1,
+                            verdict="text_criteria_recognized", "structured captured work uses supported textual acceptance criteria");
+                    }
+                    present
+                },
+                serde_json::Value::Array(items) => items.iter().any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())),
+                _ => false,
+            })
+}
+
+fn execution_details_sql() -> String {
+    // CASE prevents json_each from evaluating corrupt legacy JSON.
+    let whitespace = "char(9)||char(10)||char(11)||char(12)||char(13)||' '||char(133)||char(160)||char(5760)||char(8192)||char(8193)||char(8194)||char(8195)||char(8196)||char(8197)||char(8198)||char(8199)||char(8200)||char(8201)||char(8202)||char(8232)||char(8233)||char(8239)||char(8287)||char(12288)";
+    format!("(length(trim(COALESCE(i.next_action,''), {whitespace})) > 0 AND \
+        CASE WHEN json_valid(i.acceptance_criteria) THEN \
+          CASE json_type(i.acceptance_criteria) \
+          WHEN 'text' THEN length(trim(json_extract(i.acceptance_criteria,'$'), {whitespace})) > 0 \
+          WHEN 'array' THEN EXISTS(\
+            SELECT 1 FROM json_each(i.acceptance_criteria) c WHERE c.type='text' \
+            AND length(trim(c.value, {whitespace})) > 0) ELSE 0 END ELSE 0 END)")
+}
+
+/// A captured message whose FIRST LINE opens with `ASK` and names a board id is
+/// a delegation, so it is a request rather than a shell (AMUX-4677).
+///
+/// Reported by mixpeek-finances with a receipt. MG-1786's prompt begins
+/// `ASK (Ethan, resumed you for this): pick up MF-1165`, mixpeek-general picked
+/// MF-1165 up and discarded the duplicate envelope, and the terminal callback
+/// told the sender "Nothing was requested of this lane and nothing is owed".
+/// [`terminal_summary`] asserts that sentence for every discarded shell and has
+/// no input capable of contradicting it. The sender read it as their hand-off being
+/// dropped. It also matters before the discard: a shell occupies no WIP slot and
+/// `drainable_backlog_rows` never dispatches one, so a delegation that lands in
+/// backlog as a shell sits there.
+///
+/// `amux board request <lane> <title>` parks the card on the SENDER's board
+/// (AMUX-4653), so a message is the fallback path for handing work over, and
+/// this is the most explicit form that message can take.
+///
+/// Deliberately narrow, because the risk is turning every message containing the
+/// word "ask" into a request: uppercase `ASK` at the start of the FIRST LINE of
+/// the prompt, plus a board id LATER on that same line. "let me know if you want
+/// me to ask about MS-1496" fails on both counts.
+///
+/// The board id test is two adjacent uppercase letters, a hyphen and a digit,
+/// which is looser than [`contains_card_ref`]'s tokenizer and deliberately so:
+/// this rule has a SQL mirror in [`capture_shell_sql`] and every clause here has
+/// to be one GLOB can express exactly. It does not check that the id names a row
+/// that exists: both this and the mirror answer from the row alone, and an
+/// `EXISTS` subquery per row over a 12k-row board is not a predicate you
+/// interpolate into a dispatch query. A well-formed id that names nothing keeps
+/// one extra card, which is the recoverable direction.
+pub fn capture_is_delegated_ask(desc: &str) -> bool {
+    let Some(first) = capture_prompt_first_line(desc) else { return false };
+    let Some(rest) = first.strip_prefix("ASK") else { return false };
+    rest.as_bytes().windows(4).any(|w| {
+        w[0].is_ascii_uppercase()
+            && w[1].is_ascii_uppercase()
+            && w[2] == b'-'
+            && w[3].is_ascii_digit()
+    })
+}
+
+/// The first line of a captured prompt, or `None` when `desc` is not a capture
+/// envelope.
+///
+/// Mirrors [`capture_shell_sql`]'s extraction step for step. After the
+/// `**Prompt:**` marker it strips SPACES ONLY: SQLite's `ltrim(x, ' ')` cannot
+/// strip a newline, and a `trim_start()` here would walk a prompt that begins
+/// with a blank line onto line two while the SQL stayed on line one.
+fn capture_prompt_first_line(desc: &str) -> Option<&str> {
+    let rest = desc.trim_start().strip_prefix("**Prompt:**")?.trim_start_matches(' ');
+    Some(rest.split('\n').next().unwrap_or(rest))
+}
+
+/// [`is_capture_shell`] as a SQL predicate, for the queries that select or
+/// count board rows without loading them (AMUX-4697).
+///
+/// ONE definition, interpolated, rather than the same clauses written into each
+/// query. Five call sites spelling a predicate by hand is how two of them come
+/// to disagree, and the disagreement is invisible until a count and a dispatch
+/// list differ by rows nobody can name.
+///
+/// Expects the `issues` row to be addressable as `i`. `ltrim` mirrors
+/// `trim_start`: SQLite's default `ltrim` strips spaces only, so the leading
+/// newline that `save_patched` can leave is handled explicitly. The test
+/// `the_sql_predicate_and_the_rust_one_select_the_same_rows` runs both over the
+/// same fixtures and fails if they ever part company.
+///
+/// Built rather than written as a const so the first-line extraction appears
+/// once here and reads the same as the Rust one. `GLOB` and not `LIKE` for the
+/// ask clause: LIKE is case-insensitive over ASCII in SQLite, so `LIKE 'ASK%'`
+/// would match "ask me later" and part company with `strip_prefix("ASK")` on the
+/// very first message anyone writes in lower case.
+pub fn capture_shell_sql() -> String {
+    format!("({} AND NOT {} AND NOT {})", capture_envelope_sql(), capture_delegation_sql(), execution_details_sql())
+}
+
+/// `creator='amux'` plus the `**Prompt:**` marker: amux minted this row from an
+/// inbound prompt, whatever the prompt turned out to say.
+pub fn capture_envelope_sql() -> String {
+    format!("(i.creator = 'amux' AND {} LIKE '**Prompt:**%')", capture_desc_trimmed())
+}
+
+/// [`capture_is_delegated_ask`] as SQL. Split out from [`capture_shell_sql`] so
+/// the diagnostic that COUNTS delegations and the predicate that EXEMPTS them
+/// read the same clause (AMUX-4677).
+fn capture_delegation_sql() -> String {
+    let prompt = format!("ltrim(substr({}, 12), ' ')", capture_desc_trimmed());
+    // Appending a newline makes `instr` always find one, which is the same
+    // answer as `split('\n').next()` and needs no CASE.
+    let first_line = format!("substr({prompt}, 1, instr({prompt} || char(10), char(10)) - 1)");
+    format!("({first_line} GLOB 'ASK*[A-Z][A-Z]-[0-9]*')")
+}
+
+/// An envelope that carries a delegation, for callers that want the population
+/// the carve-out rescued rather than the one it left behind.
+pub fn capture_delegation_row_sql() -> String {
+    format!("({} AND {})", capture_envelope_sql(), capture_delegation_sql())
+}
+
+/// `i.desc` with the leading whitespace `trim_start` removes. SQLite's default
+/// `ltrim` strips spaces only, so the newline `save_patched` can leave is named.
+/// '**Prompt:**' is 11 characters, so the prompt itself starts at offset 12.
+fn capture_desc_trimmed() -> String {
+    "ltrim(ltrim(i.desc, char(10) || char(13) || char(9)), ' ')".to_string()
+}
+
+/// The marker the SERVER appends when it chose the fold target itself.
+///
+/// AF-616 (mixpeek-frustrations, from a live specimen on this lane's cards):
+/// the auto-fold picks its target by TEMPORAL ADJACENCY. It folds a capture
+/// into whatever card the lane created next, and nothing compares the two. Their
+/// report was captured as AF-613 and folded into AF-615, an unrelated finding
+/// this lane happened to card in the same minute, so the trail from the report
+/// to its fix runs through a card about something else.
+///
+/// Until now BOTH fold paths wrote the identical line, so the summary and the
+/// task callback said "folded this capture into AF-615" whether a lane ASSERTED
+/// the target with `board discard --folded-into` or a SQL query guessed it. That
+/// is a claim whose confidence cannot be read off it, and b3db93fd made it
+/// worse in the useful direction: a wrong target used to be a quiet link and is
+/// now a sentence the reporting lane reads.
+///
+/// This does NOT change when anything folds. Narrowing the window, or requiring
+/// the fold to be asserted, changes every lane's board and is recorded on AF-616
+/// as a decision that is not this lane's to take. Labelling the guess as a guess
+/// is not that change, and it is what lets a reader tell the two apart today.
+pub const FOLD_INFERRED_MARKER: &str = "[inferred]";
+
+/// The card this one was folded into, and whether the SERVER inferred that
+/// target rather than a lane declaring it.
+///
+/// `true` = inferred by adjacency, so the reader should confirm the target
+/// actually addresses the capture. Absence of the marker reads as declared,
+/// which is the safe direction for the entries written before AF-616: they
+/// predate the distinction and most of them were peer folds.
+pub fn folded_into_detail(log: Option<&str>) -> Option<(String, bool)> {
+    let marker = "capture folded into ";
+    log.unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            // THE MARKER MUST BEGIN THE ENTRY, not merely appear in it.
+            //
+            // The first cut used `rfind`, which matched anywhere on the line,
+            // and a live callback caught it within the hour: mixpeek-frustrations
+            // wrote an outcome note DISCUSSING this very fix, containing
+            //   its own Actions line read "capture folded into AF-615", and ...
+            // That note is embedded in the card's STATUS log entry, so the scan
+            // matched the quotation and parsed the target as `AF-615"` — the
+            // trailing quote survived because it is not sentence punctuation.
+            // The callback then read: folded this capture into AF-615". A
+            // positional match landing on prose ABOUT the marker is the same
+            // self-referential trap `every_send_failure_literal_is_classified`
+            // documents against its own docstring.
+            //
+            // The server writes this as a standalone entry, so requiring it at
+            // the start is both tighter and truer to the producer. Entries carry
+            // a `HH:MM` backtick stamp and may carry a `session: ` attribution,
+            // both of which are stripped before the test.
+            let body = line.trim();
+            let body = match body.strip_prefix('`').and_then(|r| r.split_once('`')) {
+                Some((_stamp, rest)) => rest.trim_start(),
+                None => body,
+            };
+            // `<session>: capture folded into X` — only a prefix with no spaces
+            // in it, so a sentence ending in a colon cannot qualify.
+            let body = match body.split_once(": ") {
+                Some((head, rest)) if !head.contains(' ') && rest.starts_with(marker) => rest,
+                _ => body,
+            };
+            body.strip_prefix(marker)
+        })
+        .filter_map(|rest| {
+            // The marker sits AFTER the id, so the id still parses out of an
+            // older entry that has no marker at all.
+            //
+            // REMOVE IT BEFORE TAKING THE ID, rather than relying on it never
+            // being first. A line with the marker and no target parsed the
+            // MARKER as the target ("[inferred", the `]` eaten by the
+            // punctuation trim below), so a fold naming nothing would have
+            // reported a fold into a card called `[inferred`. That is the same
+            // class as the `AF-615"` bug this parser already carries a test for.
+            let inferred = rest.contains(FOLD_INFERRED_MARKER);
+            let rest = rest.replace(FOLD_INFERRED_MARKER, " ");
+            rest.split_whitespace()
+                .next()
+                .map(|id| (id.to_string(), inferred))
+        })
+        .map(|(id, inferred)| {
+            (
+                id.trim_end_matches(['.', ',', ';', ')', '"', '\'', ']'])
+                    .to_string(),
+                inferred,
+            )
+        })
+        .rfind(|(id, _)| !id.is_empty())
+}
+
+/// Artifact-registry refs are combined with refs in evidence so a proof link
+/// cannot disappear merely because an older producer did not register it.
+fn terminal_summary(
+    conn: &Connection,
+    row: &IssueRow,
+    from: &str,
+) -> rusqlite::Result<(String, usize)> {
+    let (action_count, latest_action) = terminal_action_digest(row.log.as_deref());
+    let evidence = compact_terminal_text(row.evidence.as_deref().unwrap_or("not recorded"), 1200);
+    // "not supplied" WAS VERY NEARLY A CONSTANT, and a constant cannot disagree
+    // with the run, so it read as a measurement to every reader.
+    //
+    // This clause reads `last_result`, which only `board next --result` writes.
+    // The verb a lane closing a card actually uses is `--outcome`, and that goes
+    // to `desc_append` and `evidence` (amux:2138, amux:2039). `last_result` is
+    // then overwritten by THIS function's own composed summary, which the filter
+    // below correctly rejects. So the clause announced "not supplied" almost
+    // every time, including directly above an evidence line carrying the very
+    // outcome it said was missing.
+    //
+    // Reported by mixpeek-frustrations 2026-09-08 on MS-1388: mixpeek-studio had
+    // done a full prod verification and recorded it, and the callback still led
+    // with "closed the request without resolving the dependency ... not supplied
+    // ... none recorded". They chased it to the board before they could tell it
+    // from a dropped request, for the second time that day.
+    //
+    // So the clause is now OMITTED when there is nothing to report, rather than
+    // asserting a negative the payload contradicts one field over. Saying
+    // nothing is the honest form of having nothing to say.
+    let recorded_outcome = row
+        .last_result
+        .as_deref()
+        .filter(|summary| !summary.starts_with("Final outcome:"))
+        .map(|summary| compact_terminal_text(summary, 600));
+    let mut assets = Vec::new();
+    let mut seen = HashSet::new();
+    for artifact in crate::db::artifact_store::list_for_task(conn, &row.id)? {
+        // Insert retired refs into `seen` too: otherwise the same invalid ref
+        // can be reintroduced from free-text evidence one loop below and wear
+        // a valid-looking state again.
+        if !artifact.ref_value.trim().is_empty()
+            && seen.insert(artifact.ref_value.clone())
+            && !crate::db::artifact_store::is_retired_state(&artifact.state)
+        {
+            assets.push(artifact.ref_value);
+        }
+    }
+    if let Some(evidence_text) = row.evidence.as_deref() {
+        for reference in asset_refs(evidence_text) {
+            if seen.insert(reference.clone()) {
+                assets.push(reference);
+            }
+        }
+    }
+    let linked_assets = if assets.is_empty() {
+        "none recorded".to_string()
+    } else {
+        assets.join(", ")
+    };
+    // A FOLD IS NOT A DROP, so it does not get the drop's sentence. The four
+    // "not supplied / not recorded / none recorded" clauses below are all true
+    // of a capture shell and all misleading about it: the work is on the card
+    // it was folded into. Say that, and say where.
+    if let Some(target) = folded_into(row.log.as_deref()) {
+        let tail = if assets.is_empty() {
+            String::new()
+        } else {
+            format!(" Linked assets: {linked_assets}.")
+        };
+        return Ok((
+            format!(
+                "Final outcome: folded into {target} (from {from}, recorded {}). \
+                 This was a capture shell, not a unit of work: its work, evidence and \
+                 assets are on {target}.{tail}",
+                row.status
+            ),
+            assets.len(),
+        ));
+    }
+    // AF-634. A capture shell that was discarded WITHOUT a fold still gets the
+    // clause list below, and "Tests/deployment/live evidence: not recorded" plus
+    // "Linked assets: none recorded" describe a dropped task and a tidied
+    // message equally well. For a message they are true and say nothing, and the
+    // reader is its SENDER, who reads them as a report about work.
+    if is_capture_shell(row) && row.status == "discarded" {
+        let tail = if assets.is_empty() {
+            String::new()
+        } else {
+            format!(" Linked assets: {linked_assets}.")
+        };
+        return Ok((
+            format!(
+                "Final outcome: discarded (from {from}) as a captured message, not a \
+                 unit of work. Nothing was requested of this lane and nothing is \
+                 owed.{}{tail}",
+                match recorded_outcome {
+                    Some(text) => format!(" Recorded reason: {text}."),
+                    None => String::new(),
+                }
+            ),
+            assets.len(),
+        ));
+    }
+    let outcome_clause = match recorded_outcome {
+        Some(text) => format!(" Recorded terminal outcome: {text}."),
+        None => String::new(),
+    };
+    Ok((
+        format!(
+            "Final outcome: {} (from {}).{} Actions: {} recorded; latest: {}. Tests/deployment/live evidence: {}. Linked assets: {}.",
+            row.status, from, outcome_clause, action_count, latest_action, evidence, linked_assets
+        ),
+        assets.len(),
+    ))
 }
 
 /// `closed_at` for the row about to be written (AMUX-3609).
@@ -2828,6 +4059,16 @@ fn entered_state_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> 
 }
 
 pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<usize> {
+    validate_dependency_update(conn, row)?;
+    // This marker records delivery, not an outside dependency. Once the owner
+    // structures the captured request it must become eligible without a second
+    // manual PATCH deleting harness-generated text. Preserve all real holds.
+    if row.source_ref.as_deref() == Some("Already delivered owner follow-up; claim explicitly when switching work")
+        && row.creator == "amux" && has_execution_details(row) {
+        row.source_ref = None;
+        tracing::info!(card = %row.id, verdict = "capture_intake_completed",
+            "structured captured request released its delivery-only hold");
+    }
     let dep_json = if row.depends_on.is_empty() {
         None
     } else {
@@ -2845,20 +4086,84 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
     // item at the ONE write choke point every status transition uses. This is
     // intentionally not a PATCH-handler side effect: board-drive, epic
     // completion and future transition producers all call save_patched too.
-    let previous_status: Option<String> = conn
-        .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
+    let previous: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT status, last_result FROM issues WHERE id = ?1",
+            params![row.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .ok();
-    if previous_status
+    let previous_status = previous.as_ref().map(|(status, _)| status.clone());
+    let reopened_terminal_summary = previous.as_ref().is_some_and(|(status, summary)| {
+        is_terminal_status(status)
+            && !is_terminal_status(&row.status)
+            && summary
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Final outcome:"))
+    });
+    if reopened_terminal_summary {
+        // If this same atomic PATCH supplied a current-run result, preserve it.
+        // Otherwise clear only the generated terminal projection. The old
+        // Final outcome already remains in the append-only card log.
+        if row
+            .last_result
+            .as_deref()
+            .is_some_and(|text| text.starts_with("Final outcome:"))
+        {
+            row.last_result = None;
+        }
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+        row.log = Some(append_log(
+            row.log.as_deref(),
+            &hhmm,
+            &format!(
+                "STATUS (board): terminal summary retired on reopen to {}; prior Final outcome remains in history; current Work summary {}.",
+                row.status,
+                if row.last_result.is_some() { "replaced" } else { "reset" }
+            ),
+        ));
+    }
+    let terminal_transition = previous_status
         .as_deref()
-        .is_some_and(|s| !is_terminal_status(s))
-        && is_terminal_status(&row.status)
-        && row.callback_session.as_deref().is_some_and(|s| !s.trim().is_empty())
+        .is_some_and(|status| status != row.status && is_terminal_status(&row.status));
+    // A card closed before this rule shipped has no authoritative final
+    // summary. Repair it on the next durable board write using only its
+    // structured evidence, log, and registered assets; this makes the failing
+    // ATE-75 specimen recoverable without mutating its relations or source.
+    let needs_terminal_summary = terminal_transition
+        || (is_terminal_status(&row.status)
+            && !row
+                .last_result
+                .as_deref()
+                .is_some_and(|summary| summary.starts_with("Final outcome:")));
+    let mut terminal_summary_assets = 0;
+    if needs_terminal_summary {
+        let from = previous_status.as_deref().unwrap_or("new");
+        let (summary, asset_count) = terminal_summary(conn, row, from)?;
+        row.last_result = Some(summary.clone());
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+        row.log = Some(append_log(
+            row.log.as_deref(),
+            &hhmm,
+            &format!("STATUS (board): {summary}"),
+        ));
+        terminal_summary_assets = asset_count;
+    }
+    if row.callback_session.as_deref().is_some_and(|s| !s.trim().is_empty())
         && row.callback_state.as_deref() == Some("armed")
     {
-        row.callback_state = Some("pending".into());
-        row.callback_error = None;
+        if dependency_is_resolved(&row.status, &row.item_type) || row.status == "discarded" {
+            // Done -> verified is an edge between two closed statuses. Checking
+            // only non-terminal -> terminal silently lost this completion.
+            row.callback_state = Some("pending".into());
+            row.callback_error = None;
+        } else if row.status == "done" && previous_status.as_deref() != Some("done") {
+            tracing::info!(task_id = %row.id, item_type = %row.item_type,
+                marker = "dependency_waiting_for_verification", measured = true, n_considered = 1,
+                "completion callback held until the dependency is verified");
+        }
     }
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
@@ -2871,7 +4176,8 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              decision_supersedes = ?37, waiting_on = ?38, requested_by = ?39, \
              callback_session = ?40, callback_prompt = ?41, callback_state = ?42, \
              callback_message_id = ?43, callback_fired_at = ?44, callback_error = ?45, \
-             ask_actor = ?46 \
+             ask_actor = ?46, lease_owner = ?47, lease_acquired_at = ?48, \
+             lease_heartbeat_at = ?49, lease_expires_at = ?50, lease_generation = ?51 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -2920,8 +4226,38 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.callback_fired_at,
             row.callback_error,
             row.ask_actor,
+            row.lease_owner.as_deref().filter(|s| !s.is_empty()),
+            row.lease_acquired_at,
+            row.lease_heartbeat_at,
+            row.lease_expires_at,
+            row.lease_generation,
         ],
-    )
+    )?;
+    if needs_terminal_summary && changed == 1 {
+        tracing::info!(
+            target: "amux::board",
+            marker = "terminal_summary_recorded",
+            task_id = %row.id,
+            from = previous_status.as_deref().unwrap_or("new"),
+            to = %row.status,
+            artifacts = terminal_summary_assets,
+            "board terminal transition recorded a final summary"
+        );
+    }
+    if reopened_terminal_summary && changed == 1 {
+        tracing::warn!(
+            target: "amux::board",
+            marker = "terminal_summary_retired_on_reopen",
+            task_id = %row.id,
+            from = previous_status.as_deref().unwrap_or("unknown"),
+            to = %row.status,
+            replacement = row.last_result.is_some(),
+            measured = true,
+            n_considered = 1,
+            "reopened card retired its stale generated terminal summary"
+        );
+    }
+    Ok(changed)
 }
 
 /// Replace the tag set (Python PATCH semantics: `tags` is the full new set).
@@ -2983,93 +4319,120 @@ pub fn clear_needs_you_tags(conn: &Connection, id: &str) -> rusqlite::Result<usi
 
 /// Would giving `self_id` the dependency set `new_deps` create a cycle?
 /// Returns the cycle as SEMANTIC ids for the error message, or `None` when
-/// acyclic. Uses core's [`board::detect_cycle`] over the whole board's
-/// `DependsOn` edges (self's existing edges are replaced by `new_deps`,
-/// matching PATCH replace semantics).
+/// acyclic. Walks only from the proposed dependencies back to self. Stopping at
+/// self makes its old outgoing edges irrelevant (PATCH replacement semantics).
 pub fn depends_on_cycle(
     conn: &Connection,
     self_id: &str,
     new_deps: &[String],
 ) -> rusqlite::Result<Option<Vec<String>>> {
-    let mut names: HashMap<TaskId, String> = HashMap::new();
-    let intern = |sem: &str, names: &mut HashMap<TaskId, String>| -> TaskId {
-        let t = internal_id(sem);
-        names.entry(t.clone()).or_insert_with(|| sem.to_string());
-        t
-    };
-    let mut edges: Vec<(TaskId, TaskId)> = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, depends_on FROM issues \
-         WHERE deleted IS NULL AND depends_on IS NOT NULL AND depends_on != ''",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let result = dependency_path(conn, new_deps, self_id)?.map(|path| {
+        let mut cycle = vec![self_id.to_string()];
+        cycle.extend(path);
+        cycle
+    });
+    if let Some(cycle) = &result {
+        tracing::warn!(target: "amux::board", verdict = "dependency_cycle_rejected",
+            task_id = self_id, cycle = %cycle.join(" -> "),
+            "board graph rejected a cycle in the edited task's dependency closure");
+    }
+    Ok(result)
+}
+
+/// The parent relation is its own DAG: mixing it with depends_on would turn
+/// normal parent-waits-for-child execution into a false cycle.
+pub fn epic_cycle(conn: &Connection, self_id: &str, parent: &str) -> rusqlite::Result<Option<Vec<String>>> {
+    let mut graph = amux_core::task_graph::Adjacency::new();
+    let mut stmt = conn.prepare("SELECT id,epic FROM issues WHERE deleted IS NULL AND epic IS NOT NULL AND epic != ''")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {
+        let (id,parent) = row?;
+        graph.entry(id).or_default().insert(parent);
+    }
+    let result = amux_core::task_graph::path_to(&graph, &[parent.into()], self_id).map(|path| {
+        let mut cycle = vec![self_id.into()]; cycle.extend(path); cycle
+    });
+    if let Some(cycle) = &result {
+        tracing::warn!(target: "amux::board", verdict = "lineage_cycle_rejected", task_id = self_id,
+            cycle = %cycle.join(" -> "), "board graph rejected cyclic parent lineage");
+    }
+    Ok(result)
+}
+
+/// Find an existing dependency path from any of `starts` to `target`.
+///
+/// This is the hypothetical-edge companion to [`depends_on_cycle`]. A peer
+/// request creates a new child and, in the same transaction, adds
+/// `parent -> child`. The child id does not exist until it is minted, so the
+/// ordinary replacement check cannot see both new edge sets at once. A cycle
+/// can only be introduced when one of the child's declared dependencies
+/// already reaches the parent; walking from those starts proves or disproves
+/// exactly that condition before either row is written.
+///
+/// The returned path includes both its starting dependency and `target`.
+/// Missing/deleted ids are leaves, matching the board's runtime dependency
+/// semantics: a dependency that resolves to no live task cannot block work.
+pub fn dependency_path(
+    conn: &Connection,
+    starts: &[String],
+    target: &str,
+) -> rusqlite::Result<Option<Vec<String>>> {
+    let mut graph = amux_core::task_graph::Adjacency::new();
+    let mut stmt = conn.prepare("SELECT id, depends_on FROM issues WHERE deleted IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
     for row in rows {
-        let (id, dep_json) = row?;
-        if id == self_id {
-            continue; // replaced by new_deps below
-        }
-        if let Ok(deps) = serde_json::from_str::<Vec<serde_json::Value>>(&dep_json) {
-            for d in deps.iter().filter_map(|v| v.as_str()) {
-                let from = intern(&id, &mut names);
-                let to = intern(d, &mut names);
-                edges.push((from, to));
+        let (id, raw) = row?;
+        if let Some(raw) = raw.filter(|v| !v.is_empty()) {
+            match serde_json::from_str::<Vec<String>>(&raw) {
+                Ok(deps) => { graph.insert(id, deps.into_iter().collect()); }
+                Err(error) => tracing::warn!(target: "amux::board", verdict = "dependency_graph_malformed",
+                    task_id = id, %error, "cannot traverse malformed task dependencies; graph verification reports this row"),
             }
         }
     }
-    for d in new_deps {
-        let from = intern(self_id, &mut names);
-        let to = intern(d, &mut names);
-        edges.push((from, to));
-    }
-    // REFUSE ONLY A CYCLE THIS CALLER IS PART OF (AC-335).
-    //
-    // The graph above is EVERY depends_on edge on the board, and detect_cycle
-    // returns the first cycle it finds anywhere in it. So one stale cycle
-    // between two unrelated cards made every subsequent depends_on write fail —
-    // with an error naming two ids the caller had never touched, which reads as
-    // "your edit is circular" when it is not.
-    //
-    // Live specimen: GE-473 <-> MHC-256, two cards owned by other lanes and BOTH
-    // already closed (done and verified). Setting AC-331 -> AC-330, which shares
-    // no node with either, was refused as "circular depends_on: GE-473 ->
-    // MHC-256". Board-wide, for everyone, until someone broke a cycle between two
-    // finished cards nobody was looking at.
-    //
-    // The check is sound because new edges all originate at `self_id`: adding
-    // them can only create cycles that pass THROUGH self_id. A cycle without
-    // self_id therefore pre-existed this request and is not this caller's to fix.
-    //
-    // Pre-existing cycles are still real board damage, so they are logged rather
-    // than swallowed — the caller is unblocked, and the problem stays visible to
-    // whoever owns those cards.
-    let self_tid = internal_id(self_id);
-    Ok(board::detect_cycle(&edges).and_then(|cycle| {
-        let named: Vec<String> = cycle
-            .iter()
-            .map(|t| {
-                names
-                    .get(t)
-                    .cloned()
-                    .unwrap_or_else(|| t.as_str().to_string())
-            })
-            .collect();
-        if cycle.contains(&self_tid) {
-            Some(named)
-        } else {
-            tracing::warn!(
-                cycle = %named.join(" -> "),
-                self_id = %self_id,
-                "pre-existing depends_on cycle elsewhere on the board — not blocking this write (AC-335)"
-            );
-            None
-        }
-    }))
+    Ok(amux_core::task_graph::path_to(&graph, starts, target))
 }
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-4801: the live-work list is DERIVED and SQL-safe.
+    ///
+    /// The literal it replaced, `NOT IN ('done','verified','discarded')`, was
+    /// wrong on `armed`, `quarantined` and on any status outside the enum. The
+    /// cells below pin the difference rather than the spelling.
+    #[test]
+    fn live_work_status_list_is_derived_and_sql_safe() {
+        let list = live_work_status_list();
+        // DERIVED: every status claiming live work is present, and nothing else.
+        for st in amux_core::board::TaskStatus::ALL {
+            let quoted = format!("'{}'", db_status_spelling(st));
+            assert_eq!(
+                list.contains(&quoted),
+                st.claims_live_work(),
+                "{st:?} membership must follow claims_live_work, got list {list}"
+            );
+        }
+        // The two the old literal got wrong, named so a regression says which.
+        assert!(!list.contains("'quarantined'"), "a quarantined card is parked for the OWNER: {list}");
+        assert!(!list.contains("'armed'"), "an armed card waits for an event and is never auto-picked: {list}");
+        assert!(list.contains("'todo'") && list.contains("'doing'"), "{list}");
+        // And `done` is absent here even though it is NOT is_terminal: the two
+        // predicates disagree on `done` on purpose, which is the trap this
+        // whole card is about.
+        assert!(!list.contains("'done'"), "{list}");
+
+        // SQL-SAFE: interpolated, so this must be a comma-separated list of
+        // single-quoted lowercase identifiers and nothing else.
+        for part in list.split(',') {
+            assert!(part.starts_with('\'') && part.ends_with('\''), "{part:?} in {list}");
+            let inner = &part[1..part.len() - 1];
+            assert!(
+                !inner.is_empty()
+                    && inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{inner:?} is not a bare identifier, so interpolating it is unsafe"
+            );
+        }
+    }
+
     use super::*;
 
     /// AF-332. The probe must catch what `current_rev()` cannot.
@@ -3390,6 +4753,161 @@ mod tests {
         }
     }
 
+    /// AMUX-4757. Every alias `parse_status` accepts must survive the SQL
+    /// status filter, because that filter now decides which rows are read at
+    /// all.
+    ///
+    /// ENUMERATED FROM THE TABLE ITSELF rather than spot-checked. Missing one
+    /// spelling here drops rows silently: `list_issues(&["doing"])` would stop
+    /// seeing a card stored as `wip`, the Rust filter below would never get the
+    /// chance to keep it, and the only symptom would be board-drive quietly
+    /// ignoring a lane.
+    #[test]
+    fn the_sql_status_filter_keeps_every_spelling_the_rust_filter_kept() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        // One row per raw spelling the parser accepts, plus an unmodelled
+        // operator column, plus a spelling with stray case and whitespace.
+        let spellings = [
+            "backlog", "todo", "doing", "wip", "in_progress", "inprogress", "review",
+            "in_review", "inreview", "in review", "needsyou", "needs_you", "blocked",
+            "done", "resolved", "complete", "completed", "closed", "verified",
+            "discarded", "armed", "quarantined", "some-operator-column", "  DoInG  ",
+        ];
+        for (i, sp) in spellings.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated)
+                 VALUES (?1, ?2, ?3, 'code', 1760000000, 1760000000)",
+                rusqlite::params![format!("S-{i}"), format!("card {i}"), sp],
+            ).expect("insert");
+        }
+        // For every canonical status, the SQL-narrowed read must return exactly
+        // the rows whose spelling canonicalises to it.
+        for canon in ["backlog", "todo", "doing", "review", "needsyou", "blocked",
+                      "done", "verified", "discarded", "armed", "quarantined",
+                      "some-operator-column"] {
+            let got = list_issues(&conn, &[canon.to_string()], &[], ArchivedFilter::ActiveOnly)
+                .expect("list");
+            let want: Vec<&str> = spellings
+                .iter()
+                .copied()
+                .filter(|sp| {
+                    parse_status(sp)
+                        .map(|st| db_status_spelling(st).to_string())
+                        .unwrap_or_else(|| sp.trim().to_lowercase())
+                        == canon
+                })
+                .collect();
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "filter {canon:?} returned {} rows, expected the {} spelling(s) {want:?}",
+                got.len(),
+                want.len()
+            );
+        }
+        // `doing` specifically: four aliases plus the padded/mixed-case one.
+        let doing = list_issues(&conn, &["doing".to_string()], &[], ArchivedFilter::ActiveOnly)
+            .expect("list");
+        assert_eq!(doing.len(), 5, "doing must match wip/in_progress/inprogress/  DoInG  too");
+        // An empty filter still reads everything.
+        let all = list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly).expect("list");
+        assert_eq!(all.len(), spellings.len());
+
+        // A MIXED FILTER, modelled plus unmodelled, which is where a wrong
+        // enumeration actually bites and a single-status test cannot see it.
+        // With one status in the filter, contributing no spellings leaves the
+        // SQL list empty, the narrowing turns itself off and the Rust filter
+        // still gets the right answer; with two, the modelled one's aliases
+        // narrow the query and the unmodelled one's rows are dropped before
+        // Rust ever sees them. Found by mutation: removing the unmodelled arm
+        // left the suite green until this leg existed.
+        let mixed = list_issues(
+            &conn,
+            &["todo".to_string(), "some-operator-column".to_string()],
+            &[],
+            ArchivedFilter::ActiveOnly,
+        )
+        .expect("list");
+        assert_eq!(mixed.len(), 2, "a mixed filter must keep BOTH, got {mixed:?}");
+        assert!(mixed.iter().any(|r| r.status == "some-operator-column"));
+        assert!(mixed.iter().any(|r| r.status == "todo"));
+    }
+
+    /// AMUX-4757. `planning_tasks` must produce exactly what
+    /// `list_issues` + `to_task` produced, minus the one field it declares it
+    /// does not load.
+    ///
+    /// A DIFFERENTIAL TEST, because the change is an equivalence claim. Writing
+    /// expectations by hand against the new projection would pass just as
+    /// happily if the narrow column list had quietly dropped `reviewer`,
+    /// mis-ordered the rows, or parsed `depends_on` differently — all of which
+    /// are one-character mistakes in a 16-column index-addressed query, and all
+    /// of which would show up as a planner that silently disagrees with the
+    /// board about which cards exist.
+    #[test]
+    fn the_planning_projection_matches_the_full_read_except_for_the_desc_it_declares() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, status: &str, session: Option<&str>, archived: i64,
+                       pinned: i64, pos: f64, deps: &str, reviewer: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id, title, \"desc\", status, session, creator, created,
+                    updated, type, archived, pinned, pos, depends_on, reviewer, version,
+                    lease_owner)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                rusqlite::params![
+                    id, format!("title of {id}"), format!("a long description for {id}"),
+                    status, session, "someone", 1_760_000_000i64, 1_760_000_100i64,
+                    "code", archived, pinned, pos, deps, reviewer, 3i64,
+                    if session.is_none() { Some("leaseholder") } else { None },
+                ],
+            ).expect("insert");
+        };
+        // The shapes that distinguish the two reads: ordering by pinned/pos/
+        // updated, an archived row, an unowned row whose worker comes from the
+        // LEASE rather than the session, dependencies, tags, and a status the
+        // board does not model.
+        add("P-1", "todo", Some("alpha"), 0, 0, 0.0, "[\"P-2\"]", Some("rev"));
+        add("P-2", "done", Some("beta"), 0, 0, 0.0, "", None);
+        add("P-3", "todo", None, 0, 1, 0.0, "", None);
+        add("P-4", "todo", Some("alpha"), 1, 0, 0.0, "", None);
+        add("P-5", "some-operator-column", Some("beta"), 0, 0, -5.0, "", None);
+        conn.execute("INSERT INTO issue_tags (issue_id, tag) VALUES ('P-1','urgent')", [])
+            .expect("tag");
+
+        let full = list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly).expect("full");
+        let narrow = planning_tasks(&conn, ArchivedFilter::ActiveOnly).expect("narrow");
+        assert_eq!(full.len(), narrow.len(), "row counts differ");
+        assert!(!full.is_empty());
+
+        for (row, planned) in full.iter().zip(narrow.iter()) {
+            let mut expected = row.to_task().expect("to_task");
+            // The ONE declared difference. Asserted explicitly rather than
+            // skipped, so a future change that starts loading desc here is a
+            // failure rather than a silent cost.
+            assert!(!expected.desc.is_empty(), "fixture must have a desc to omit");
+            assert_eq!(planned.task.desc, "", "planning_tasks must not load desc");
+            expected.desc = String::new();
+            // SERIALISED, not field-by-field. A hand-written comparison only
+            // covers the fields someone remembered; this covers every field
+            // Task has, including any added later.
+            assert_eq!(
+                serde_json::to_value(&expected).expect("expected"),
+                serde_json::to_value(&planned.task).expect("planned"),
+                "task mismatch for {}",
+                row.id
+            );
+            assert_eq!(planned.raw_status, row.status, "raw status for {}", row.id);
+            assert_eq!(planned.session, row.session, "session for {}", row.id);
+        }
+        // The unmodelled column still reaches the caller by its raw spelling,
+        // which is what the orchestrator's warning prints.
+        assert!(narrow.iter().any(|p| p.raw_status == "some-operator-column"));
+        // And the archived row is excluded by both.
+        assert!(!narrow.iter().any(|p| p.task.id == internal_id("P-4")));
+    }
+
     #[test]
     fn a_single_real_timestamp_does_not_fail_the_whole_list_read() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3568,6 +5086,54 @@ mod tests {
         crate::db::migrate::test_memdb()
     }
 
+    /// AMUX-4618. `blast_radius` was called once per needsyou row over a query
+    /// the planner answers with `SCAN issues`, and its `LIKE '%id%'` is a
+    /// SUBSTRING match, so it was both slow and wrong.
+    #[test]
+    fn blast_radius_counts_exact_dependents_in_one_pass() {
+        let conn = create_db();
+        let mk = |id: &str, deps: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, archived, depends_on, created, updated) \
+                 VALUES (?1, 't', ?2, 0, ?3, 1, 1)",
+                rusqlite::params![id, status, deps],
+            )
+            .unwrap();
+        };
+        // Two live cards depend on BR-1, one on BR-18.
+        mk("BR-1", "[]", "needsyou");
+        mk("BR-18", "[]", "needsyou");
+        mk("a", r#"["BR-1"]"#, "todo");
+        mk("b", r#"["BR-1"]"#, "todo");
+        mk("c", r#"["BR-18"]"#, "todo");
+        // Terminal and archived dependents must not count, which is the filter
+        // the original query already had and this must keep.
+        mk("d", r#"["BR-1"]"#, "done");
+
+        let ids = vec!["BR-1".to_string(), "BR-18".to_string()];
+        let r = blast_radius_many(&conn, &ids);
+
+        // THE OVER-COUNT, which is the point of the exact match. `LIKE '%BR-1%'`
+        // matches the row depending on BR-18, so the old path answered 3 here.
+        // Measured on the live board: 26 such prefix collisions among ids that
+        // are actually depended on.
+        assert_eq!(r.get("BR-1"), Some(&2), "BR-18's dependent must not count toward BR-1: {r:?}");
+        assert_eq!(r.get("BR-18"), Some(&1));
+
+        // POSITIVE CONTROL: the old substring query really does answer 3, so the
+        // cell above is about a behaviour that changed rather than one that was
+        // always right.
+        assert_eq!(blast_radius(&conn, "BR-1"), 3, "the substring query over-counts, which is why this exists");
+
+        // An id nobody depends on is 0 and PRESENT, not missing: the caller
+        // scores every row and a missing key would silently become a default.
+        let none = blast_radius_many(&conn, &["BR-999".to_string()]);
+        assert_eq!(none.get("BR-999"), Some(&0));
+
+        // No ids asked for, no work done.
+        assert!(blast_radius_many(&conn, &[]).is_empty());
+    }
+
     /// AMUX-3949. THE CARD'S CHECK: a card blocked in `review` and one blocked
     /// in `doing` must report DIFFERENT positions.
     ///
@@ -3652,45 +5218,29 @@ mod tests {
             "a card with no dependencies must never be blocked"
         );
 
-        // Close the blocker -> the dependent becomes ready in the same tick.
+        // Done is implementation completion, not verified dependency success.
         blocker.status = "done".into();
         blocker.updated = 2000;
         save_patched(&conn, &mut blocker).expect("close blocker");
-        assert!(
-            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
-            "closing the blocker must free the dependent immediately"
-        );
+        assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), vec![blocker.id.clone()]);
+        blocker.status = "verified".into();
+        save_patched(&conn, &mut blocker).expect("verify blocker");
+        assert!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
 
-        // A DEPENDENCY THAT RESOLVES TO NOTHING MUST NOT BLOCK, and this arm
-        // was NOT covered until a mutant said so. `None => true` survived the
-        // control above, because a card with an EMPTY depends_on never enters
-        // the filter at all -- so "a card with no dependencies is unblocked"
-        // is true whatever the None arm does. Two different things were both
-        // called "no dependency".
-        //
-        // The behaviour is the function's own documented rule: an id that
-        // resolves to nothing cannot be worked, and treating it as a blocker
-        // parks the holder forever.
+        // A missing or discarded required artifact is not successful delivery.
+        // The owner can explicitly remove a no-longer-required relationship.
         dependent.depends_on = vec!["AMUX-DOES-NOT-EXIST".into()];
-        save_patched(&conn, &mut dependent).expect("save phantom dep");
-        assert!(
-            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
-            "a dependency on a card that does not exist must not park the holder forever"
-        );
-
-        // A DISCARDED blocker frees it too. Discard is a judgement, not a pause,
-        // and treating it as still-blocking parks the dependent forever.
-        let mut b2 = create_issue(&conn, &new_card("todo"), 1000).expect("b2");
-        dependent.depends_on = vec![b2.id.clone()];
-        save_patched(&conn, &mut dependent).expect("save deps 2");
-        assert!(!crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
-        b2.status = "discarded".into();
-        b2.updated = 3000;
-        save_patched(&conn, &mut b2).expect("discard b2");
-        assert!(
-            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
-            "a discarded blocker is resolved, not pending"
-        );
+        assert!(save_patched(&conn, &mut dependent).is_err(), "new missing dependencies are rejected");
+        // A historical dangling row still reads as blocked, never successful.
+        conn.execute("UPDATE issues SET depends_on='[\"AMUX-DOES-NOT-EXIST\"]' WHERE id=?1", [&dependent.id]).unwrap();
+        assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), dependent.depends_on);
+        blocker.status = "discarded".into();
+        save_patched(&conn, &mut blocker).unwrap();
+        dependent.depends_on = vec![blocker.id.clone()];
+        assert_eq!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent), dependent.depends_on);
+        dependent.depends_on.clear();
+        save_patched(&conn, &mut dependent).unwrap();
+        assert!(crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
     }
 
     /// AMUX-3947. entered_state_at records the TRANSITION, and an ordinary edit
@@ -3991,6 +5541,7 @@ mod tests {
     fn terminal_transition_arms_one_durable_peer_callback() {
         let conn = create_db();
         let mut new = new_card("todo");
+        new.item_type = "chore".into();
         new.requested_by = Some("requester".into());
         new.callback_session = Some("requester".into());
         new.callback_prompt = Some("Start the dependent release card.".into());
@@ -4021,6 +5572,50 @@ mod tests {
         let stored = get_issue(&conn, &row.id).unwrap().unwrap();
         assert_eq!(stored.callback_state.as_deref(), Some("pending"));
         assert!(stored.callback_message_id.is_none());
+    }
+
+    /// AF-681, reported by primis: `resolution_status` (now
+    /// `completion_label_for_type`) read "verified" on a card that had
+    /// actually DISCARDED, which looks like a false claim about the outcome.
+    /// It is not an outcome at all -- it is `verified_is_meaningful(item_type)`,
+    /// a constant for the TYPE that does not change no matter what happened to
+    /// this specific card. Pin that a `code` card reports the SAME label
+    /// whether it is still pending or has actually discarded, and that a
+    /// non-code type reports "done" the same way -- proving the field cannot
+    /// answer "how did this resolve", which is what `dependency_resolved` is for.
+    #[test]
+    fn completion_label_for_type_is_a_type_constant_not_an_outcome() {
+        let conn = create_db();
+
+        let mut code_card = new_card("todo");
+        code_card.item_type = "code".into();
+        code_card.requested_by = Some("requester".into());
+        code_card.callback_session = Some("requester".into());
+        let mut code_row = create_issue(&conn, &code_card, 1000).expect("create code card");
+        assert_eq!(
+            code_row.snapshot()["callback"]["completion_label_for_type"], "verified",
+            "code's completion word is 'verified' before anything has happened"
+        );
+
+        code_row.status = "discarded".into();
+        code_row.updated = 2000;
+        save_patched(&conn, &mut code_row).expect("discard");
+        assert_eq!(
+            code_row.snapshot()["callback"]["completion_label_for_type"], "verified",
+            "the label is UNCHANGED by discarding -- it never claimed to describe \
+             what happened, only what this TYPE's completion is called"
+        );
+        assert_eq!(
+            code_row.snapshot()["callback"]["dependency_resolved"], false,
+            "the REAL per-card outcome lives here, not in the type label"
+        );
+
+        let mut chore_card = new_card("todo");
+        chore_card.item_type = "chore".into();
+        chore_card.requested_by = Some("requester".into());
+        chore_card.callback_session = Some("requester".into());
+        let chore_row = create_issue(&conn, &chore_card, 1000).expect("create chore card");
+        assert_eq!(chore_row.snapshot()["callback"]["completion_label_for_type"], "done");
     }
 
     #[test]
@@ -4081,6 +5676,8 @@ mod tests {
 
     fn new_card(status: &str) -> NewIssue {
         NewIssue {
+            acceptance_criteria: None,
+            next_action: None,
             title: "Ask Ethan about pricing".into(),
             desc: String::new(),
             status: status.into(),
@@ -4491,6 +6088,7 @@ mod tests {
         // newest verified, and the 100 newest done — the lumped 100-cap
         // showed 9 of a 141-card bulk-verify while Python showed all of it.
         let mk = |i: i64, status: &str| IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: format!("T-{i}"),
             title: String::new(),
@@ -4596,13 +6194,83 @@ mod tests {
         assert_eq!(prefix_from_session("general-canvas-apps"), "GCA");
     }
 
+    /// AF-470: `append_log`'s line SHAPE for an entry (backtick-time, space,
+    /// message) is unchanged from Python's; both cases here now also carry a
+    /// leading date separator because neither `existing` argument has one
+    /// yet. `today()` mirrors `append_log`'s own `chrono::Local::now()` call
+    /// rather than hardcoding a date, so this test does not go stale.
     #[test]
     fn append_log_matches_python_format() {
-        assert_eq!(append_log(None, "12:01", "x -> y"), "`12:01` x -> y");
+        let today = format!("`{}`", chrono::Local::now().format("%Y-%m-%d"));
+        assert_eq!(append_log(None, "12:01", "x -> y"), format!("{today}\n`12:01` x -> y"));
+        // The separator lands right before the NEW entry, not retroactively
+        // before the pre-existing one: `existing` has no separator at all,
+        // so its own date is genuinely untracked, and the marker means "from
+        // here, dates are tracked" -- it cannot honestly claim the old line
+        // shared today's date too.
         assert_eq!(
             append_log(Some("`09:00` created\n"), "12:01", "a: todo -> doing"),
-            "`09:00` created\n`12:01` a: todo -> doing"
+            format!("`09:00` created\n{today}\n`12:01` a: todo -> doing")
         );
+    }
+
+    /// AF-470. The property the card asked for: width is paid ONLY at a real
+    /// day boundary. Once a separator for today already exists, a second
+    /// same-day append must not add another one.
+    #[test]
+    fn append_log_adds_no_second_separator_on_the_same_day() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let after_first = append_log(None, "09:00", "created");
+        assert_eq!(after_first, format!("`{today}`\n`09:00` created"));
+        let after_second = append_log(Some(&after_first), "09:15", "a: todo -> doing");
+        assert_eq!(
+            after_second,
+            format!("`{today}`\n`09:00` created\n`09:15` a: todo -> doing"),
+            "a second entry on the SAME day must not repeat the separator: {after_second}"
+        );
+    }
+
+    /// AF-470. A log that already tracks dates, appended to on a NEW day,
+    /// gets exactly one fresh separator -- not a re-statement of the old
+    /// one, not silence.
+    #[test]
+    fn append_log_adds_a_fresh_separator_when_the_day_changes() {
+        let existing = "`2020-01-01`\n`21:20` yesterday's last entry";
+        let got = append_log(Some(existing), "08:25", "today's first entry");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            got,
+            format!("{existing}\n`{today}`\n`08:25` today's first entry"),
+            "a real day change must get its own separator: {got}"
+        );
+    }
+
+    /// AF-470. Every entry written before this feature existed has no
+    /// separator at all -- TG-3239's own 74-entry log, exactly. The very
+    /// next append must add one (marking "dates are tracked from here"), not
+    /// retroactively guess at the untracked history above it.
+    #[test]
+    fn append_log_on_a_legacy_log_with_no_separator_convention_adds_one() {
+        let legacy = "`21:20` old entry one\n`08:25` old entry two (next calendar day, unmarked)";
+        let got = append_log(Some(legacy), "14:00", "first entry since the fix shipped");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            got,
+            format!("{legacy}\n`{today}`\n`14:00` first entry since the fix shipped")
+        );
+    }
+
+    /// AF-470. The separator's own shape must never be mistaken for an
+    /// ordinary entry needing a separator search to skip a false match --
+    /// `date_separator` returns None for anything that is not EXACTLY
+    /// `` `YYYY-MM-DD` `` alone on the line.
+    #[test]
+    fn date_separator_recognizes_only_the_exact_shape() {
+        assert_eq!(date_separator("`2026-09-18`"), Some("2026-09-18"));
+        assert_eq!(date_separator("`09:15` message"), None, "an ordinary entry is not a separator");
+        assert_eq!(date_separator("`2026-09-18` message"), None, "trailing text disqualifies it");
+        assert_eq!(date_separator("2026-09-18"), None, "must be backtick-wrapped");
+        assert_eq!(date_separator("`26-09-18`"), None, "must be 4-digit year");
     }
 
     #[test]
@@ -4641,6 +6309,109 @@ mod tests {
         // Ungated statuses stay ungated.
         assert!(default_gates_for("code", TaskStatus::Todo).is_empty());
     }
+
+    /// AF-510. The whole point of the digest: oldest asks first, fleet-wide,
+    /// regardless of which lane holds them -- the queue that actually costs
+    /// the owner is the week-old backlog, not today's newest card.
+    #[test]
+    fn needsyou_digest_orders_oldest_first_fleet_wide() {
+        let conn = crate::db::migrate::test_memdb();
+        for (id, session, updated) in [
+            ("NY-NEW", "lane-a", 1_900_000_000i64),
+            ("NY-OLD", "lane-b", 1_000_000_000i64),
+            ("NY-MID", "lane-a", 1_500_000_000i64),
+        ] {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+                 VALUES (?1,?1,'needsyou',?2,'agent',?3,?3)",
+                params![id, session, updated],
+            )
+            .unwrap();
+        }
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        assert_eq!(total, 3);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["NY-OLD", "NY-MID", "NY-NEW"], "must be oldest-asked-first, not insertion or session order");
+        assert!(rows[0].age_days > rows[1].age_days && rows[1].age_days > rows[2].age_days);
+    }
+
+    /// AF-510. autofix.rs's own lesson: "the owner digest emitted 92 cards in
+    /// one SMS" is what makes a cap mandatory. This pins BOTH halves — the cap
+    /// actually truncates, AND the true population survives the cap instead of
+    /// disappearing with it (ethos rule 4: a capped list that does not report
+    /// its own size reads as complete).
+    #[test]
+    fn needsyou_digest_caps_but_reports_the_true_total() {
+        let conn = crate::db::migrate::test_memdb();
+        for i in 0..5i64 {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+                 VALUES (?1,?1,'needsyou','lane',   'agent',?2,?2)",
+                params![format!("NY-{i}"), 1_000_000_000i64 + i],
+            )
+            .unwrap();
+        }
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 2).unwrap();
+        assert_eq!(total, 5, "the true population must survive the cap");
+        assert_eq!(rows.len(), 2, "the returned list must actually be capped");
+        // And it must be the OLDEST two that survive the cut, not an arbitrary two.
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["NY-0", "NY-1"]);
+    }
+
+    /// AF-510. Mirrors the per-lane renag's own predicate exactly: a
+    /// human-owned card is never renagged to a lane (there is no lane to
+    /// renag), and a terminal card is not a live ask regardless of how it got
+    /// tagged. Both must stay invisible to the digest for the same reason.
+    #[test]
+    fn needsyou_digest_excludes_human_owned_and_terminal_cards() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-HUMAN','t','needsyou','lane','human',1000000000,1000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-DONE','t','done','lane','agent',1000000000,1000000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('NY-DONE','needs:you',1000000000)",
+            [],
+        )
+        .unwrap();
+        let (rows, total) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        let leaked_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(total, 0, "neither a human-owned nor a terminal card is a live agent ask: {leaked_ids:?}");
+    }
+
+    /// AF-510 / AC-178. The ask clock is the TAG's `added_at` when a tag
+    /// exists, never `updated` — `updated` is last-touch, so a heavily
+    /// commented-on ask would otherwise look newest right when it is most
+    /// overdue. Matches board_drive.rs's own renag query byte for byte in
+    /// intent: MIN(tag.added_at), falling back to `i.updated` only when no
+    /// tag row exists at all.
+    #[test]
+    fn needsyou_digest_ages_by_the_tag_not_the_last_touch() {
+        let conn = crate::db::migrate::test_memdb();
+        // Asked long ago (tag), but touched (commented on) recently.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,created,updated) \
+             VALUES ('NY-TAGGED','t','doing','lane','agent',1000000000,1_950_000_000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id,tag,added_at) VALUES ('NY-TAGGED','needs:you-review',1_000_000_000)",
+            [],
+        )
+        .unwrap();
+        let (rows, _) = needsyou_digest(&conn, 2_000_000_000.0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asked_at, 1_000_000_000.0, "asked_at must be the TAG's added_at, not the recent `updated` touch");
+    }
 }
 
 #[cfg(test)]
@@ -4649,6 +6420,7 @@ mod configured_gate_tests {
 
     fn row(item_type: &str, gate: Option<&str>) -> IssueRow {
         IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: "T-1".into(), title: String::new(), desc: String::new(),
             status: "doing".into(), session: None, creator: String::new(),
@@ -4685,6 +6457,25 @@ mod configured_gate_tests {
         c.execute(
             "INSERT INTO statuses (id,label,position,is_builtin,gate,mode,gate_custom)
              VALUES ('done','Done',4,1,?1,'implicit',?2)",
+            rusqlite::params![gate, custom],
+        )
+        .unwrap();
+        c
+    }
+
+    /// Same shape as `conn_with`, seeded at `verified` instead of `done` — for
+    /// tests exercising the code-type Verified defaults ("Deployed to prod",
+    /// "Zero regressions", etc.), which `done` does not carry.
+    fn conn_with_verified(gate: Option<&str>, custom: Option<i64>) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE statuses (id TEXT PRIMARY KEY, label TEXT, position INTEGER,
+             is_builtin INTEGER, gate TEXT, mode TEXT, gate_custom INTEGER);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO statuses (id,label,position,is_builtin,gate,mode,gate_custom)
+             VALUES ('verified','Verified',5,1,?1,'implicit',?2)",
             rusqlite::params![gate, custom],
         )
         .unwrap();
@@ -4910,6 +6701,448 @@ column=silent type:code=outranked(2)"
     /// re-derive, and concluded the override was pinned per-card. Worker and
     /// Group are exactly the rungs that were never asserted.
     ///
+    /// The outcome clause must report, never assert a negative it cannot support.
+    ///
+    /// "Recorded terminal outcome: not supplied" was very nearly a CONSTANT.
+    /// It reads `last_result`, which only `board next --result` writes; a lane
+    /// closing a card uses `--outcome`, which goes to desc_append and evidence,
+    /// and `last_result` is then overwritten by terminal_summary's own output
+    /// and filtered out. So the clause announced "not supplied" almost every
+    /// time, including directly above an evidence line carrying that outcome.
+    ///
+    /// mixpeek-frustrations, MS-1388, 2026-09-08: mixpeek-studio had done a full
+    /// prod verification and recorded it; the callback still said not supplied.
+    #[test]
+    fn the_outcome_clause_is_omitted_rather_than_asserting_not_supplied() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, last_result: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, last_result)
+                 VALUES (?1, ?2, 'discarded', 'doc', ?3, ?3, ?4)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, last_result],
+            ).expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        // A card whose last_result is this function's OWN prior output, which is
+        // the overwhelmingly common real state.
+        let echoed = add("C-ECHO", Some("Final outcome: discarded (from doing). Actions: 1 recorded."));
+        let (text, _) = terminal_summary(&conn, &echoed, "doing").expect("summary");
+        assert!(!text.contains("not supplied"),
+            "must not assert an absence it cannot support: {text}");
+        assert!(!text.contains("Recorded terminal outcome"),
+            "the clause is omitted, not emptied: {text}");
+        assert!(text.starts_with("Final outcome: discarded (from doing)."), "{text}");
+
+        // A card with nothing recorded at all: same, no negative asserted.
+        let bare = add("C-BARE", None);
+        let (bare_text, _) = terminal_summary(&conn, &bare, "doing").expect("summary");
+        assert!(!bare_text.contains("not supplied"), "{bare_text}");
+
+        // THE CONTROL, and it is the one that matters: a REAL recorded outcome
+        // must still be reported. Without this, deleting the clause entirely
+        // would pass everything above.
+        let real = add("C-REAL", Some("Verified the CTA on studio.mixpeek.com; manifest chain checked."));
+        let (real_text, _) = terminal_summary(&conn, &real, "doing").expect("summary");
+        assert!(real_text.contains("Recorded terminal outcome:"), "{real_text}");
+        assert!(real_text.contains("Verified the CTA on studio.mixpeek.com"), "{real_text}");
+    }
+
+    /// AF-634. The rendered summary, not just the predicate. A capture shell
+    /// discarded WITHOUT a fold used to get the generic clause list, whose
+    /// "Tests/deployment/live evidence: not recorded" and "Linked assets: none
+    /// recorded" are true of a message and describe a dropped task.
+    #[test]
+    fn a_discarded_capture_summary_does_not_read_like_a_dropped_task() {
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, creator: &str, desc: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, creator, \"desc\")
+                 VALUES (?1, ?2, ?5, 'doc', ?3, ?3, ?4, ?6)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, creator, status, desc],
+            ).expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        let cap = add("C-CAP", "amux", "**Prompt:** here is a finding you should know", "discarded");
+        let (text, _) = terminal_summary(&conn, &cap, "doing").expect("summary");
+        assert!(text.contains("captured message"), "say what it was: {text}");
+        assert!(text.contains("nothing is owed"), "and that nothing is outstanding: {text}");
+        assert!(
+            !text.contains("Tests/deployment/live evidence"),
+            "a message has no test evidence, and saying so reads as a missing one: {text}"
+        );
+        assert!(
+            !text.contains("Linked assets: none recorded"),
+            "nor any assets to have failed to produce: {text}"
+        );
+
+        // THE DISCRIMINATION, and it is the cell that keeps this from silencing
+        // real reports. A genuine discarded card must KEEP the full clause list:
+        // there, "evidence: not recorded" is a fact worth chasing.
+        let real = add("C-REAL2", "some-lane", "Fix the retry loop", "discarded");
+        let (real_text, _) = terminal_summary(&conn, &real, "doing").expect("summary");
+        assert!(
+            real_text.contains("Tests/deployment/live evidence"),
+            "a real discarded task keeps the clause list: {real_text}"
+        );
+        assert!(!real_text.contains("captured message"), "{real_text}");
+
+        // AND A CAPTURE THAT WAS NOT DISCARDED is ordinary work now: a lane
+        // retitled it and did it. It must not be excused as a message.
+        let done_cap = add("C-DONE", "amux", "**Prompt:** do the thing", "done");
+        let (done_text, _) = terminal_summary(&conn, &done_cap, "doing").expect("summary");
+        assert!(!done_text.contains("captured message"), "{done_text}");
+    }
+
+    /// A fold must be readable as a fold, from the log alone.
+    ///
+    /// Reported 2026-09-08 by mixpeek-frustrations and, independently, by
+    /// AF-634 (ts-gke, 19 cards and 21+ notifications in one night). A capture
+    /// shell is amux's record of an inbound MESSAGE. Discarding one is tidying,
+    /// not dropping a request, and the sentence must not read as the latter to
+    /// the person who sent the message.
+    #[test]
+    fn a_discarded_capture_is_not_described_as_a_dropped_request() {
+        let cap = |creator: &str, desc: &str, status: &str| {
+            let mut r = IssueRow {
+                creator: creator.into(),
+                desc: desc.into(),
+                status: status.into(),
+                ..Default::default()
+            };
+            r.id = "X-1".into();
+            r
+        };
+
+        // THE PREDICATE. Both halves are required: amux minted it AND it carries
+        // the prompt marker. Either alone catches real work.
+        assert!(is_capture_shell(&cap("amux", "**Prompt:** hello", "discarded")));
+        assert!(
+            !is_capture_shell(&cap("some-lane", "**Prompt:** hello", "discarded")),
+            "a LANE that happens to paste a prompt marker is carding real work"
+        );
+        assert!(
+            !is_capture_shell(&cap("amux", "Fix the parser", "discarded")),
+            "an amux-minted card with no prompt marker is not a capture"
+        );
+        // Leading whitespace must not defeat it: the marker is written by a
+        // formatter, not by hand.
+        assert!(is_capture_shell(&cap("amux", "\n  **Prompt:** hi", "discarded")));
+    }
+
+    /// AMUX-4677: a captured message whose FIRST LINE is an `ASK` naming a card
+    /// is a delegation, so it stops being a shell and its sender stops being
+    /// told nothing was asked of the lane.
+    ///
+    /// Reported by mixpeek-finances with MG-1786, whose prompt opens
+    /// `ASK (Ethan, resumed you for this): pick up MF-1165`. mixpeek-general
+    /// picked MF-1165 up and discarded the duplicate envelope, and the terminal
+    /// callback still told the sender "Nothing was requested of this lane and
+    /// nothing is owed". AF-634 added that sentence for tidied chatter, and the
+    /// sender of a hand-off reads it as their request being dropped.
+    /// `amux board request` parks its card on the SENDER's board (AMUX-4653),
+    /// so a message is the path a lane actually has for handing work over.
+    ///
+    /// Both directions, because the risk here IS the fix: a lower-case "ask",
+    /// the word in a body, an id on the second line and an ask naming no card
+    /// all stay shells.
+    #[test]
+    fn a_first_line_ask_naming_a_card_is_a_request_not_a_shell() {
+        // The receipt, through its first newline.
+        const RECEIPT: &str = "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 on \
+the finances board, WS5 of epic MF-1168.\nThe bar Ethan set 2026-09-15: ONE COMMAND deploys \
+everything to a clean machine.";
+        assert!(capture_is_delegated_ask(RECEIPT), "the shape this card exists for");
+
+        for (desc, why) in [
+            ("**Prompt:** ask (ethan): pick up MF-1165", "lower-case ask is prose, not a marker"),
+            (
+                "**Prompt:** landed 3f79021a; say the word if you want me to ask about MF-1165",
+                "the word ask inside a body is the over-firing this must not do",
+            ),
+            (
+                "**Prompt:** ASK below\nthe card is MF-1165",
+                "the id has to be on the same line as the ask",
+            ),
+            ("**Prompt:** ASK: can you look at the retry loop", "an ask naming no card"),
+            ("**Prompt:** ASK (finances): pick up the docker bundle", "a subject but no id"),
+            ("ASK (finances): pick up MF-1165", "not a capture envelope at all"),
+        ] {
+            assert!(!capture_is_delegated_ask(desc), "{why}: {desc}");
+        }
+
+        // And the rendered sentence, which is what the sender actually read.
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, desc: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, creator, \"desc\")
+                 VALUES (?1, ?2, 'discarded', 'code', ?3, ?3, 'amux', ?4)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, desc],
+            )
+            .expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        let ask = add("C-ASK", RECEIPT);
+        assert!(!is_capture_shell(&ask), "a delegation is a unit of work");
+        let (text, _) = terminal_summary(&conn, &ask, "doing").expect("summary");
+        assert!(
+            !text.contains("nothing is owed"),
+            "the sentence mixpeek-finances read as their hand-off being dropped: {text}"
+        );
+        assert!(!text.contains("captured message"), "{text}");
+
+        // THE DISCRIMINATION. Tidied chatter keeps AF-634's sentence, and if it
+        // did not this cell would pass on a predicate that had simply stopped
+        // recognising captures at all.
+        let chatter = add("C-CHAT", "**Prompt:** landed 3f79021a, ask me if you want MF-1165 next");
+        assert!(is_capture_shell(&chatter), "chatter is still a shell");
+        let (chat_text, _) = terminal_summary(&conn, &chatter, "doing").expect("summary");
+        assert!(chat_text.contains("nothing is owed"), "{chat_text}");
+    }
+
+    /// AMUX-4697: `capture_shell_sql` and `is_capture_shell` must select the
+    /// same rows, or a count and a dispatch list differ by rows nobody can name.
+    ///
+    /// Runs BOTH over the same fixtures rather than asserting each separately,
+    /// which is the only arrangement that can catch a drift: two independent
+    /// assertions both stay green while the predicates diverge.
+    #[test]
+    fn execution_retirement_keeps_runtime_verification_and_dependency_failure_distinct() {
+        assert!(!execution_is_terminal("done", "code"));
+        assert!(execution_is_terminal("done", "chore"));
+        assert!(execution_is_terminal("verified", "code"));
+        for status in ["discarded", "quarantined"] {
+            assert!(execution_is_terminal(status, "code"));
+            assert!(!dependency_is_resolved(status, "code"));
+        }
+        for status in ["backlog", "todo", "review", "doing", "unknown"] {
+            assert!(!execution_is_terminal(status,"code"));
+        }
+    }
+
+    #[test]
+    fn structured_capture_releases_only_the_delivery_marker() {
+        let conn = crate::db::migrate::test_memdb();
+        for (i, hold) in ["Already delivered owner follow-up; claim explicitly when switching work", "budget approval pending"].into_iter().enumerate() {
+            let id = format!("HOLD-{i}");
+            conn.execute("INSERT INTO issues(id,title,desc,status,creator,created,updated,next_action,acceptance_criteria,source_ref) VALUES (?1,'Reproduce bug','**Prompt:** fix this','backlog','amux',1,1,'Run regression','[\"Regression passes\"]',?2)", rusqlite::params![id, hold]).unwrap();
+            let mut row = get_issue(&conn,&id).unwrap().unwrap();
+            save_patched(&conn,&mut row).unwrap();
+            assert_eq!(row.source_ref.as_deref(), if i==0 {None} else {Some(hold)});
+            assert_eq!(get_issue(&conn,&id).unwrap().unwrap().source_ref, row.source_ref);
+        }
+    }
+
+    #[test]
+    fn retained_prompt_provenance_does_not_make_structured_work_a_shell() {
+        let conn = crate::db::migrate::test_memdb();
+        for (i, (action, criteria, expected)) in [
+            ("Run the reproduction", r#"["Regression no longer reproduces"]"#, false),
+            ("Run the reproduction", r#""Regression no longer reproduces""#, false),
+            ("Run the reproduction", r#"" \t\n\u2003""#, true),
+            ("", r#""Regression no longer reproduces""#, true),
+            ("", r#"["Regression no longer reproduces"]"#, true),
+            ("Run the reproduction", "[]", true),
+            ("Run the reproduction", r#"[" ", null, 1]"#, true),
+            ("Run the reproduction", "broken json", true),
+            ("Run the reproduction", r#"{"gate":"done"}"#, true),
+            ("\u{2003}", r#"["done"]"#, true),
+        ].into_iter().enumerate() {
+            let id = format!("INTAKE-{i}");
+            conn.execute("INSERT INTO issues(id,title,desc,status,creator,created,updated,next_action,acceptance_criteria) VALUES (?1,'Reproduce bug','**Prompt:** fix this','backlog','amux',1,1,?2,?3)", rusqlite::params![id, action, criteria]).unwrap();
+            let row = get_issue(&conn, &id).unwrap().unwrap();
+            let sql: bool = conn.query_row(&format!("SELECT {} FROM issues i WHERE id=?1", capture_shell_sql()), [&id], |r| r.get(0)).unwrap();
+            assert_eq!(is_capture_shell(&row), expected, "Rust: {id}");
+            assert_eq!(sql, expected, "SQL: {id}");
+        }
+    }
+
+    #[test]
+    fn the_sql_predicate_and_the_rust_one_select_the_same_rows() {
+        // The REAL schema via the migration chain, not a hand-rolled four-column
+        // stand-in. `tests/schema_fixtures.rs` caught the stand-in and it was
+        // right to: this cell claims the SQL predicate selects the same rows as
+        // the Rust one, and a fixture whose `issues` differs from production
+        // cannot support that claim about production.
+        let conn = crate::db::migrate::test_memdb();
+        // Each case is (id, creator, desc) with the answer the Rust predicate
+        // gives, including the whitespace shapes a formatter can emit.
+        let cases = [
+            ("C-1", "amux", "**Prompt:** hello"),
+            ("C-2", "some-lane", "**Prompt:** hello"),
+            ("C-3", "amux", "Fix the parser"),
+            ("C-4", "amux", "\n  **Prompt:** hi"),
+            ("C-5", "amux", "   **Prompt:** spaces first"),
+            ("C-6", "amux", "\t**Prompt:** tab first"),
+            ("C-7", "amux", "\r\n**Prompt:** crlf first"),
+            ("C-8", "amux", "text then **Prompt:** later"),
+            ("C-9", "amux", ""),
+            // AMUX-4677's carve-out, on both sides of every clause it added.
+            // Ids sort after C-9 on purpose: the comparison below is ordered,
+            // and SQLite's BINARY collation puts "C-10" between "C-1" and "C-2".
+            ("C-A1", "amux", "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 now\nmore"),
+            ("C-A2", "amux", "**Prompt:** ask me about MF-1165"),
+            ("C-A3", "amux", "**Prompt:** ASK below\nthe card is MF-1165"),
+            ("C-A4", "amux", "**Prompt:** ASK: look at the retry loop"),
+            ("C-A5", "amux", "**Prompt:**ASK (x): pick up MF-1165"),
+            ("C-A6", "amux", "\n  **Prompt:**   ASK (x): pick up MF-1165"),
+        ];
+        // Every NOT NULL column the real schema carries. The hand-rolled
+        // four-column stand-in this replaced did not have them, which is the
+        // second thing the fixture guard was protecting: a narrow fixture
+        // accepts inserts production would reject.
+        for (id, creator, desc) in cases {
+            conn.execute(
+                "INSERT INTO issues (id,title,desc,status,creator,created,updated,owner_type, \
+                                     pinned,pos,notified,type,archived,rev,version,lease_generation) \
+                 VALUES (?1,?1,?2,'backlog',?3,1,1,'agent',0,0,0,'code',0,1,1,0)",
+                rusqlite::params![id, desc, creator],
+            )
+            .expect("insert");
+        }
+        let sql_says: Vec<String> = conn
+            .prepare(&format!(
+                "SELECT i.id FROM issues i WHERE {} ORDER BY i.id",
+                capture_shell_sql()
+            ))
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows");
+        let rust_says: Vec<String> = cases
+            .iter()
+            .filter(|(_, creator, desc)| {
+                let mut r = IssueRow {
+                    creator: (*creator).into(),
+                    desc: (*desc).into(),
+                    status: "backlog".into(),
+                    ..Default::default()
+                };
+                r.id = "x".into();
+                is_capture_shell(&r)
+            })
+            .map(|(id, _, _)| (*id).to_string())
+            .collect();
+        assert_eq!(sql_says, rust_says, "the two predicates must agree row for row");
+        // POSITIVE CONTROL: if this were empty both sides would agree
+        // vacuously, which is the most reassuring output a dead check produces.
+        assert!(
+            rust_says.len() >= 4,
+            "the fixtures must actually contain capture shells; got {rust_says:?}"
+        );
+    }
+
+    /// AF-616: a fold the SERVER guessed must not read like one a lane
+    /// DECLARED. Both paths write `capture folded into <ID>`; only the
+    /// adjacency-chosen one carries the marker.
+    #[test]
+    fn an_inferred_fold_target_is_distinguishable_from_a_declared_one() {
+        assert_eq!(
+            folded_into_detail(Some("capture folded into AF-615 [inferred]")),
+            Some(("AF-615".to_string(), true)),
+            "the auto-fold path guessed this target and must say so"
+        );
+        assert_eq!(
+            folded_into_detail(Some("capture folded into AF-615")),
+            Some(("AF-615".to_string(), false)),
+            "a lane naming its own target with --folded-into is an assertion"
+        );
+
+        // THE COMPATIBILITY GUARANTEE. The marker sits after the id, so every
+        // existing caller of `folded_into` parses the same id either way. Without
+        // this, adding provenance would silently retarget every fold to `AF-615`
+        // plus a suffix, which is the AF-615" bug this parser already carries a
+        // regression test for.
+        assert_eq!(
+            folded_into(Some("capture folded into AF-615 [inferred]")),
+            Some("AF-615".to_string()),
+            "the marker must not become part of the id"
+        );
+
+        // ENTRIES WRITTEN BEFORE THIS EXISTED read as declared, which is the safe
+        // direction: they predate the distinction and most were peer folds. An
+        // absent marker must never be reported as an inference.
+        assert_eq!(
+            folded_into_detail(Some("`12:01` amux: capture folded into AF-604")),
+            Some(("AF-604".to_string(), false))
+        );
+
+        // The marker alone is not a fold, and must not BECOME the target. The
+        // first cut parsed this as a fold into a card named `[inferred`, with
+        // the `]` eaten by the punctuation trim.
+        assert_eq!(folded_into_detail(Some("[inferred]")), None);
+        assert_eq!(
+            folded_into_detail(Some("capture folded into  [inferred]")),
+            None,
+            "a fold that names no target names nothing, marker or not"
+        );
+    }
+
+    /// mixpeek-cicd: five capture shells across two lanes whose terminal
+    /// summary said "discarded ... not supplied ... not recorded ... none
+    /// recorded", which is the wording a genuinely dropped request produces.
+    /// Each had in fact been folded into real cards, and the fold target was
+    /// printed on the summary's own Actions line while it said so.
+    #[test]
+    fn a_folded_capture_is_distinguishable_from_a_dropped_one() {
+        // The server-authored line (api::board writes exactly this).
+        assert_eq!(
+            folded_into(Some("claimed\ncapture folded into MS-1370\n")),
+            Some("MS-1370".to_string())
+        );
+        // Timestamp/backtick prefixes are how the log actually renders.
+        assert_eq!(
+            folded_into(Some("`12:01` amux: capture folded into AF-604")),
+            Some("AF-604".to_string())
+        );
+        // Trailing punctuation must not become part of the id.
+        assert_eq!(
+            folded_into(Some("capture folded into MS-1370.")),
+            Some("MS-1370".to_string())
+        );
+        // The LAST fold wins, so a re-fold is not reported at its first target.
+        assert_eq!(
+            folded_into(Some("capture folded into A-1\ncapture folded into A-2")),
+            Some("A-2".to_string())
+        );
+
+        // CONTROLS. Without these, a helper returning Some(..) unconditionally
+        // passes everything above, and every discarded card would claim a fold.
+        assert_eq!(folded_into(None), None);
+        assert_eq!(folded_into(Some("")), None);
+        assert_eq!(folded_into(Some("discarded: duplicate of MS-1370")), None,
+            "an ordinary discard is not a fold");
+        assert_eq!(folded_into(Some("capture folded into ")), None,
+            "a fold with no target names nothing");
+
+        // THE LIVE SPECIMEN, caught by a callback within the hour of shipping
+        // the first cut. An outcome note DISCUSSING this fix is embedded in the
+        // card's STATUS entry; matching it produced the target `AF-615"` and a
+        // callback reading `folded this capture into AF-615"`.
+        let quoting = "`17:31` STATUS (board): Final outcome: discarded (from doing). \
+                       Their fix reads a server-authored \"capture folded into <ID>\" line, \
+                       and its own Actions line read \"capture folded into AF-615\", so";
+        assert_eq!(folded_into(Some(quoting)), None,
+            "prose QUOTING the marker is not a fold");
+
+        // And the real entry still matches with that attribution prefix present.
+        assert_eq!(
+            folded_into(Some("`17:31` amux-frustrations: capture folded into AF-615")),
+            Some("AF-615".to_string())
+        );
+        // A stray quote on a REAL fold line must not become part of the id.
+        assert_eq!(
+            folded_into(Some("capture folded into AF-615\"")),
+            Some("AF-615".to_string())
+        );
+    }
+
     /// One test for the whole ladder rather than five, because the property is
     /// a mapping and the interesting failure is two rungs agreeing when they
     /// should differ.
@@ -5012,6 +7245,203 @@ column=silent type:code=outranked(2)"
             &groups(&["ops"]),
         );
         assert_eq!(got, vec!["Group rule"]);
+    }
+
+    /// AF-570. An ADDITIVE scoped gate unions with the type default instead of
+    /// replacing it, and one WITHOUT the marker still replaces.
+    ///
+    /// Three cells, and the third is the one that matters. amux-cloud pointed out
+    /// that asserting only the two additive outcomes proves the OUTCOME and not
+    /// that the flag is READ: if the union were hardcoded, both additive cells
+    /// still pass, because that is what group:amux wants anyway, while every
+    /// gate in the fleet that never opted in silently flips to union. The
+    /// replace-when-unset cell is what guarantees no other group moved.
+    ///
+    /// Cell 2 is amux-cloud's "test the type you did NOT set out to change": the
+    /// case this feature exists for is `investigation`, so `code` is where a
+    /// mistake would hide. Setting the group gate to the peer criteria alone,
+    /// under the replacement semantics this replaces, silently drops
+    /// "Confirmed working in prod" from every code card.
+    #[test]
+    fn an_additive_scoped_gate_unions_with_the_type_default_and_a_plain_one_replaces() {
+        let peer = r#"["@additive","Peer-reviewed by a DIFFERENT worker","That peer verified it themselves"]"#;
+
+        // CELL 1: the type this was built for. It gains a truthful bar it can
+        // actually satisfy, plus the peer criteria.
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:amux", "verified", peer);
+        let inv = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "investigation", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        assert!(
+            inv.iter().any(|g| g == "Outcome confirmed to still hold"),
+            "an investigation must keep its own type bar: {inv:?}"
+        );
+        assert!(
+            inv.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and still carry the group peer criteria: {inv:?}"
+        );
+
+        // CELL 2: the type NOT being changed. This is where the regression hides.
+        let code = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "code", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        for want in [
+            "Deployed to prod (if this card has no deployment target, note why)",
+            "Confirmed working in prod (if this card has no deployment target, note why)",
+            "Zero regressions",
+        ] {
+            assert!(
+                code.iter().any(|g| g == want),
+                "code must NOT lose {want:?} to the group gate: {code:?}"
+            );
+        }
+        assert!(
+            code.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and code still answers to the group peer criteria: {code:?}"
+        );
+
+        // CELL 3: NO marker, so replacement is unchanged. Without this cell a
+        // hardcoded union passes cells 1 and 2 while moving every gate in the
+        // fleet that never opted in.
+        let c2 = conn_with(None, None);
+        add_session_gates(&c2);
+        scope_gate(&c2, "group:ops", "verified", r#"["Ops rule"]"#);
+        let plain = effective_gate_scoped(
+            &c2,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&["ops"]),
+        );
+        assert_eq!(
+            plain,
+            vec!["Ops rule"],
+            "a gate WITHOUT the marker must still REPLACE the type default: {plain:?}"
+        );
+
+        // CELL 4: the marker is a directive, never a criterion. Nobody should be
+        // asked to acknowledge "@additive", and a gate of only the marker holds
+        // no rule, so it must not win its tier with an empty list (which reads as
+        // no gate and opens the transition).
+        assert!(
+            !inv.iter().any(|g| g == GATE_ADDITIVE_MARKER),
+            "the marker must not surface as a criterion: {inv:?}"
+        );
+        let c3 = conn_with(None, None);
+        add_session_gates(&c3);
+        scope_gate(&c3, "group:amux", "verified", r#"["@additive"]"#);
+        let only_marker = effective_gate_scoped(
+            &c3,
+            &row_for("amux-frustrations", "code", None),
+            TaskStatus::Verified,
+            &groups(&["amux"]),
+        );
+        assert!(
+            only_marker
+                .iter()
+                .any(|g| g == "Confirmed working in prod (if this card has no deployment target, note why)"),
+            "a marker-only gate holds no rule and must fall through, not open the gate: {only_marker:?}"
+        );
+    }
+
+    /// AF-393. The column tier (`statuses.gate_custom`) is the fleet-wide
+    /// default and, until this fix, could only REPLACE each type's own
+    /// criteria — worker and group already had the additive escape hatch
+    /// (AF-570) but the tier every card falls back to when no scope has an
+    /// opinion did not. Same three cells as the worker/group test above, for
+    /// the same reason: a hardcoded union would pass the additive cells
+    /// without proving the flag is read, and cell 2 is where a fleet-wide
+    /// gate quietly overwriting a type's own bar would hide.
+    #[test]
+    fn an_additive_column_gate_unions_with_the_type_default_and_a_plain_one_replaces() {
+        let peer = r#"["@additive","Peer-reviewed by a DIFFERENT worker","That peer verified it themselves"]"#;
+
+        // CELL 1: an investigation card, no worker/group gate at all, must
+        // still gain the column's peer criteria on top of its own type bar.
+        let c = conn_with_verified(Some(peer), Some(1));
+        add_session_gates(&c);
+        let inv = effective_gate_scoped(
+            &c,
+            &row_for("amux-frustrations", "investigation", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        assert!(
+            inv.iter().any(|g| g == "Outcome confirmed to still hold"),
+            "an investigation must keep its own type bar under an additive column gate: {inv:?}"
+        );
+        assert!(
+            inv.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and still carry the column's peer criteria: {inv:?}"
+        );
+
+        // CELL 2: a code card must NOT lose its own criteria to the same
+        // fleet-wide column gate.
+        let code = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        for want in [
+            "Deployed to prod (if this card has no deployment target, note why)",
+            "Confirmed working in prod (if this card has no deployment target, note why)",
+            "Zero regressions",
+        ] {
+            assert!(
+                code.iter().any(|g| g == want),
+                "code must NOT lose {want:?} to an additive column gate: {code:?}"
+            );
+        }
+        assert!(
+            code.iter().any(|g| g.starts_with("Peer-reviewed")),
+            "and code still answers to the column's peer criteria: {code:?}"
+        );
+
+        // CELL 3: NO marker, so replacement is unchanged — the column tier's
+        // pre-existing behaviour for every gate that never opts in.
+        let c2 = conn_with_verified(Some(r#"["Column rule"]"#), Some(1));
+        add_session_gates(&c2);
+        let plain = effective_gate_scoped(
+            &c2,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        assert_eq!(
+            plain,
+            vec!["Column rule"],
+            "a column gate WITHOUT the marker must still REPLACE the type default: {plain:?}"
+        );
+
+        // CELL 4: the marker is a directive, never a criterion, and a
+        // marker-only column gate holds no rule so it must fall through to
+        // the type default rather than opening the transition.
+        assert!(
+            !inv.iter().any(|g| g == GATE_ADDITIVE_MARKER),
+            "the marker must not surface as a criterion: {inv:?}"
+        );
+        let c3 = conn_with_verified(Some(r#"["@additive"]"#), Some(1));
+        add_session_gates(&c3);
+        let only_marker = effective_gate_scoped(
+            &c3,
+            &row_for("backend", "code", None),
+            TaskStatus::Verified,
+            &groups(&[]),
+        );
+        assert!(
+            only_marker
+                .iter()
+                .any(|g| g == "Confirmed working in prod (if this card has no deployment target, note why)"),
+            "a marker-only column gate holds no rule and must fall through, not open the gate: {only_marker:?}"
+        );
     }
 
     /// A worker in several groups answers to ALL of them: union, in sorted
